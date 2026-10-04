@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -12,6 +13,8 @@ import (
 
 	"github.com/excavador/mail-mcp/internal/accounts"
 )
+
+var pmIDRE = regexp.MustCompile(`^[A-Za-z0-9_=-]{1,128}$`)
 
 // idHeaderFields are the header fields the cheap stable-id fetch asks for.
 // Message-ID is always wanted, as the fallback for every provider; Date,
@@ -49,8 +52,15 @@ func stableID(p accounts.Provider, header []byte, size int64, internal time.Time
 		return "", fmt.Errorf("parse headers: %w", err)
 	}
 	if p == accounts.Proton {
-		if v := strings.TrimSpace(h.Get("X-Pm-Internal-Id")); v != "" {
-			return "pm:" + v, nil
+		// A message's own headers are attacker-influenced unless Bridge
+		// overwrites this one, so it is trusted only when it occurs exactly
+		// once and looks like an id; anything else falls through to the
+		// Message-ID scheme. Whether Bridge strips an inbound X-Pm-Internal-Id
+		// must be verified against a live Bridge.
+		if vs := h.Values("X-Pm-Internal-Id"); len(vs) == 1 {
+			if v := strings.TrimSpace(vs[0]); pmIDRE.MatchString(v) {
+				return "pm:" + v, nil
+			}
 		}
 	}
 	mid := strings.TrimSpace(h.Get("Message-Id"))

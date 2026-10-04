@@ -25,6 +25,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"time"
@@ -98,14 +99,28 @@ func Open(dir string) (*Cache, error) {
 	if dir == "" {
 		return nil, errors.New("cache: directory is empty")
 	}
-	if err := os.MkdirAll(filepath.Join(dir, "blobs"), 0o750); err != nil {
+	blobs := filepath.Join(dir, "blobs")
+	if err := os.MkdirAll(blobs, 0o700); err != nil {
 		return nil, fmt.Errorf("cache: create directory: %w", err)
 	}
+	// MkdirAll leaves an existing directory's mode alone and is subject to
+	// the umask; the cache holds mail, so make it owner-only regardless.
+	for _, d := range []string{dir, blobs} {
+		if err := os.Chmod(d, 0o700); err != nil {
+			return nil, fmt.Errorf("cache: restrict directory: %w", err)
+		}
+	}
+	sweepTemp(blobs)
 	// WAL so a status read never waits on a refresh; busy_timeout and an
 	// immediate txlock so two accounts refreshing at once queue for the
 	// write lock instead of failing with SQLITE_BUSY mid-transaction.
-	dsn := "file:" + filepath.Join(dir, "index.db") +
-		"?_pragma=journal_mode(WAL)&_pragma=busy_timeout(10000)&_pragma=synchronous(NORMAL)&_txlock=immediate"
+	q := url.Values{}
+	q.Add("_pragma", "journal_mode(WAL)")
+	q.Add("_pragma", "busy_timeout(10000)")
+	q.Add("_pragma", "synchronous(NORMAL)")
+	q.Set("_txlock", "immediate")
+	u := url.URL{Scheme: "file", Opaque: url.PathEscape(filepath.Join(dir, "index.db")), RawQuery: q.Encode()}
+	dsn := u.String()
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("cache: open index: %w", err)

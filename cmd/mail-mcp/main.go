@@ -38,6 +38,10 @@ import (
 var version = "dev"
 
 func main() {
+	// Everything this process creates (the cache, its SQLite WAL and shm
+	// files) holds mail: owner-only, whatever the caller's umask was.
+	syscall.Umask(0o077)
+
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 

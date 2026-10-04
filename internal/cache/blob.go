@@ -6,14 +6,22 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
+	"strings"
 )
+
+var sumRE = regexp.MustCompile(`^[0-9a-f]{64}$`)
 
 // BlobPath is where the blob with the given SHA-256 (hex) lives. The first
 // two hex characters fan the files out over 256 directories so no single
 // directory grows to hundreds of thousands of entries.
+//
+// Anything that is not exactly 64 lowercase hex characters yields "", never a
+// path: a digest that reaches here from outside must not be able to name
+// "../..", and "" fails every os call made with it.
 func (c *Cache) BlobPath(sum string) string {
-	if len(sum) < 2 {
-		return filepath.Join(c.dir, "blobs", sum)
+	if !sumRE.MatchString(sum) {
+		return ""
 	}
 	return filepath.Join(c.dir, "blobs", sum[:2], sum)
 }
@@ -66,5 +74,43 @@ func (c *Cache) putBlob(raw []byte) (string, error) {
 		cleanup()
 		return "", fmt.Errorf("cache: place blob: %w", err)
 	}
+	// Persist the rename itself: without a directory fsync a crash can lose
+	// the entry for a blob whose index row is already committed.
+	if err := syncDir(dir); err != nil {
+		return "", fmt.Errorf("cache: sync blob directory: %w", err)
+	}
 	return sum, nil
+}
+
+func syncDir(dir string) error {
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer d.Close()
+	return d.Sync()
+}
+
+// sweepTemp removes temporary files a crashed write left behind. Blobs are
+// only ever renamed into place complete, so a ".tmp-" file is never a blob.
+func sweepTemp(blobs string) {
+	fans, err := os.ReadDir(blobs)
+	if err != nil {
+		return
+	}
+	for _, f := range fans {
+		if !f.IsDir() {
+			continue
+		}
+		dir := filepath.Join(blobs, f.Name())
+		ents, err := os.ReadDir(dir)
+		if err != nil {
+			continue
+		}
+		for _, e := range ents {
+			if !e.IsDir() && strings.HasPrefix(e.Name(), ".tmp-") {
+				_ = os.Remove(filepath.Join(dir, e.Name()))
+			}
+		}
+	}
 }

@@ -20,13 +20,34 @@ func (c *Cache) RefreshOnce(ctx context.Context, a accounts.Account) (st Stats, 
 	defer func() {
 		if r := recover(); r != nil {
 			err = fmt.Errorf("%s: refresh panicked: %v", a.Name, r)
+			c.recordRefresh(a.Name, st, false)
 		}
 	}()
 	client, err := imapx.Dial(ctx, a)
 	if err != nil {
+		// Refresh never ran, so it recorded nothing: note the failure here,
+		// or an account that cannot connect would be invisible to Status.
+		c.recordRefresh(a.Name, Stats{}, false)
 		return st, err
 	}
-	defer func() { _ = client.Logout().Wait(); _ = client.Close() }()
+	// imapclient's calls take no context, so a server that stalls mid-FETCH
+	// would block a read forever. Closing the connection when ctx ends
+	// (cancelled, or the per-refresh deadline) makes the blocked read return.
+	done := make(chan struct{})
+	defer close(done)
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = client.Close()
+		case <-done:
+		}
+	}()
+	defer func() {
+		if ctx.Err() == nil {
+			_ = client.Logout().Wait()
+		}
+		_ = client.Close()
+	}()
 	return c.Refresh(ctx, a, client)
 }
 
@@ -37,12 +58,17 @@ func (c *Cache) Run(ctx context.Context, log *slog.Logger, a accounts.Account, i
 	if interval <= 0 {
 		return
 	}
+	// One refresh may not outlive max(interval, 10m): a hang is bounded, and
+	// the next tick starts clean.
+	budget := max(interval, 10*time.Minute)
 	refresh := func() {
 		start := time.Now()
-		st, err := c.RefreshOnce(ctx, a)
+		rctx, cancel := context.WithTimeout(ctx, budget)
+		defer cancel()
+		st, err := c.RefreshOnce(rctx, a)
 		attrs := []any{
 			"account", a.Name, "folders", st.Folders, "new_uids", st.NewUIDs,
-			"new_ids", st.NewIDs, "new_bodies", st.NewBodies, "removed", st.Removed,
+			"new_ids", st.NewIDs, "new_bodies", st.NewBodies, "removed", st.Removed, "skipped", st.Skipped,
 			"took", time.Since(start).Round(time.Millisecond).String(),
 		}
 		if err != nil {

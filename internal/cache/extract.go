@@ -20,6 +20,18 @@ import (
 // anything a person would search for, and bounds the FTS index.
 const maxIndexedText = 256 << 10
 
+// maxHeaderField caps each indexed header column, so one hostile header
+// (a megabyte of Cc) cannot bloat the index.
+const maxHeaderField = 4 << 10
+
+// capField truncates s to maxHeaderField bytes on a UTF-8 boundary.
+func capField(s string) string {
+	if len(s) <= maxHeaderField {
+		return s
+	}
+	return strings.ToValidUTF8(s[:maxHeaderField], "")
+}
+
 func bufioReader(b []byte) *bufio.Reader { return bufio.NewReader(bytes.NewReader(b)) }
 
 // parsed is what the index keeps about one message.
@@ -41,18 +53,19 @@ func parseMessage(raw []byte) parsed {
 		return out
 	}
 	h := mail.Header{Header: e.Header}
-	out.From = addrs(h, "From")
-	out.To = addrs(h, "To")
-	out.Cc = addrs(h, "Cc")
+	out.From = capField(addrs(h, "From"))
+	out.To = capField(addrs(h, "To"))
+	out.Cc = capField(addrs(h, "Cc"))
 	out.Subject, _ = h.Subject()
 	if out.Subject == "" {
 		out.Subject = e.Header.Get("Subject")
 	}
+	out.Subject = capField(out.Subject)
 	if d, err := h.Date(); err == nil {
 		out.Date = d
 	}
-	out.ListID = strings.TrimSpace(e.Header.Get("List-Id"))
-	out.GitHubReason = strings.TrimSpace(e.Header.Get("X-Github-Reason"))
+	out.ListID = capField(strings.TrimSpace(e.Header.Get("List-Id")))
+	out.GitHubReason = capField(strings.TrimSpace(e.Header.Get("X-Github-Reason")))
 
 	var plain, htm strings.Builder
 	collectText(e, &plain, &htm, 0)
@@ -83,7 +96,7 @@ func addrs(h mail.Header, key string) string {
 // skipping attachments. Plain text is preferred by the caller; HTML is only
 // the fallback for messages that carry no plain part.
 func collectText(e *message.Entity, plain, htm *strings.Builder, depth int) {
-	if depth > 16 || plain.Len() >= maxIndexedText && htm.Len() >= maxIndexedText {
+	if depth > 16 || plain.Len() >= maxIndexedText {
 		return
 	}
 	if mr := e.MultipartReader(); mr != nil {
@@ -106,7 +119,10 @@ func collectText(e *message.Entity, plain, htm *strings.Builder, depth int) {
 	default:
 		return
 	}
-	b, _ := io.ReadAll(io.LimitReader(e.Body, maxIndexedText))
+	if dst.Len() >= maxIndexedText {
+		return
+	}
+	b, _ := io.ReadAll(io.LimitReader(e.Body, int64(maxIndexedText-dst.Len())))
 	if dst.Len() > 0 {
 		dst.WriteByte('\n')
 	}
@@ -126,6 +142,7 @@ func walkParts(mr message.MultipartReader, plain, htm *strings.Builder, depth in
 var (
 	breaks     = regexp.MustCompile(`(?i)<(br|/p|/div|/tr|/li|/h[1-6])\b[^>]*>`)
 	dropBlocks = regexp.MustCompile(`(?is)<(script|style|head)\b.*?</(script|style|head)\s*>`)
+	inline     = regexp.MustCompile(`(?i)</?(a|b|i|em|strong|span|u|s|small|big|code|font|sub|sup|mark|abbr)(\s[^>]*)?/?>`)
 	tags       = regexp.MustCompile(`(?s)<[^>]*>`)
 	spaces     = regexp.MustCompile(`[ \t\r\f\v]+`)
 	blank      = regexp.MustCompile(`\n\s*\n+`)
@@ -137,6 +154,9 @@ var (
 func stripHTML(s string) string {
 	s = dropBlocks.ReplaceAllString(s, " ")
 	s = breaks.ReplaceAllString(s, "\n")
+	// Inline tags vanish without a gap so "<b>wor</b>ld" stays one word;
+	// every other tag separates words.
+	s = inline.ReplaceAllString(s, "")
 	s = tags.ReplaceAllString(s, " ")
 	s = html.UnescapeString(s)
 	s = spaces.ReplaceAllString(s, " ")

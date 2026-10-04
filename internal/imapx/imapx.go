@@ -12,7 +12,9 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"net"
 	"sort"
+	"time"
 
 	"github.com/emersion/go-imap/v2"
 	"github.com/emersion/go-imap/v2/imapclient"
@@ -49,25 +51,55 @@ func tlsConfig(a accounts.Account) *tls.Config {
 	}
 }
 
-// Dial connects and logs in.
+// connectTimeout bounds TCP connect, TLS handshake, greeting and login
+// together. A server that accepts the connection and then says nothing must
+// not be able to hold a caller forever.
+const connectTimeout = 30 * time.Second
+
+// Dial connects and logs in. It honours ctx and gives up after connectTimeout.
+//
+// The connection is dialled here, not by imapclient.Dial*, because those take
+// no context: a deadline on the raw connection covers the handshake and the
+// login, and a watcher closes the client if ctx ends mid-way.
 func Dial(ctx context.Context, a accounts.Account) (*imapclient.Client, error) {
 	opts := &imapclient.Options{TLSConfig: tlsConfig(a)}
 
-	var (
-		c   *imapclient.Client
-		err error
-	)
-	switch a.TLS {
-	case accounts.Implicit:
-		c, err = imapclient.DialTLS(a.Addr(), opts)
-	case accounts.StartTLS:
-		c, err = imapclient.DialStartTLS(a.Addr(), opts)
-	default:
-		return nil, fmt.Errorf("unknown tls mode %q", a.TLS)
-	}
+	d := &net.Dialer{Timeout: connectTimeout}
+	conn, err := d.DialContext(ctx, "tcp", a.Addr())
 	if err != nil {
 		return nil, fmt.Errorf("%s: connect: %w", a.Name, err)
 	}
+	_ = conn.SetDeadline(time.Now().Add(connectTimeout))
+
+	var c *imapclient.Client
+	switch a.TLS {
+	case accounts.Implicit:
+		tc := tls.Client(conn, opts.TLSConfig)
+		if err := tc.HandshakeContext(ctx); err != nil {
+			_ = conn.Close()
+			return nil, fmt.Errorf("%s: connect: %w", a.Name, err)
+		}
+		c = imapclient.New(tc, opts)
+	case accounts.StartTLS:
+		c, err = imapclient.NewStartTLS(conn, opts)
+		if err != nil {
+			_ = conn.Close()
+			return nil, fmt.Errorf("%s: connect: %w", a.Name, err)
+		}
+	default:
+		_ = conn.Close()
+		return nil, fmt.Errorf("unknown tls mode %q", a.TLS)
+	}
+
+	stop := make(chan struct{})
+	defer close(stop)
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = c.Close()
+		case <-stop:
+		}
+	}()
 
 	if err := c.Login(a.Username, a.Password()).Wait(); err != nil {
 		_ = c.Close()
@@ -75,6 +107,9 @@ func Dial(ctx context.Context, a accounts.Account) (*imapclient.Client, error) {
 		// password and a disabled app password look identical from here.
 		return nil, fmt.Errorf("%s: login refused for %s", a.Name, a.Username)
 	}
+	// Past login the deadline would kill a healthy long session; from here
+	// the caller's context is the bound.
+	_ = conn.SetDeadline(time.Time{})
 	return c, nil
 }
 

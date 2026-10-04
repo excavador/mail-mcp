@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"log/slog"
 	"sort"
 	"time"
 
@@ -22,6 +23,12 @@ const (
 	// bodyBatch UIDs per full-body FETCH: bodies are read into memory, so
 	// this is smaller to bound it when a batch happens to hold attachments.
 	bodyBatch = 25
+	// bodyBatchBytes caps the summed RFC822.SIZE of one body FETCH, since
+	// bodies are read into memory.
+	bodyBatchBytes = 32 << 20
+	// maxMessageSize is the largest message cached. Anything bigger is
+	// skipped (counted, logged, not stored) rather than held in memory.
+	maxMessageSize = 50 << 20
 )
 
 // Stats counts what one Refresh did.
@@ -39,6 +46,8 @@ type Stats struct {
 	// Removed is membership rows dropped because the message left the folder
 	// (or the folder's UIDVALIDITY changed). Blobs and index rows stay.
 	Removed int `json:"removed"`
+	// Skipped is messages not cached because they exceed maxMessageSize.
+	Skipped int `json:"skipped"`
 }
 
 func (s *Stats) add(o Stats) {
@@ -46,6 +55,7 @@ func (s *Stats) add(o Stats) {
 	s.NewIDs += o.NewIDs
 	s.NewBodies += o.NewBodies
 	s.Removed += o.Removed
+	s.Skipped += o.Skipped
 }
 
 // Refresh brings the cache of one account up to date with the mailbox behind
@@ -160,6 +170,7 @@ func (c *Cache) refreshFolder(ctx context.Context, a accounts.Account, client *i
 		bs, err := c.refreshBatch(ctx, a, client, folder, sel.UIDValidity, fresh[start:end])
 		st.NewIDs += bs.NewIDs
 		st.NewBodies += bs.NewBodies
+		st.Skipped += bs.Skipped
 		if err != nil {
 			return st, err
 		}
@@ -212,7 +223,15 @@ func (c *Cache) refreshBatch(ctx context.Context, a accounts.Account, client *im
 	}
 
 	infos := make(map[imap.UID]headerInfo, len(msgs))
+	skipped := map[imap.UID]bool{}
 	for _, m := range msgs {
+		if m.RFC822Size > maxMessageSize {
+			skipped[m.UID] = true
+			st.Skipped++
+			slog.Warn("cache: message too large, not cached",
+				"account", a.Name, "folder", folder, "uid", uint32(m.UID), "size", m.RFC822Size)
+			continue
+		}
 		id, err := stableID(a.Provider, m.FindBodySection(hdrSection), m.RFC822Size, m.InternalDate)
 		if err != nil {
 			return st, fmt.Errorf("uid %d: %w", m.UID, err)
@@ -239,16 +258,25 @@ func (c *Cache) refreshBatch(ctx context.Context, a accounts.Account, client *im
 	}
 	st.NewIDs = len(needBody)
 
-	for start := 0; start < len(needBody); start += bodyBatch {
+	for start := 0; start < len(needBody); {
 		if err := ctx.Err(); err != nil {
 			return st, err
 		}
-		end := min(start+bodyBatch, len(needBody))
+		end, total := start, int64(0)
+		for end < len(needBody) && end-start < bodyBatch {
+			sz := infos[needBody[end]].size
+			if end > start && total+sz > bodyBatchBytes {
+				break
+			}
+			total += sz
+			end++
+		}
 		n, err := c.fetchBodies(ctx, a, client, needBody[start:end], infos)
 		st.NewBodies += n
 		if err != nil {
 			return st, err
 		}
+		start = end
 	}
 
 	rows := make([]memberRow, 0, len(uids))
