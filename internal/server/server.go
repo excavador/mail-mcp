@@ -15,13 +15,11 @@ package server
 
 import (
 	"context"
-	"fmt"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/excavador/mail-mcp/internal/accounts"
 	"github.com/excavador/mail-mcp/internal/cache"
-	"github.com/excavador/mail-mcp/internal/imapx"
 )
 
 // Mode selects which tool set a server carries.
@@ -52,6 +50,10 @@ func New(accts []accounts.Account, store *cache.Cache, version string, mode Mode
 	}
 
 	addReads(s, accts, byName)
+	addListFolders(s, byName, store)
+	addSearch(s, byName, store)
+	addFetchMessage(s, byName, store)
+	addSenderStats(s, byName, store)
 	addCacheStatus(s, store)
 	// Write tools (create_folder, apply, undo, reapply) are registered only
 	// for Admin, and arrive with the organise and history work.
@@ -85,31 +87,6 @@ func addReads(s *mcp.Server, accts []accounts.Account, byName map[string]account
 			})
 		}
 		return nil, map[string]any{"accounts": out}, nil
-	})
-
-	mcp.AddTool(s, &mcp.Tool{
-		Name:        "list_folders",
-		Description: "List every folder (Gmail: label) in one account, with how many messages each holds.",
-		Annotations: readOnly(),
-	}, func(ctx context.Context, _ *mcp.CallToolRequest, in struct {
-		Account string `json:"account" jsonschema:"account name, as list_accounts returns it"`
-	},
-	) (*mcp.CallToolResult, any, error) {
-		a, ok := byName[in.Account]
-		if !ok {
-			return nil, nil, fmt.Errorf("unknown account %q; call list_accounts", in.Account)
-		}
-		c, err := imapx.Dial(ctx, a)
-		if err != nil {
-			return nil, nil, err
-		}
-		defer c.Logout()
-
-		folders, err := imapx.ListFolders(ctx, c)
-		if err != nil {
-			return nil, nil, err
-		}
-		return nil, map[string]any{"account": a.Name, "folders": folders, "count": len(folders)}, nil
 	})
 }
 
