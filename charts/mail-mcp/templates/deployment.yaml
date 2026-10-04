@@ -79,9 +79,9 @@ spec:
           persistentVolumeClaim:
             claimName: {{ include "mail-mcp.fullname" . }}-cache
         - name: history
-          {{- if .Values.history.existingClaim }}
+          {{- if (include "mail-mcp.historyExistingClaim" .) }}
           persistentVolumeClaim:
-            claimName: {{ .Values.history.existingClaim }}
+            claimName: {{ include "mail-mcp.historyExistingClaim" . }}
           {{- else }}
           # When history.existingClaim is not set, use an emptyDir.
           # In production, set history.existingClaim to a durable, backed-up PVC.

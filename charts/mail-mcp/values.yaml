@@ -50,7 +50,7 @@ cache:
 # When empty (not set), an emptyDir is used and history is discarded on restart.
 # In production this should be a durable, backed-up PVC for persistence.
 history:
-  # existingClaim: ""
+  existingClaim: ""
 
 resources:
   requests: {cpu: 20m, memory: 64Mi}
