@@ -1,0 +1,13 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": ["config:recommended", ":semanticCommitTypeAll(chore)"],
+  "labels": ["dependencies"],
+  "packageRules": [
+    {
+      "description": "Go toolchain moves by estate decision, not by Renovate.",
+      "matchManagers": ["gomod", "devbox"],
+      "matchPackageNames": ["go", "golang"],
+      "enabled": false
+    }
+  ]
+}

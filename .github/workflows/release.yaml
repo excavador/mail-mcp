@@ -1,0 +1,24 @@
+name: Release
+on:
+  push:
+    tags:
+      - "v*"
+permissions:
+  contents: write
+  packages: write
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  release:
+    permissions:
+      contents: write
+      packages: write
+    uses: truvity/ci-workflows/.github/workflows/release-public.yaml@58d470dff71c732e208f47a80bb6c5d741e016a7 # v3.25.0
+    with:
+      charts: '["mail-mcp"]'
+      chart-app-version: release
+      chart-registry: oci://ghcr.io/excavador/charts
+      # ko builds the image straight from Go — no Dockerfile, and multi-arch
+      # including arm64, which is not optional on RK1 boards.
+      ko-docker-repo: ghcr.io/excavador

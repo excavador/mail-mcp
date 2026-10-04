@@ -1,0 +1,58 @@
+# Image via ko (no Dockerfile), chart pushed separately by helmctl in the
+# release workflow. Both land in GHCR under excavador.
+version: 2
+project_name: mail-mcp
+
+builds:
+  - id: mail-mcp
+    main: ./cmd/mail-mcp
+    binary: mail-mcp
+    env:
+      - CGO_ENABLED=0
+    goos: [linux, darwin]
+    goarch: [amd64, arm64]
+    ldflags:
+      - -s -w -X main.version={{.Version}}
+
+kos:
+  - id: mail-mcp
+    build: mail-mcp
+    tags:
+      - "{{ .Version }}"
+      - "{{ if not .IsSnapshot }}latest{{ end }}"
+    # arm64 is not optional: the cluster this runs on is Turing RK1 boards.
+    platforms:
+      - linux/amd64
+      - linux/arm64
+    bare: true
+    preserve_import_paths: false
+    base_import_paths: true
+    base_image: gcr.io/distroless/static:nonroot
+    sbom: none
+    labels:
+      org.opencontainers.image.title: mail-mcp
+      org.opencontainers.image.version: "{{ .Version }}"
+      org.opencontainers.image.source: https://github.com/excavador/mail-mcp
+      org.opencontainers.image.licenses: MIT
+
+archives:
+  - id: mail-mcp
+    ids: [mail-mcp]
+    formats: [tar.gz]
+    name_template: "mail-mcp_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+
+changelog:
+  use: github
+  sort: asc
+  filters:
+    exclude:
+      - "^test:"
+      - "^chore:"
+      - "^ci:"
+      - "^docs:"
+
+release:
+  prerelease: auto
+  footer: |
+    Image: `ghcr.io/excavador/mail-mcp:{{ .Version }}`
+    Chart: `oci://ghcr.io/excavador/charts/mail-mcp:{{ .Version }}`

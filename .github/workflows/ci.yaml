@@ -1,0 +1,17 @@
+name: CI
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: truvity/ci-actions/setup-devbox@f0c56df8cb20d13c6ebd350f3e5f62d6dfbd4e08 # v1.1.0
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Check
+        run: devbox run -- just check

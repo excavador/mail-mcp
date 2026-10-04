@@ -1,0 +1,12 @@
+{
+  "$schema": "https://raw.githubusercontent.com/jetify-com/devbox/0.16.0/.schema/devbox.schema.json",
+  "packages": [
+    "go@1.27",
+    "goreleaser@latest",
+    "just@latest",
+    "kubernetes-helm@latest"
+  ],
+  "env": {
+    "CGO_ENABLED": "0"
+  }
+}

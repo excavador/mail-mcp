@@ -1,0 +1,185 @@
+// Command mail-mcp is a Model Context Protocol server for mailboxes reached
+// over IMAP: Gmail directly, Proton through Proton Mail Bridge.
+//
+// It serves two MCP endpoints from one process. sluis grants sessions longer
+// than 24 hours only to read-only resources, so reading lives on one resource
+// and organising on another:
+//
+//	/mcp        read tools only            -> the read-only resource (7-day sessions)
+//	/mcp-admin  read tools + write tools   -> the write resource (24-hour sessions)
+//
+// The HTTP transport validates every request itself: a bearer token minted by
+// the issuer, checked against its JWKS with the endpoint's own resource URL
+// as the required audience (RFC 8707), via truvity/sluis/identity/resource --
+// the same as excavador/netbox-mcp and excavador/homebox-mcp.
+package main
+
+import (
+	"context"
+	"fmt"
+	"log/slog"
+	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
+
+	"github.com/modelcontextprotocol/go-sdk/mcp"
+	"github.com/truvity/sluis/identity/resource"
+	"github.com/urfave/cli/v3"
+
+	"github.com/excavador/mail-mcp/internal/accounts"
+	"github.com/excavador/mail-mcp/internal/server"
+)
+
+// version is overridden at build time.
+var version = "dev"
+
+func main() {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	cmd := &cli.Command{
+		Name:    "mail-mcp",
+		Usage:   "MCP server for mailboxes reached over IMAP (Gmail, Proton via Bridge)",
+		Version: version,
+		Flags: []cli.Flag{
+			&cli.StringFlag{
+				Name:     "accounts",
+				Usage:    "path to the accounts file (passwords live in files it names, never in it)",
+				Sources:  cli.EnvVars("ACCOUNTS_FILE"),
+				Required: true,
+			},
+			&cli.StringFlag{
+				Name: "transport",
+				// stdio serves the admin tool set: a person running this on
+				// their own machine against their own mailboxes needs no
+				// split, and there is no issuer to grant sessions anyway.
+				Usage:   "stdio or http",
+				Value:   "stdio",
+				Sources: cli.EnvVars("TRANSPORT"),
+			},
+			&cli.StringFlag{
+				Name: "addr",
+				// 0.0.0.0, not 127.0.0.1: in a pod, loopback means nothing
+				// can reach it, including the readiness probe.
+				Usage:   "listen address for the http transport",
+				Value:   "0.0.0.0:8080",
+				Sources: cli.EnvVars("ADDR"),
+			},
+			&cli.StringFlag{
+				Name:    "issuer-url",
+				Usage:   "issuer that mints tokens for both resources (http transport only)",
+				Sources: cli.EnvVars("ISSUER_URL"),
+			},
+			&cli.StringFlag{
+				Name: "read-resource-url",
+				// The RFC 8707 resource indicator for the read endpoint: this
+				// server's externally reachable URL for /mcp, which is also the
+				// audience the issuer mints for it.
+				Usage:   "external URL of the read endpoint (http transport only)",
+				Sources: cli.EnvVars("READ_RESOURCE_URL"),
+			},
+			&cli.StringFlag{
+				Name:    "admin-resource-url",
+				Usage:   "external URL of the admin endpoint (http transport only)",
+				Sources: cli.EnvVars("ADMIN_RESOURCE_URL"),
+			},
+			&cli.StringFlag{
+				Name: "scope",
+				// sluis rejects an authorize request that carries no scope at
+				// all; "openid" is the one it accepts out of the box. Never
+				// checked here -- see resource.Config.Scope.
+				Usage:   "OAuth scope advertised in the PRM and the 401 challenge (http transport only)",
+				Value:   "openid",
+				Sources: cli.EnvVars("SCOPE"),
+			},
+		},
+		Action: run,
+	}
+
+	if err := cmd.Run(ctx, os.Args); err != nil {
+		fmt.Fprintf(os.Stderr, "mail-mcp: %v\n", err)
+		os.Exit(1)
+	}
+}
+
+func run(ctx context.Context, cmd *cli.Command) error {
+	log := slog.New(slog.NewJSONHandler(os.Stderr, nil))
+
+	accts, err := accounts.Load(cmd.String("accounts"))
+	if err != nil {
+		return err
+	}
+	names := make([]string, 0, len(accts))
+	for _, a := range accts {
+		names = append(names, a.Name)
+	}
+	log.Info("accounts loaded", "accounts", names, "version", version)
+
+	if cmd.String("transport") != "http" {
+		return server.New(accts, version, server.Admin).Run(ctx, &mcp.StdioTransport{})
+	}
+
+	issuer := cmd.String("issuer-url")
+	readURL, adminURL := cmd.String("read-resource-url"), cmd.String("admin-resource-url")
+	if issuer == "" || readURL == "" || adminURL == "" {
+		return fmt.Errorf("--issuer-url, --read-resource-url and --admin-resource-url are required for the http transport")
+	}
+	if readURL == adminURL {
+		// The split is the point: one audience for both would hand a
+		// read-only, 7-day token the write tools.
+		return fmt.Errorf("--read-resource-url and --admin-resource-url must differ")
+	}
+
+	mux := http.NewServeMux()
+	for _, ep := range []struct {
+		path, url string
+		mode      server.Mode
+	}{
+		{"/mcp", readURL, server.Read},
+		{"/mcp-admin", adminURL, server.Admin},
+	} {
+		auth, err := resource.New(resource.Config{
+			IssuerURL:   issuer,
+			ResourceURL: ep.url,
+			Scope:       cmd.String("scope"),
+		})
+		if err != nil {
+			return fmt.Errorf("auth for %s: %w", ep.path, err)
+		}
+		s := server.New(accts, version, ep.mode)
+		h := mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return s }, nil)
+
+		mux.Handle(ep.path, auth.Protect(h))
+		mux.Handle(ep.path+"/", auth.Protect(h))
+		// RFC 9728 puts each resource's own path after the well-known
+		// prefix, so the two endpoints get two metadata documents.
+		mux.Handle(auth.Path(), auth.Metadata())
+		log.Info("endpoint", "path", ep.path, "mode", ep.mode.String(), "resource", ep.url, "metadata", auth.Path())
+	}
+
+	// Liveness only, and deliberately does NOT touch any mailbox: a probe that
+	// fails when Gmail blips takes the pod out of service for something a
+	// restart cannot fix. Unauthenticated on purpose -- a probe carries no token.
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok\n"))
+	})
+
+	addr := cmd.String("addr")
+	srv := &http.Server{Addr: addr, Handler: mux, ReadHeaderTimeout: 10 * time.Second}
+
+	go func() {
+		<-ctx.Done()
+		shutdown, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(shutdown)
+	}()
+
+	log.Info("serving mcp over http", "addr", addr)
+	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		return err
+	}
+	return nil
+}

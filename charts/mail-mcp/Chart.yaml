@@ -1,0 +1,22 @@
+apiVersion: v2
+name: mail-mcp
+description: Model Context Protocol server for mailboxes over IMAP
+type: application
+# The published chart version comes from the RELEASE TAG, not from this file --
+# the release workflow overrides it. What is here only matters for local
+# `helm template`.
+#
+# Releases from this repo must be 1.x. excavador/mail-mcp-chart publishes 0.x to
+# this same OCI path, packaging the upstream read-only Python server, and it is
+# kept as a fallback. Tagging a v0.x here would overwrite one of its charts.
+version: 1.1.0
+# Also set from the release tag by the workflow; this value is only what a
+# local `helm template` will use.
+appVersion: "1.1.0"
+home: https://github.com/excavador/mail-mcp
+sources:
+  - https://github.com/excavador/mail-mcp
+maintainers:
+  - name: Oleg Tsarev
+    email: oleg@tsarev.id
+keywords: [mcp, mail, imap]

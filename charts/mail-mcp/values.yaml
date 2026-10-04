@@ -1,0 +1,79 @@
+image:
+  registry: ghcr.io
+  repository: excavador/mail-mcp
+  # Empty means the chart's appVersion. Pin it in a values file to upgrade
+  # deliberately rather than whenever the chart is republished.
+  tag: ""
+  pullPolicy: IfNotPresent
+
+replicaCount: 1
+
+# A Secret holding accounts.yaml plus one key per password file.
+# Mount it read-only at /etc/mail-mcp with ACCOUNTS_FILE=/etc/mail-mcp/accounts.yaml
+accounts:
+  # Required. The accounts file and password files are never literals in values:
+  # they would end up in a values file, in git, and in `helm get values` output.
+  existingSecret: ""
+
+# stdio is meaningless in a pod, so this chart only ever runs http.
+service:
+  type: ClusterIP
+  port: 8080
+
+# The server validates every request itself against access-roster: no
+# secret to provide here, because a bearer token is never a literal and a
+# CIMD client never registers one. All three are required.
+auth:
+  # access-roster's own URL, exactly as it appears in a token's `iss`.
+  issuerUrl: ""
+  # This server's own EXTERNAL URL (not its in-cluster Service address):
+  # the RFC 8707 resource indicator a client names, and the audience
+  # access-roster mints a token for. Must match, byte for byte, this
+  # resource's id in access-roster's own policy.
+  readResourceUrl: ""
+  # The admin endpoint URL, also for RFC 8707 resource indicator.
+  # Must be different from readResourceUrl.
+  adminResourceUrl: ""
+  # Advertised in the PRM's scopes_supported and the 401 challenge's
+  # scope -- never checked by this server itself. access-roster refuses
+  # an authorize request with no scope at all; "openid" is the one it
+  # accepts by default. An estate needing more sets this, not the image.
+  scope: openid
+
+# Cache directory: a writable PVC for IMAP cache. In production this should
+# be backed up and durable; in development an emptyDir is acceptable.
+cache:
+  storageClass: nvme
+  size: 20Gi
+
+# History directory: an optional PVC for command history.
+# When empty (not set), an emptyDir is used and history is discarded on restart.
+# In production this should be a durable, backed-up PVC for persistence.
+history:
+  # existingClaim: ""
+
+resources:
+  requests: {cpu: 20m, memory: 64Mi}
+  limits: {memory: 128Mi}
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+  fsGroup: 65532
+  seccompProfile: {type: RuntimeDefault}
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities: {drop: ["ALL"]}
+
+# Annotations on the DEPLOYMENT, not the pod template. Reloader reads them
+# here: an annotation on the pod template looks right and is never seen, so a
+# rotated token would sit in a Secret while the pod kept the old one.
+deploymentAnnotations: {}
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+podAnnotations: {}

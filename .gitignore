@@ -1,0 +1,5 @@
+# Anchored to the repo root ON PURPOSE. A bare `mail-mcp` also matches
+# charts/mail-mcp/ and cmd/mail-mcp/, which is how a whole chart and a
+# main package once went missing while every check stayed green.
+/mail-mcp
+/dist/

@@ -1,0 +1,172 @@
+{
+  "$schema": "https://json-schema.org/draft-07/schema#",
+  "title": "mail-mcp values",
+  "description": "Strict: a typo in a values file should fail the render, not be silently ignored and leave you wondering why a setting had no effect.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "image",
+    "accounts",
+    "service",
+    "auth"
+  ],
+  "properties": {
+    "nameOverride": {
+      "type": "string"
+    },
+    "fullnameOverride": {
+      "type": "string"
+    },
+    "replicaCount": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "image": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "registry",
+        "repository"
+      ],
+      "properties": {
+        "registry": {
+          "type": "string",
+          "minLength": 1
+        },
+        "repository": {
+          "type": "string",
+          "minLength": 1
+        },
+        "tag": {
+          "type": "string",
+          "description": "Empty means the chart's appVersion. Pin it to upgrade deliberately rather than whenever the chart is republished."
+        },
+        "pullPolicy": {
+          "enum": [
+            "Always",
+            "IfNotPresent",
+            "Never"
+          ]
+        }
+      }
+    },
+    "accounts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "existingSecret"
+      ],
+      "properties": {
+        "existingSecret": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Required. The accounts file and password files are never literals in values: they would end up in a values file, in git, and in `helm get values` output."
+        }
+      }
+    },
+    "service": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "port"
+      ],
+      "properties": {
+        "type": {
+          "enum": [
+            "ClusterIP",
+            "NodePort",
+            "LoadBalancer"
+          ]
+        },
+        "port": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65535
+        }
+      }
+    },
+    "auth": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "issuerUrl",
+        "readResourceUrl",
+        "adminResourceUrl"
+      ],
+      "properties": {
+        "issuerUrl": {
+          "type": "string",
+          "minLength": 1,
+          "description": "access-roster's own URL, exactly as it appears in a token's `iss`."
+        },
+        "readResourceUrl": {
+          "type": "string",
+          "minLength": 1,
+          "description": "This server's read endpoint EXTERNAL URL: the RFC 8707 resource indicator a client names, and the audience access-roster mints for it. Must match this resource's id in access-roster's policy, byte for byte."
+        },
+        "adminResourceUrl": {
+          "type": "string",
+          "minLength": 1,
+          "description": "This server's admin endpoint EXTERNAL URL: must be different from readResourceUrl."
+        },
+        "scope": {
+          "type": "string",
+          "description": "Advertised in the PRM's scopes_supported and the 401 challenge's scope; never checked by this server. Empty omits both fields rather than advertising an empty list."
+        }
+      }
+    },
+    "cache": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "storageClass": {
+          "type": "string",
+          "minLength": 1
+        },
+        "size": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "history": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "existingClaim": {
+          "type": "string",
+          "description": "Optional. When empty, an emptyDir is used and history is discarded on restart. In production this should be a durable, backed-up PVC."
+        }
+      }
+    },
+    "resources": {
+      "type": "object"
+    },
+    "podSecurityContext": {
+      "type": "object"
+    },
+    "securityContext": {
+      "type": "object"
+    },
+    "nodeSelector": {
+      "type": "object"
+    },
+    "tolerations": {
+      "type": "array"
+    },
+    "affinity": {
+      "type": "object"
+    },
+    "podAnnotations": {
+      "type": "object"
+    },
+    "deploymentAnnotations": {
+      "type": "object",
+      "description": "Annotations on the Deployment itself. Reloader reads them here, not on the pod template.",
+      "additionalProperties": {
+        "type": "string"
+      }
+    }
+  }
+}

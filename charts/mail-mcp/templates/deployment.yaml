@@ -1,0 +1,100 @@
+{{- include "mail-mcp.validate" . }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "mail-mcp.fullname" . }}
+  labels: {{- include "mail-mcp.labels" . | nindent 4 }}
+  {{- with .Values.deploymentAnnotations }}
+  annotations: {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels: {{- include "mail-mcp.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels: {{- include "mail-mcp.selectorLabels" . | nindent 8 }}
+      {{- with .Values.podAnnotations }}
+      annotations: {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      securityContext: {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: mail-mcp
+          image: "{{ .Values.image.registry }}/{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext: {{- toYaml .Values.securityContext | nindent 12 }}
+          env:
+            - name: ACCOUNTS_FILE
+              value: /etc/mail-mcp/accounts.yaml
+            # stdio would exit immediately in a pod with no attached client.
+            - name: TRANSPORT
+              value: http
+            - name: ADDR
+              value: "0.0.0.0:{{ .Values.service.port }}"
+            - name: ISSUER_URL
+              value: {{ .Values.auth.issuerUrl | quote }}
+            - name: READ_RESOURCE_URL
+              value: {{ .Values.auth.readResourceUrl | quote }}
+            - name: ADMIN_RESOURCE_URL
+              value: {{ .Values.auth.adminResourceUrl | quote }}
+            - name: SCOPE
+              value: {{ .Values.auth.scope | quote }}
+            - name: CACHE_DIR
+              value: /var/cache/mail-mcp
+            - name: HISTORY_DIR
+              value: /var/lib/mail-mcp/history
+          ports:
+            - name: http
+              containerPort: {{ .Values.service.port }}
+              protocol: TCP
+          # /healthz is liveness only and does NOT call external services:
+          # a readiness probe that fails when a dependency blips would take
+          # the pod out of service for something it cannot fix by restarting.
+          livenessProbe:
+            httpGet: {path: /healthz, port: http}
+            initialDelaySeconds: 5
+            periodSeconds: 20
+          readinessProbe:
+            httpGet: {path: /healthz, port: http}
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          resources: {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            - name: accounts
+              mountPath: /etc/mail-mcp
+              readOnly: true
+            - name: cache
+              mountPath: /var/cache/mail-mcp
+            - name: history
+              mountPath: /var/lib/mail-mcp/history
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: accounts
+          secret:
+            secretName: {{ .Values.accounts.existingSecret }}
+            defaultMode: 0400
+        - name: cache
+          persistentVolumeClaim:
+            claimName: {{ include "mail-mcp.fullname" . }}-cache
+        - name: history
+          {{- if .Values.history.existingClaim }}
+          persistentVolumeClaim:
+            claimName: {{ .Values.history.existingClaim }}
+          {{- else }}
+          # When history.existingClaim is not set, use an emptyDir.
+          # In production, set history.existingClaim to a durable, backed-up PVC.
+          emptyDir: {}
+          {{- end }}
+        - name: tmp
+          emptyDir: {}
+      {{- with .Values.nodeSelector }}
+      nodeSelector: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity: {{- toYaml . | nindent 8 }}
+      {{- end }}
