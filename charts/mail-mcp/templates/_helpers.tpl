@@ -53,10 +53,3 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- fail "auth.readResourceUrl and auth.adminResourceUrl must be different" -}}
 {{- end -}}
 {{- end -}}
-
-{{/* Return history.existingClaim if it's set, otherwise empty string.
-     Guards against null values safely. */}}
-{{- define "mail-mcp.historyExistingClaim" -}}
-{{- $claim := dig "history" "existingClaim" "" .Values -}}
-{{- if $claim }}{{ $claim }}{{ end -}}
-{{- end -}}
