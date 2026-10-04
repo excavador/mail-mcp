@@ -20,6 +20,7 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/excavador/mail-mcp/internal/accounts"
+	"github.com/excavador/mail-mcp/internal/cache"
 	"github.com/excavador/mail-mcp/internal/imapx"
 )
 
@@ -43,7 +44,7 @@ func readOnly() *mcp.ToolAnnotations {
 }
 
 // New builds one MCP server carrying the tools for mode.
-func New(accts []accounts.Account, version string, mode Mode) *mcp.Server {
+func New(accts []accounts.Account, store *cache.Cache, version string, mode Mode) *mcp.Server {
 	s := mcp.NewServer(&mcp.Implementation{Name: "mail-" + mode.String(), Version: version}, nil)
 	byName := map[string]accounts.Account{}
 	for _, a := range accts {
@@ -51,6 +52,7 @@ func New(accts []accounts.Account, version string, mode Mode) *mcp.Server {
 	}
 
 	addReads(s, accts, byName)
+	addCacheStatus(s, store)
 	// Write tools (create_folder, apply, undo, reapply) are registered only
 	// for Admin, and arrive with the organise and history work.
 	return s
@@ -108,5 +110,23 @@ func addReads(s *mcp.Server, accts []accounts.Account, byName map[string]account
 			return nil, nil, err
 		}
 		return nil, map[string]any{"account": a.Name, "folders": folders, "count": len(folders)}, nil
+	})
+}
+
+// addCacheStatus registers cache_status, which reports what the local cache
+// holds. It reads only the cache, never a mailbox, so it is as cheap and as
+// safe as a tool gets.
+func addCacheStatus(s *mcp.Server, store *cache.Cache) {
+	mcp.AddTool(s, &mcp.Tool{
+		Name: "cache_status",
+		Description: "Report what the local message cache holds for each account: cached messages, " +
+			"folder memberships, folders, and when the cache was last refreshed from the mailbox.",
+		Annotations: readOnly(),
+	}, func(ctx context.Context, _ *mcp.CallToolRequest, _ struct{}) (*mcp.CallToolResult, any, error) {
+		st, err := store.Status(ctx)
+		if err != nil {
+			return nil, nil, err
+		}
+		return nil, map[string]any{"accounts": st}, nil
 	})
 }

@@ -21,6 +21,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
@@ -29,6 +30,7 @@ import (
 	"github.com/urfave/cli/v3"
 
 	"github.com/excavador/mail-mcp/internal/accounts"
+	"github.com/excavador/mail-mcp/internal/cache"
 	"github.com/excavador/mail-mcp/internal/server"
 )
 
@@ -94,6 +96,21 @@ func main() {
 				Value:   "openid",
 				Sources: cli.EnvVars("SCOPE"),
 			},
+			&cli.StringFlag{
+				Name: "cache-dir",
+				// Message blobs and the search index. Losing it only costs a
+				// re-fetch, so an emptyDir would work; a volume avoids paying
+				// that on every restart.
+				Usage:   "directory for the immutable message cache",
+				Value:   "/var/cache/mail-mcp",
+				Sources: cli.EnvVars("CACHE_DIR"),
+			},
+			&cli.DurationFlag{
+				Name:    "refresh-interval",
+				Usage:   "how often to refresh the cache from each mailbox; 0 disables refreshing",
+				Value:   15 * time.Minute,
+				Sources: cli.EnvVars("REFRESH_INTERVAL"),
+			},
 		},
 		Action: run,
 	}
@@ -117,8 +134,29 @@ func run(ctx context.Context, cmd *cli.Command) error {
 	}
 	log.Info("accounts loaded", "accounts", names, "version", version)
 
+	store, err := cache.Open(cmd.String("cache-dir"))
+	if err != nil {
+		return err
+	}
+	// Refreshers stop, and are waited for, before the cache closes under them.
+	ctx, cancel := context.WithCancel(ctx)
+	var wg sync.WaitGroup
+	defer func() {
+		cancel()
+		wg.Wait()
+		_ = store.Close()
+	}()
+	for _, a := range accts {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			store.Run(ctx, log, a, cmd.Duration("refresh-interval"))
+		}()
+	}
+	log.Info("cache", "dir", cmd.String("cache-dir"), "refresh_interval", cmd.Duration("refresh-interval").String())
+
 	if cmd.String("transport") != "http" {
-		return server.New(accts, version, server.Admin).Run(ctx, &mcp.StdioTransport{})
+		return server.New(accts, store, version, server.Admin).Run(ctx, &mcp.StdioTransport{})
 	}
 
 	issuer := cmd.String("issuer-url")
@@ -148,7 +186,7 @@ func run(ctx context.Context, cmd *cli.Command) error {
 		if err != nil {
 			return fmt.Errorf("auth for %s: %w", ep.path, err)
 		}
-		s := server.New(accts, version, ep.mode)
+		s := server.New(accts, store, version, ep.mode)
 		h := mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return s }, nil)
 
 		mux.Handle(ep.path, auth.Protect(h))
