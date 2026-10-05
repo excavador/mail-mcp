@@ -19,6 +19,7 @@ import (
 	"github.com/excavador/mail-mcp/internal/accounts"
 	"github.com/excavador/mail-mcp/internal/cache"
 	"github.com/excavador/mail-mcp/internal/history"
+	"github.com/excavador/mail-mcp/internal/imapx"
 	"github.com/excavador/mail-mcp/internal/organise"
 )
 
@@ -515,6 +516,9 @@ func addApplyIntent(s *mcp.Server, d writeDeps) {
 
 // applyErrorText is the fixed text recorded and shown for a failed apply.
 func applyErrorText(err error) string {
+	if errors.Is(err, imapx.ErrTimeout) {
+		return "mail server did not answer in time"
+	}
 	var se organise.SafeError
 	if errors.As(err, &se) {
 		return se.Error()

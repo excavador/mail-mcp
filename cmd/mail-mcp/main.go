@@ -158,6 +158,10 @@ func main() {
 
 func run(ctx context.Context, cmd *cli.Command) error {
 	log := slog.New(slog.NewJSONHandler(os.Stderr, nil))
+	// The package-level slog functions (tool failures, imap session lines) and
+	// the standard log package write through the default logger; without
+	// this they came out as text lines beside the JSON ones.
+	slog.SetDefault(log)
 	memlimit.Set(log)
 
 	approval, err := server.ParseApprovalMode(cmd.String("approval-mode"))
@@ -243,7 +247,7 @@ func run(ctx context.Context, cmd *cli.Command) error {
 			return fmt.Errorf("auth for %s: %w", ep.path, err)
 		}
 		s := server.New(accts, store, version, ep.mode, opts...)
-		h := mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return s }, nil)
+		h := mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return s }, &mcp.StreamableHTTPOptions{Logger: log})
 
 		mux.Handle(ep.path, auth.Protect(h))
 		mux.Handle(ep.path+"/", auth.Protect(h))
