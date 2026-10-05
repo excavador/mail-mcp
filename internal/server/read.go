@@ -170,22 +170,19 @@ func addListFolders(s *mcp.Server, byName map[string]accounts.Account, store *ca
 	})
 }
 
-// syntaxHint is the part of an FTS5 error worth showing: SQLite's own words
-// for what is wrong with the expression ("fts5: syntax error near ..."),
-// stripped of anything else and kept short.
+// syntaxHint turns an FTS5 error into advice that does not echo the query:
+// SQLite's own message quotes the offending input ("near \".\""), which is
+// both noise and attacker-influenced text. Anything it does not recognise
+// adds nothing.
 func syntaxHint(err error) string {
 	msg := err.Error()
-	if i := strings.Index(msg, "fts5:"); i >= 0 {
-		msg = msg[i:]
-	} else if i := strings.Index(msg, "no such column"); i >= 0 {
-		msg = msg[i:]
-	} else {
-		return ""
+	switch {
+	case strings.Contains(msg, "fts5: syntax error"):
+		return `: quote terms that contain punctuation, e.g. "amazon.nl"; balance quotes and parentheses; AND, OR and NOT need a term on both sides`
+	case strings.Contains(msg, "no such column"):
+		return ": unknown column filter; the columns are subject, from_addr, to_addr, cc_addr and body"
 	}
-	if strings.ContainsAny(msg, "/\\") {
-		return ""
-	}
-	return ": " + capRunes(clean(msg), 120)
+	return ""
 }
 
 const (

@@ -342,6 +342,11 @@ func (c *Cache) SearchV2(ctx context.Context, o SearchOptions) (SearchResult, er
 	}
 	margs := plan.args
 	hasText := strings.TrimSpace(o.Text) != ""
+	// pageCtx is the budget for decorating the page (folders, thread info):
+	// the match query may use up its whole searchTimeout and the page it found
+	// must still be answered, not lost to a deadline that is already spent.
+	pageCtx, pageCancel := context.WithTimeout(ctx, pageTimeout)
+	defer pageCancel()
 	ctx, cancel := context.WithTimeout(ctx, searchTimeout)
 	defer cancel()
 
@@ -448,7 +453,7 @@ GROUP BY x.account, COALESCE(mt.tid, 'u:' || x.stable_id))`
 			}
 			res.Messages = append(res.Messages, h)
 		}
-		if err := c.fillFolders(ctx, res.Messages); err != nil {
+		if err := c.fillFolders(pageCtx, res.Messages); err != nil {
 			return res, err
 		}
 	} else {
@@ -456,7 +461,7 @@ GROUP BY x.account, COALESCE(mt.tid, 'u:' || x.stable_id))`
 		for _, p := range pg {
 			refs = append(refs, threadRef{account: p.account, tid: p.tid, top: p.stableID, matched: p.matched, date: p.date, snippet: snip(p)})
 		}
-		hits, err := c.threadHits(ctx, refs)
+		hits, err := c.threadHits(pageCtx, refs)
 		if err != nil {
 			return res, err
 		}

@@ -952,7 +952,13 @@ func (c *Cache) BackfillThreads(ctx context.Context, log *slog.Logger) error {
 	start, processed := c.now(), 0
 	var rl *rateLog
 	if log != nil {
-		rl = newRateLog("thread backfill", log, 0)
+		// Rates count from where this run starts, not from 0: after a restart
+		// the first line would otherwise report the whole backlog as one minute's work.
+		from := 0
+		if st, err := c.ThreadsBackfillStatus(ctx); err == nil {
+			from = st.Done
+		}
+		rl = newRateLog("thread backfill", log, from)
 	}
 	for {
 		var (

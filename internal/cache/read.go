@@ -172,7 +172,8 @@ const (
 	maxExcludeFrom      = 20
 	maxExcludeFromBytes = 320
 	searchTimeout       = 5 * time.Second
-	folderChunk         = 500 // ids per membership lookup
+	pageTimeout         = 10 * time.Second // from the start: up to searchTimeout more for the page
+	folderChunk         = 500              // ids per membership lookup
 	maxAddrsListed      = 50
 	listedAddrsNote     = "+%d more"
 )

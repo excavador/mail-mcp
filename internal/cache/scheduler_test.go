@@ -1,6 +1,7 @@
 package cache
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -238,5 +239,19 @@ func TestMeasureBackfills(t *testing.T) {
 	_ = c.db.QueryRow(`SELECT COUNT(*) FROM message_thread`).Scan(&nt)
 	if nt != n {
 		t.Errorf("threaded %d of %d", nt, n)
+	}
+}
+
+func TestRateLogCountsFromWhereTheRunStarted(t *testing.T) {
+	var buf bytes.Buffer
+	log := slog.New(slog.NewTextHandler(&buf, nil))
+	rl := newRateLog("job", log, 320000)
+	rl.start = rl.start.Add(-time.Minute)
+	rl.last = rl.last.Add(-time.Minute)
+	rl.tick(320600, 336000)
+	out := buf.String()
+	// 600 messages in a minute: 10/s, not 5334/s counted from zero.
+	if !strings.Contains(out, "msg_per_s=10.0") || !strings.Contains(out, "avg_msg_per_s=10.0") {
+		t.Errorf("rates not relative to the start of the run: %s", out)
 	}
 }
