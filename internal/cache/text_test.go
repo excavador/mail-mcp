@@ -79,3 +79,24 @@ func TestRewriteBodyFilterSkipsQuotedPhrases(t *testing.T) {
 		}
 	}
 }
+
+func TestPlainTextEntitiesDecodedOnce(t *testing.T) {
+	raw := "From: a@x.com\r\nTo: b@x.com\r\nSubject: s\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n" +
+		"Use &lt;ul&gt; &amp; &quot;li&quot; &#39;x&#39; AT&amp;T &amp;lt; see https://x.test/?a=1&copy=2\r\n"
+	p := parseMessage([]byte(raw))
+	want := `Use <ul> & "li" 'x' AT&T &lt; see https://x.test/?a=1&copy=2`
+	if p.Body != want || p.BodyNew != want {
+		t.Errorf("body %q, new %q; want %q", p.Body, p.BodyNew, want)
+	}
+	plain := "From: a@x.com\r\nSubject: s\r\nContent-Type: text/plain\r\n\r\nno entities & here <b>\r\n"
+	if got := parseMessage([]byte(plain)).Body; got != "no entities & here <b>" {
+		t.Errorf("untouched plain: %q", got)
+	}
+}
+
+func TestHTMLEntitiesDecodedAfterTagsStripped(t *testing.T) {
+	got := stripHTML("<p>a &lt;b&gt;bold&lt;/b&gt; &amp; c</p>")
+	if got != "a <b>bold</b> & c" {
+		t.Errorf("got %q", got)
+	}
+}
