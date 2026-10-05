@@ -39,7 +39,14 @@ type entityStats struct {
 	Candidates int // rows the MATCH listed
 	Rewritten  int // rows whose text changed
 	Missing    int // candidates whose blob could not be read
+	// SkippedEmpty counts rewrites refused because they would blank a column
+	// that holds text; SkippedLarge counts blobs over maxReindexBlob.
+	SkippedEmpty int
+	SkippedLarge int
 }
+
+// maxReindexBlob is the largest blob the job reads.
+const maxReindexBlob = 32 << 20
 
 // EntitiesStatus is the progress of the fts2_entities job, like BackfillStatus.
 // Done counts candidates examined, Total the messages the job started with, so
@@ -113,11 +120,14 @@ func (c *Cache) runEntities(ctx context.Context, log *slog.Logger) (entityStats,
 		total.Candidates += st.Candidates
 		total.Rewritten += st.Rewritten
 		total.Missing += st.Missing
+		total.SkippedEmpty += st.SkippedEmpty
+		total.SkippedLarge += st.SkippedLarge
 		if err != nil {
 			return total, err
 		}
 		if finished {
 			log.Info("fts2 entities done", "candidates", total.Candidates, "rewritten", total.Rewritten, "missing", total.Missing,
+				"skipped_empty", total.SkippedEmpty, "skipped_large", total.SkippedLarge,
 				"took", time.Since(start).Round(time.Millisecond).String())
 			return total, nil
 		}
@@ -142,15 +152,16 @@ func (c *Cache) entitiesBatch(ctx context.Context) (finished bool, st entityStat
 		return false, st, 0, fmt.Errorf("read entities state: %w", err)
 	}
 	type item struct {
-		rid          int64
-		body, bodyNo string
-		write        bool
+		rid             int64
+		body, bodyNo    string
+		oldNew, oldFull string // what the row held when it was read
+		write           bool
 	}
 	rows, err := c.db.QueryContext(ctx, `
 SELECT message_fts2.rowid, message_fts2.body_new, message_fts2.body_full, m.blob_sha256
 FROM message_fts2 JOIN messages m ON m.rowid = message_fts2.rowid
 WHERE message_fts2 MATCH ? AND message_fts2.rowid > ? AND message_fts2.rowid <= ?
-ORDER BY message_fts2.rowid LIMIT ?`, entityMatch, last, maxRow, entitiesBatchRows)
+ORDER BY message_fts2.rowid LIMIT ?`, entityMatch, last, maxRow, max(entitiesBatchRows, 1))
 	if err != nil {
 		return false, st, 0, fmt.Errorf("list entity candidates: %w", err)
 	}
@@ -174,17 +185,30 @@ ORDER BY message_fts2.rowid LIMIT ?`, entityMatch, last, maxRow, entitiesBatchRo
 				raw  []byte
 				rerr error
 			)
+			large := false
 			if path := c.BlobPath(blob); path != "" {
-				raw, rerr = os.ReadFile(path)
+				if fi, serr := os.Stat(path); serr == nil && fi.Size() > maxReindexBlob {
+					large = true
+				} else {
+					raw, rerr = os.ReadFile(path)
+				}
 			}
-			if raw == nil || rerr != nil {
+			if large {
+				st.SkippedLarge++
+			} else if raw == nil || rerr != nil {
 				st.Missing++
 			} else if b, bn, ok := parseBody(raw); ok {
 				if b == bn {
 					b = "" // the same words are already in body_new
 				}
-				if bn != bodyNew || b != full {
-					it.body, it.bodyNo, it.write = bn, b, true
+				switch {
+				case bn == "" && (bodyNew != "" || full != ""):
+					// Never blank a row (body_full is empty by design when it equals
+					// body_new, so only an empty body_new counts): the extractor found less than the
+					// index holds, and the index is the safer side.
+					st.SkippedEmpty++
+				case bn != bodyNew || b != full:
+					it.body, it.bodyNo, it.oldNew, it.oldFull, it.write = bn, b, bodyNew, full, true
 					heldBytes += len(bn) + len(b)
 				}
 			}
@@ -212,11 +236,12 @@ ORDER BY message_fts2.rowid LIMIT ?`, entityMatch, last, maxRow, entitiesBatchRo
 		j, wrote := i, 0
 		for j < len(items) && (j == i || (j-i < writeRows && time.Since(locked) < writeSlice)) {
 			if it := items[j]; it.write {
-				if err := rewriteBodyTx(ctx, tx, it.rid, it.body, it.bodyNo); err != nil {
+				n, err := rewriteBodyTx(ctx, tx, it.rid, it.body, it.bodyNo, it.oldNew, it.oldFull)
+				if err != nil {
 					_ = tx.Rollback()
 					return false, st, held, err
 				}
-				wrote++
+				wrote += n
 			}
 			j++
 		}
@@ -233,10 +258,15 @@ ORDER BY message_fts2.rowid LIMIT ?`, entityMatch, last, maxRow, entitiesBatchRo
 	return false, st, held, nil
 }
 
-// rewriteBodyTx replaces the two body columns of a message_fts2 row.
-func rewriteBodyTx(ctx context.Context, tx *sql.Tx, rid int64, bodyNew, bodyFull string) error {
-	if _, err := tx.ExecContext(ctx, `UPDATE message_fts2 SET body_new = ?, body_full = ? WHERE rowid = ?`, bodyNew, bodyFull, rid); err != nil {
-		return fmt.Errorf("rewrite entities: %w", err)
+// rewriteBodyTx replaces the two body columns of a message_fts2 row, only if
+// the row still holds the text it was read with (a refresh or another job may
+// have rewritten it since). It returns 1 if it wrote the row, else 0.
+func rewriteBodyTx(ctx context.Context, tx *sql.Tx, rid int64, bodyNew, bodyFull, oldNew, oldFull string) (int, error) {
+	res, err := tx.ExecContext(ctx, `UPDATE message_fts2 SET body_new = ?, body_full = ? WHERE rowid = ? AND body_new = ? AND body_full = ?`,
+		bodyNew, bodyFull, rid, oldNew, oldFull)
+	if err != nil {
+		return 0, fmt.Errorf("rewrite entities: %w", err)
 	}
-	return nil
+	n, _ := res.RowsAffected()
+	return int(n), nil
 }

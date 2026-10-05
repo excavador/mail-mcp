@@ -72,6 +72,8 @@ func TestSearchExcludeFromAndKindOverTheTool(t *testing.T) {
 		long[i] = "x"
 	}
 	qsToolErr(t, cs, "search", base(map[string]any{"exclude_from": long}), "more than 20")
+	qsToolErr(t, cs, "search", base(map[string]any{"exclude_from": []string{"a\nb"}}), "control character")
+	qsToolErr(t, cs, "search", base(map[string]any{"exclude_kind": []string{"human", "human", "list", "list", "human"}}), "more than")
 }
 
 func TestSearchExcludeIsRefusedWithServerTrue(t *testing.T) {
@@ -136,5 +138,35 @@ func TestSavedQueryStoresExclusions(t *testing.T) {
 	_, raw := ok[map[string]any](t, cs, "list_saved_queries", map[string]any{"account": "acct"})
 	if !strings.Contains(raw, `"exclude_from":["bob@"]`) || !strings.Contains(raw, `"exclude_kind":["list","transactional","notification"]`) {
 		t.Errorf("list_saved_queries does not show the exclusions: %s", raw)
+	}
+}
+
+func TestSearchEchoesTheExclusionsItApplied(t *testing.T) {
+	e := excEnv(t)
+	cs := e.admin()
+	type echo struct {
+		Excluded *struct {
+			From []string `json:"from"`
+			Kind []string `json:"kind"`
+		} `json:"excluded"`
+	}
+	r, _ := ok[echo](t, cs, "search", map[string]any{"account": "acct", "query": "body"})
+	if r.Excluded != nil {
+		t.Errorf("echo without exclusions: %+v", r.Excluded)
+	}
+	r, _ = ok[echo](t, cs, "search", map[string]any{"account": "acct", "query": "body", "exclude_from": []string{"BOB@", "bob@", "x\u202ey"}, "exclude_kind": []string{"list"}})
+	if r.Excluded == nil || len(r.Excluded.From) != 2 || r.Excluded.From[0] != "bob@" || !slices.Equal(r.Excluded.Kind, []string{"list"}) {
+		t.Fatalf("echo %+v", r.Excluded)
+	}
+	for _, f := range r.Excluded.From {
+		if strings.ContainsRune(f, '\u202e') {
+			t.Errorf("echo is not sanitised: %q", f)
+		}
+	}
+	// Exclusions that come from a saved query are echoed too.
+	ok[map[string]any](t, cs, "save_query", map[string]any{"account": "acct", "name": "quiet", "query": "body", "exclude_from": []string{"alice@"}})
+	r, _ = ok[echo](t, cs, "search", map[string]any{"account": "acct", "saved": "quiet"})
+	if r.Excluded == nil || !slices.Equal(r.Excluded.From, []string{"alice@"}) {
+		t.Errorf("saved echo %+v", r.Excluded)
 	}
 }

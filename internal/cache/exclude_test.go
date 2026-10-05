@@ -207,3 +207,47 @@ func TestExcludeInThreadModeDropsAThreadOnlyWhenAllItsMatchesAreExcluded(t *test
 		t.Errorf("message mode total %d, want 2", res.Total)
 	}
 }
+
+func TestExclusionsAreDeduplicatedFoldedAndCollisionFree(t *testing.T) {
+	c := thrOpen(t)
+	ctx := context.Background()
+	// Control characters are refused; 4 kinds is the most there can be.
+	for _, bad := range []string{"a\x00b", "a\nb", "a\tb", "a\x7fb", "\x1d"} {
+		if err := ValidateExclusions([]string{bad}, nil); !errors.Is(err, ErrQueryLimit) {
+			t.Errorf("%q: %v, want a refusal", bad, err)
+		}
+	}
+	if err := ValidateExclusions(nil, []string{"human", "human", "list", "list", "human"}); !errors.Is(err, ErrQueryLimit) {
+		t.Errorf("5 kinds: %v, want a refusal", err)
+	}
+	// Duplicates reach neither the SQL nor the key.
+	nf, nk := NormalizeExclusions([]string{"Bob", " bob", "BOB", "al"}, []string{"list", "list", "human"})
+	if !slices.Equal(nf, []string{"al", "bob"}) || !slices.Equal(nk, []string{"human", "list"}) {
+		t.Errorf("normalised to %v %v", nf, nk)
+	}
+	if ExclusionKey([]string{"bob", "BOB"}, []string{"list", "list"}) != ExclusionKey([]string{"Bob"}, []string{"list"}) {
+		t.Error("duplicates change the key")
+	}
+	t0 := time.Date(2026, 3, 1, 9, 0, 0, 0, time.UTC)
+	exclAdd(t, c, "b", "Bob <bob@x.example>", t0)
+	exclAdd(t, c, "a", "Al <al@x.example>", t0.Add(time.Hour))
+	res, err := c.SearchV2(ctx, SearchOptions{SearchQuery: SearchQuery{Text: "ledger", ExcludeFrom: slices.Repeat([]string{"BOB@"}, 20), ExcludeKind: []string{"human", "human"}, Limit: 10}, GroupBy: "message"})
+	if err != nil || res.Total != 1 {
+		t.Errorf("duplicated exclusions: %+v %v", res, err)
+	}
+	// The key cannot be forged by an entry holding a separator.
+	for _, p := range [][2][]string{
+		{{"a,b"}, {"a", "b"}},
+		{{"a\"", "b"}, {"a", "\"b"}},
+		{{"a\x1eb"}, {"a", "b"}},
+		{{"x"}, {"x", "x\x1d"}},
+	} {
+		if ExclusionKey(p[0], nil) == ExclusionKey(p[1], nil) {
+			t.Errorf("%q and %q share a key", p[0], p[1])
+		}
+	}
+	// Folding is ASCII only, like SQLite's lower(): the key and the pattern agree.
+	if nf, _ := NormalizeExclusions([]string{"ÀB", "É"}, nil); !slices.Equal(nf, []string{"Àb", "É"}) {
+		t.Errorf("non-ASCII folded: %q", nf)
+	}
+}

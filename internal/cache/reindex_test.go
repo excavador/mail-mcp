@@ -210,3 +210,36 @@ func TestReindexResumesAfterCancelWithoutDoubleWork(t *testing.T) {
 		t.Errorf("status at the end: %+v", s)
 	}
 }
+
+func TestReindexNeverBlanksARowAndWritesOnlyIfUnchanged(t *testing.T) {
+	c := thrOpen(t)
+	t0 := time.Date(2026, 3, 1, 9, 0, 0, 0, time.UTC)
+	// "&nbsp;" decodes to a no-break space, which trims to an empty body.
+	blank := entAdd(t, c, "blank", true, "&nbsp;", t0)
+	before := entBody(t, c, blank)
+	restartEntities(t, c)
+	st, err := c.runEntities(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.SkippedEmpty != 1 || st.Rewritten != 0 || entBody(t, c, blank) != before {
+		t.Errorf("stats %+v, row %q -> %q: an emptying rewrite must be skipped", st, before, entBody(t, c, blank))
+	}
+	// The update is a compare-and-swap on the text that was read.
+	rid := entAdd(t, c, "cas", true, html.EscapeString(entPlain), t0.Add(time.Hour))
+	cur := entBody(t, c, rid)
+	tx, err := c.db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	n, err := rewriteBodyTx(context.Background(), tx, rid, "new", "", "changed meanwhile", "")
+	if err != nil || n != 0 {
+		t.Errorf("stale compare wrote %d rows (%v)", n, err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if entBody(t, c, rid) != cur {
+		t.Error("a row that changed since it was read was overwritten")
+	}
+}
