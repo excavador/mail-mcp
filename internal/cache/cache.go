@@ -29,6 +29,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"time"
 
 	// Pure-Go SQLite (with FTS5): the binary is CGO_ENABLED=0 on a distroless
@@ -41,6 +42,8 @@ import (
 type Cache struct {
 	dir string
 	db  *sql.DB
+
+	folderQueries atomic.Int64 // membership lookups for folders of messages
 }
 
 const schema = `

@@ -141,6 +141,9 @@ func (o *Organiser) PreviewIntent(ctx context.Context, a accounts.Account, in In
 	if err := in.Validate(a.Provider); err != nil {
 		return nil, err
 	}
+	if err := o.checkTarget(ctx, a.Name, in.Target); err != nil {
+		return nil, err
+	}
 	p := &Preview{Account: a.Name, Intent: in, Kind: kind, After: after, Reapplies: reapplies}
 	ms, err := o.resolve(ctx, p)
 	if err != nil {
@@ -157,6 +160,9 @@ func (o *Organiser) PreviewIDs(ctx context.Context, a accounts.Account, in Inten
 	if err := in.CheckMove(a.Provider); err != nil {
 		return nil, err
 	}
+	if err := o.checkTarget(ctx, a.Name, in.Target); err != nil {
+		return nil, err
+	}
 	if len(ids)+len(copyBack) > maxIntentMessages {
 		return nil, ErrTooManyMatched
 	}
@@ -164,6 +170,21 @@ func (o *Organiser) PreviewIDs(ctx context.Context, a accounts.Account, in Inten
 	p.CopyBack = append([]string(nil), copyBack...)
 	sort.Strings(p.CopyBack)
 	return o.issue(ctx, p, ids)
+}
+
+// checkTarget refuses a preview whose target folder the cache does not know
+// for the account. It answers from the cache's folders table (create_folder
+// records a new folder there at once), so there is no server round trip;
+// apply still re-checks with LIST.
+func (o *Organiser) checkTarget(ctx context.Context, account, target string) error {
+	ok, err := o.store.HasFolder(ctx, account, target)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return refusef(errTargetMissingFmt, target, account)
+	}
+	return nil
 }
 
 func (o *Organiser) issue(ctx context.Context, p *Preview, ids []string) (*Preview, error) {

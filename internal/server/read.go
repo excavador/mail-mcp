@@ -292,6 +292,10 @@ func serverSearch(ctx context.Context, byName map[string]accounts.Account, store
 	default:
 		return nil, searchOut{}, errors.New("live request already in progress for this account")
 	}
+	// The IMAP part has liveTimeout; the database part gets its own budget
+	// (cache.HitsByUIDTimeout) from the request context, not from what is left
+	// of this one.
+	reqCtx := ctx
 	ctx, cancel := context.WithTimeout(ctx, liveTimeout)
 	defer cancel()
 	c, err := imapx.Dial(ctx, a)
@@ -312,7 +316,7 @@ func serverSearch(ctx context.Context, byName map[string]accounts.Account, store
 	if len(uids) > maxServerUIDs {
 		uids, capped = uids[len(uids)-maxServerUIDs:], true
 	}
-	hits, truncated, uncached, err := store.HitsByUID(ctx, a.Name, folder, uids, in.Limit)
+	hits, truncated, uncached, err := store.HitsByUID(reqCtx, a.Name, folder, uids, in.Limit)
 	if err != nil {
 		return nil, searchOut{}, fail("search", "search failed", err)
 	}
