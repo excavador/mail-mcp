@@ -121,7 +121,13 @@ type SearchQuery struct {
 	Since     time.Time // inclusive
 	Until     time.Time // exclusive
 	Tag       string    // only messages carrying this tag (SearchV2 and ResolveSearch)
-	Limit     int
+	// ExcludeFrom drops messages whose From contains any of these (case-
+	// insensitive, literal). ExcludeKind drops messages whose sender has any of
+	// these kinds in the senders table; a sender not in the table is kept.
+	// Both are checked by ValidateExclusions (SearchV2 and ResolveSearch).
+	ExcludeFrom []string
+	ExcludeKind []string
+	Limit       int
 }
 
 // SearchHit is one message a search found.
@@ -159,13 +165,16 @@ var likeEscaper = strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`)
 
 // Bounds on what a search may ask for, so one call cannot be made expensive.
 const (
-	maxQueryBytes   = 512
-	maxQueryTerms   = 32
-	maxFromBytes    = 256
-	searchTimeout   = 5 * time.Second
-	folderChunk     = 500 // ids per membership lookup
-	maxAddrsListed  = 50
-	listedAddrsNote = "+%d more"
+	maxQueryBytes = 512
+	maxQueryTerms = 32
+	maxFromBytes  = 256
+	// maxExcludeFrom and maxExcludeFromBytes bound the exclude_from list.
+	maxExcludeFrom      = 20
+	maxExcludeFromBytes = 320
+	searchTimeout       = 5 * time.Second
+	folderChunk         = 500 // ids per membership lookup
+	maxAddrsListed      = 50
+	listedAddrsNote     = "+%d more"
 )
 
 // MaxQueryBytes is the longest search query accepted, by the cache search and

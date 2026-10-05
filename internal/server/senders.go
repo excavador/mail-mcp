@@ -173,6 +173,7 @@ type listSavedOut struct {
 func cleanFilters(f cache.SavedFilters) cache.SavedFilters {
 	f.Query, f.Folder, f.From = field(f.Query), field(f.Folder), field(f.From)
 	f.Since, f.Until, f.Tag, f.GroupBy = field(f.Since), field(f.Until), field(f.Tag), field(f.GroupBy)
+	f.ExcludeFrom, f.ExcludeKind = fieldAll(f.ExcludeFrom), fieldAll(f.ExcludeKind)
 	return f
 }
 

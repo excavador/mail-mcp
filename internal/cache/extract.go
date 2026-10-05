@@ -82,6 +82,16 @@ func parseMessage(raw []byte) (out parsed) {
 	out.GitHubReason = capField(strings.TrimSpace(e.Header.Get("X-Github-Reason")))
 	out.ListUnsub = strings.TrimSpace(e.Header.Get("List-Unsubscribe")) != ""
 
+	out.Body = bodyText(e)
+	out.BodyNew = CleanBody(out.Body)
+	out.Atts = extractAttachments(raw)
+	return out
+}
+
+// bodyText is the searchable text of a message: its text/plain parts, else
+// its text/html parts reduced to text, capped and stripped of control
+// characters.
+func bodyText(e *message.Entity) string {
 	var plain, htm strings.Builder
 	collectText(e, &plain, &htm, 0)
 	body := strings.TrimSpace(plain.String())
@@ -91,11 +101,25 @@ func parseMessage(raw []byte) (out parsed) {
 	if len(body) > maxIndexedText {
 		body = strings.ToValidUTF8(body[:maxIndexedText], "")
 	}
-	body = stripC0(body)
-	out.Body = body
-	out.BodyNew = CleanBody(body)
-	out.Atts = extractAttachments(raw)
-	return out
+	return stripC0(body)
+}
+
+// parseBody is parseMessage for the body columns only: the Body and BodyNew
+// the index would hold now, without the attachment extraction (PDF text can
+// take seconds). ok is false when the message does not parse at all. Like
+// parseMessage it survives a panic in the MIME or charset code.
+func parseBody(raw []byte) (body, bodyNew string, ok bool) {
+	defer func() {
+		if recover() != nil {
+			body, bodyNew, ok = "", "", false
+		}
+	}()
+	e, err := message.Read(bytes.NewReader(raw))
+	if e == nil || (err != nil && !message.IsUnknownCharset(err) && !message.IsUnknownEncoding(err)) {
+		return "", "", false
+	}
+	body = bodyText(e)
+	return body, CleanBody(body), true
 }
 
 func addrs(h mail.Header, key string) string {

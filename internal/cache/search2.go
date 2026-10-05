@@ -9,7 +9,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -77,6 +79,79 @@ type matchPlan struct {
 	hasAtt bool // the attachment branch is part of the set
 }
 
+// ValidateExclusions checks the exclusion lists of a search or saved query:
+// at most 20 non-empty from fragments of at most 320 bytes without control
+// characters, and at most one entry per known sender kind. The errors are
+// fixed texts that never echo the input.
+func ValidateExclusions(from, kinds []string) error {
+	if len(from) > maxExcludeFrom {
+		return fmt.Errorf("%w: exclude_from has more than %d entries", ErrQueryLimit, maxExcludeFrom)
+	}
+	for _, f := range from {
+		switch {
+		case len(f) > maxExcludeFromBytes:
+			return fmt.Errorf("%w: an exclude_from entry is longer than %d bytes", ErrQueryLimit, maxExcludeFromBytes)
+		case strings.TrimSpace(f) == "":
+			return fmt.Errorf("%w: an exclude_from entry is empty", ErrQueryLimit)
+		case strings.IndexFunc(f, func(r rune) bool { return r < 0x20 || r == 0x7f }) >= 0:
+			return fmt.Errorf("%w: an exclude_from entry has a control character", ErrQueryLimit)
+		}
+	}
+	if len(kinds) > len(SenderKinds) {
+		return fmt.Errorf("%w: exclude_kind has more than %d entries", ErrQueryLimit, len(SenderKinds))
+	}
+	for _, k := range kinds {
+		if !ValidSenderKind(k) {
+			return fmt.Errorf("%w: exclude_kind must list only %s", ErrQueryLimit, strings.Join(SenderKinds, ", "))
+		}
+	}
+	return nil
+}
+
+// asciiLower folds ASCII letters only, which is all SQLite's lower() does, so
+// the pattern and the column are folded alike.
+func asciiLower(s string) string {
+	b := []byte(s)
+	for i, c := range b {
+		if 'A' <= c && c <= 'Z' {
+			b[i] = c + 'a' - 'A'
+		}
+	}
+	return string(b)
+}
+
+// NormalizeExclusions is the set the search applies and the cursor binds: the
+// from fragments trimmed, ASCII-lowercased, sorted and without duplicates, the
+// kinds sorted and without duplicates. Case-insensitive for ASCII letters only.
+func NormalizeExclusions(from, kinds []string) (nf, nk []string) {
+	for _, s := range from {
+		nf = append(nf, asciiLower(strings.TrimSpace(s)))
+	}
+	sort.Strings(nf)
+	nf = slices.Compact(nf)
+	nk = slices.Clone(kinds)
+	sort.Strings(nk)
+	return nf, slices.Compact(nk)
+}
+
+// ExclusionKey is the canonical form of the exclusions, for a cursor or search
+// key: normalised, each entry quoted so no entry can imitate a separator, ""
+// when there are none.
+func ExclusionKey(from, kinds []string) string {
+	if len(from) == 0 && len(kinds) == 0 {
+		return ""
+	}
+	nf, nk := NormalizeExclusions(from, kinds)
+	q := func(in []string) string {
+		out := make([]string, len(in))
+		for i, s := range in {
+			out[i] = strconv.Quote(s)
+		}
+		return strings.Join(out, ",")
+	}
+	return "from[" + q(nf) + "]kind[" + q(nk) + "]"
+}
+
 func (c *Cache) matchSQL(q SearchQuery) (matchPlan, error) {
 	var p matchPlan
 	text := strings.TrimSpace(q.Text)
@@ -85,6 +160,9 @@ func (c *Cache) matchSQL(q SearchQuery) (matchPlan, error) {
 	}
 	if len(q.From) > maxFromBytes {
 		return p, fmt.Errorf("%w: from filter is longer than %d bytes", ErrQueryLimit, maxFromBytes)
+	}
+	if err := ValidateExclusions(q.ExcludeFrom, q.ExcludeKind); err != nil {
+		return p, err
 	}
 	if text != "" {
 		p.expr = text
@@ -112,6 +190,18 @@ func (c *Cache) matchSQL(q SearchQuery) (matchPlan, error) {
 	if q.From != "" {
 		filt = append(filt, `lower(m.from_addr) LIKE ? ESCAPE '\'`)
 		fa = append(fa, "%"+likeEscaper.Replace(strings.ToLower(q.From))+"%")
+	}
+	exFrom, exKind := NormalizeExclusions(q.ExcludeFrom, q.ExcludeKind)
+	for _, x := range exFrom {
+		filt = append(filt, `lower(m.from_addr) NOT LIKE ? ESCAPE '\'`)
+		fa = append(fa, "%"+likeEscaper.Replace(x)+"%")
+	}
+	if len(exKind) > 0 {
+		// A sender with no row yet has no kind and is kept.
+		filt = append(filt, `NOT EXISTS (SELECT 1 FROM senders sd WHERE sd.account = m.account AND sd.addr = `+senderAddrSQL+` AND sd.kind IN (`+inList(len(exKind))+`))`)
+		for _, k := range exKind {
+			fa = append(fa, k)
+		}
 	}
 	if q.Tag != "" {
 		filt = append(filt, `EXISTS (SELECT 1 FROM tags tg WHERE tg.account = m.account AND tg.stable_id = m.stable_id AND tg.tag = ?)`)

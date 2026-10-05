@@ -71,5 +71,17 @@ func capRunes(s string, n int) string {
 // field is clean followed by the per-field cap.
 func field(s string) string { return capRunes(clean(s), maxFieldRunes) }
 
+// fieldAll is field for each element.
+func fieldAll(in []string) []string {
+	if in == nil {
+		return nil
+	}
+	out := make([]string, len(in))
+	for i, s := range in {
+		out[i] = field(s)
+	}
+	return out
+}
+
 // list is field for an address list, which may legitimately be longer.
 func list(s string) string { return capRunes(clean(s), maxListRunes) }

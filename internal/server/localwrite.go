@@ -312,6 +312,9 @@ type saveQueryIn struct {
 	Tag       string `json:"tag,omitempty" jsonschema:"only messages carrying this tag"`
 	GroupBy   string `json:"group_by,omitempty" jsonschema:"thread (default) or message"`
 	Note      string `json:"note,omitempty" jsonschema:"what this query is for (at most 500 characters)"`
+
+	ExcludeFrom []string `json:"exclude_from,omitempty" jsonschema:"drop messages whose From contains any of these (at most 20, 320 bytes each)"`
+	ExcludeKind []string `json:"exclude_kind,omitempty" jsonschema:"drop messages whose sender has any of these kinds: human, list, transactional, notification"`
 }
 
 func addSaveQuery(s *mcp.Server, d writeDeps) {
@@ -335,7 +338,8 @@ func addSaveQuery(s *mcp.Server, d writeDeps) {
 		default:
 			return nil, nil, errors.New(`group_by must be "thread" or "message"`)
 		}
-		f := cache.SavedFilters{Query: in.Query, FTSSyntax: in.FTSSyntax, Folder: in.Folder, From: in.From, Since: in.Since, Until: in.Until, Tag: in.Tag, GroupBy: in.GroupBy}
+		f := cache.SavedFilters{Query: in.Query, FTSSyntax: in.FTSSyntax, Folder: in.Folder, From: in.From, Since: in.Since, Until: in.Until, Tag: in.Tag, GroupBy: in.GroupBy,
+			ExcludeFrom: in.ExcludeFrom, ExcludeKind: in.ExcludeKind}
 		if err := d.store.SaveQuery(ctx, a.Name, in.Name, f, in.Note); err != nil {
 			if errors.Is(err, cache.ErrBadTag) || errors.Is(err, cache.ErrTagLimit) || errors.Is(err, cache.ErrQueryLimit) {
 				return nil, nil, err
