@@ -22,10 +22,10 @@ func TestCacheStatusReportsFts2Backfill(t *testing.T) {
 					Total    *int  `json:"total"`
 					Complete *bool `json:"complete"`
 				} `json:"fts2_backfill"`
-			Entities *struct {
-				Complete *bool   `json:"complete"`
-				State    *string `json:"state"`
-			} `json:"fts2_entities_job"`
+				Entities *struct {
+					Complete *bool   `json:"complete"`
+					State    *string `json:"state"`
+				} `json:"fts2_entities_job"`
 			}
 			o, raw := ok[out](t, cs, "cache_status", map[string]any{})
 			if en := o.Entities; en == nil || en.Complete == nil || en.State == nil || !*en.Complete {
