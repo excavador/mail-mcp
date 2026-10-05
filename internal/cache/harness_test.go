@@ -39,14 +39,33 @@ const (
 // the server side of the connection), so assertions are about commands and
 // never about server replies.
 type cmdLog struct {
-	mu  sync.Mutex
-	buf strings.Builder
+	mu    sync.Mutex
+	buf   strings.Builder
+	conns []net.Conn
+	// hook, when set, sees each chunk the client sent (called with mu held).
+	hook func(chunk string)
 }
 
 func (l *cmdLog) write(p []byte) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.buf.Write(p)
+	if l.hook != nil {
+		l.hook(string(p))
+	}
+}
+
+// killConns closes every accepted connection (call with mu held or from hook).
+func (l *cmdLog) killConns() {
+	for _, c := range l.conns {
+		_ = c.Close()
+	}
+}
+
+func (l *cmdLog) setHook(h func(string)) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.hook = h
 }
 
 func (l *cmdLog) reset() {
@@ -108,6 +127,9 @@ func (l recListener) Accept() (net.Conn, error) {
 	if err != nil {
 		return nil, err
 	}
+	l.log.mu.Lock()
+	l.log.conns = append(l.log.conns, c)
+	l.log.mu.Unlock()
 	return recConn{Conn: c, log: l.log}, nil
 }
 
