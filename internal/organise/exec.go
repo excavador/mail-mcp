@@ -125,13 +125,17 @@ func (o *Organiser) CreateFolder(ctx context.Context, a accounts.Account, name s
 		if isSpecialUse(attrs) {
 			return ErrSpecialUse
 		}
-		return nil
+		return o.store.NoteFolder(ctx, a.Name, name)
 	}
 	if err := c.Create(name, nil).Wait(); err != nil {
 		// Lost a race with another client: fine if it is there now.
 		if _, ok, lerr := folderInfo(c, name); lerr == nil && ok {
-			return nil
+			return o.store.NoteFolder(ctx, a.Name, name)
 		}
+		return err
+	}
+	// Make previews see the folder now, without waiting for a refresh.
+	if err := o.store.NoteFolder(ctx, a.Name, name); err != nil {
 		return err
 	}
 	_ = c.Logout().Wait()

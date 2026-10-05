@@ -13,6 +13,7 @@ import (
 	"net/mail"
 	"os"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -83,6 +84,32 @@ ORDER BY f.folder`, account)
 	return out, rows.Err()
 }
 
+// HasFolder reports whether the cache knows a folder of that exact name for
+// the account, from the folders table alone (no server round trip).
+func (c *Cache) HasFolder(ctx context.Context, account, folder string) (bool, error) {
+	var one int
+	err := c.db.QueryRowContext(ctx, `SELECT 1 FROM folders WHERE account = ? AND folder = ?`, account, folder).Scan(&one)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("cache: folder lookup: %w", err)
+	}
+	return true, nil
+}
+
+// NoteFolder records a folder the server now has but no refresh has seen yet
+// (create_folder). UIDVALIDITY 0 is the placeholder: a real one is never 0, so
+// the next refresh of the folder sees "validity changed", drops the (empty)
+// membership and writes the real value. An existing row is left alone.
+func (c *Cache) NoteFolder(ctx context.Context, account, folder string) error {
+	_, err := c.db.ExecContext(ctx, `INSERT OR IGNORE INTO folders (account, folder, uidvalidity) VALUES (?, ?, 0)`, account, folder)
+	if err != nil {
+		return fmt.Errorf("cache: note folder: %w", err)
+	}
+	return nil
+}
+
 // SearchQuery is one search. Zero fields mean "no constraint".
 type SearchQuery struct {
 	Account   string // empty: every account
@@ -134,6 +161,7 @@ const (
 	maxQueryTerms   = 32
 	maxFromBytes    = 256
 	searchTimeout   = 5 * time.Second
+	folderChunk     = 500 // ids per membership lookup
 	maxAddrsListed  = 50
 	listedAddrsNote = "+%d more"
 )
@@ -141,6 +169,11 @@ const (
 // MaxQueryBytes is the longest search query accepted, by the cache search and
 // by the server-side (X-GM-RAW) search alike.
 const MaxQueryBytes = maxQueryBytes
+
+// HitsByUIDTimeout bounds the database phase of HitsByUID, measured from the
+// start of that phase and separate from searchTimeout and from the IMAP part
+// of a server search.
+const HitsByUIDTimeout = 10 * time.Second
 
 // ErrQueryLimit is a search refused for its size. Its message is safe to show.
 var ErrQueryLimit = errors.New("query too large")
@@ -275,12 +308,8 @@ ORDER BY hit.d DESC, hit.account, hit.stable_id`
 	if truncated {
 		hits = hits[:limit]
 	}
-	for i := range hits {
-		fs, err := c.messageFolders(ctx, hits[i].Account, hits[i].StableID)
-		if err != nil {
-			return nil, false, err
-		}
-		hits[i].Folders = fs
+	if err := c.fillFolders(ctx, hits); err != nil {
+		return nil, false, err
 	}
 	return hits, truncated, nil
 }
@@ -291,6 +320,10 @@ ORDER BY hit.d DESC, hit.account, hit.stable_id`
 // limit; truncated says more were found than returned.
 func (c *Cache) HitsByUID(ctx context.Context, account, folder string, uids []imap.UID, limit int) (hits []SearchHit, truncated bool, uncached int, err error) {
 	limit = clampLimit(limit)
+	// The database phase has its own budget: the caller's context may have
+	// spent most of its time on the IMAP search already.
+	ctx, cancel := context.WithTimeout(ctx, HitsByUIDTimeout)
+	defer cancel()
 	byID := map[string]SearchHit{}
 	// resolved counts membership rows found, one per UID, so uncached is per
 	// UID too (several UIDs never share a stable id in one folder, but the
@@ -348,12 +381,8 @@ WHERE s.account = ? AND s.folder = ? AND s.uid IN (`+strings.Join(marks, ",")+`)
 	if truncated = len(hits) > limit; truncated {
 		hits = hits[:limit]
 	}
-	for i := range hits {
-		fs, ferr := c.messageFolders(ctx, hits[i].Account, hits[i].StableID)
-		if ferr != nil {
-			return nil, false, 0, ferr
-		}
-		hits[i].Folders = fs
+	if ferr := c.fillFolders(ctx, hits); ferr != nil {
+		return nil, false, 0, ferr
 	}
 	return hits, truncated, uncached, nil
 }
@@ -380,23 +409,75 @@ func addrsLimited(h gomail.Header, key string) string {
 	return strings.Join(parts, ", ")
 }
 
-func (c *Cache) messageFolders(ctx context.Context, account, stableID string) ([]string, error) {
-	rows, err := c.db.QueryContext(ctx,
-		`SELECT DISTINCT folder FROM membership WHERE account = ? AND stable_id = ? ORDER BY folder`, account, stableID)
-	if err != nil {
-		return nil, fmt.Errorf("cache: folders of message: %w", err)
+// foldersByID returns, for each of ids in one account, the folders it is a
+// member of (sorted, without duplicates). It runs one query per chunk of
+// folderChunk ids, so the cost does not grow with a query per hit. Every id
+// has an entry, empty when it has no membership.
+func (c *Cache) foldersByID(ctx context.Context, account string, ids []string) (map[string][]string, error) {
+	out := make(map[string][]string, len(ids))
+	for _, id := range ids {
+		out[id] = []string{}
 	}
-	defer rows.Close()
-	out := []string{}
-	for rows.Next() {
-		var f string
-		if err := rows.Scan(&f); err != nil {
+	for start := 0; start < len(ids); start += folderChunk {
+		part := ids[start:min(start+folderChunk, len(ids))]
+		args := make([]any, 0, len(part)+1)
+		args = append(args, account)
+		for _, id := range part {
+			args = append(args, id)
+		}
+		c.folderQueries.Add(1)
+		rows, err := c.db.QueryContext(ctx,
+			`SELECT stable_id, folder FROM membership WHERE account = ? AND stable_id IN (`+
+				strings.TrimSuffix(strings.Repeat("?,", len(part)), ",")+`)`, args...)
+		if err != nil {
 			return nil, fmt.Errorf("cache: folders of message: %w", err)
 		}
-		out = append(out, f)
+		for rows.Next() {
+			var id, f string
+			if err := rows.Scan(&id, &f); err != nil {
+				_ = rows.Close()
+				return nil, fmt.Errorf("cache: folders of message: %w", err)
+			}
+			if !slices.Contains(out[id], f) {
+				out[id] = append(out[id], f)
+			}
+		}
+		if err := rows.Err(); err != nil {
+			_ = rows.Close()
+			return nil, fmt.Errorf("cache: folders of message: %w", err)
+		}
+		_ = rows.Close()
 	}
-	return out, rows.Err()
+	for _, fs := range out {
+		sort.Strings(fs)
+	}
+	return out, nil
 }
+
+// fillFolders sets Folders on every hit, with one query per account and chunk.
+func (c *Cache) fillFolders(ctx context.Context, hits []SearchHit) error {
+	byAcct := map[string][]string{}
+	for _, h := range hits {
+		byAcct[h.Account] = append(byAcct[h.Account], h.StableID)
+	}
+	found := make(map[string]map[string][]string, len(byAcct))
+	for acct, ids := range byAcct {
+		m, err := c.foldersByID(ctx, acct, ids)
+		if err != nil {
+			return err
+		}
+		found[acct] = m
+	}
+	for i := range hits {
+		// Each hit gets its own slice: callers sanitise the names in place.
+		hits[i].Folders = append([]string{}, found[hits[i].Account][hits[i].StableID]...)
+	}
+	return nil
+}
+
+// FolderQueries reports how many membership lookups for folders-of-message
+// have run, so a test can show that a result set costs one per chunk.
+func (c *Cache) FolderQueries() int64 { return c.folderQueries.Load() }
 
 // Attachment describes a message part that is not body text. Never content.
 type Attachment struct {
@@ -453,10 +534,11 @@ func (c *Cache) ReadMessage(ctx context.Context, account, stableID string, maxBo
 		}
 		return nil, fmt.Errorf("cache: read blob: %w", err)
 	}
-	folders, err := c.messageFolders(ctx, account, stableID)
+	fm, err := c.foldersByID(ctx, account, []string{stableID})
 	if err != nil {
 		return nil, err
 	}
+	folders := fm[stableID]
 
 	m := &Message{Account: account, StableID: stableID, Folders: folders, Attachments: []Attachment{}}
 	e, perr := message.Read(bytes.NewReader(raw))

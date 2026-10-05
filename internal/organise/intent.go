@@ -77,10 +77,12 @@ var (
 	ErrUIDValidity    = SafeError("a folder was reset on the server (UIDVALIDITY changed); refresh the cache and preview again")
 	ErrNoMoveCap      = SafeError("the server does not advertise MOVE; refusing to move")
 	ErrTargetMissing  = SafeError("target folder does not exist; create it with create_folder first")
-	ErrSourceMissing  = SafeError("source folder does not exist on the server")
-	ErrExpired        = SafeError("preview expired or unknown; preview again")
-	ErrBusy           = SafeError("another write is in progress")
-	ErrSpecialUse     = SafeError("that folder is a special-use folder (Trash, Junk, Drafts, Sent, All Mail or Flagged); not allowed")
+	// errTargetMissingFmt takes the folder and the account name.
+	errTargetMissingFmt = "target folder %s does not exist on %s; create it with create_folder first"
+	ErrSourceMissing    = SafeError("source folder does not exist on the server")
+	ErrExpired          = SafeError("preview expired or unknown; preview again")
+	ErrBusy             = SafeError("another write is in progress")
+	ErrSpecialUse       = SafeError("that folder is a special-use folder (Trash, Junk, Drafts, Sent, All Mail or Flagged); not allowed")
 )
 
 // Validate checks an intent's shape and the provider's rules for it.
