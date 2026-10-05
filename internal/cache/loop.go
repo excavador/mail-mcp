@@ -74,7 +74,8 @@ func (c *Cache) Run(ctx context.Context, log *slog.Logger, a accounts.Account, i
 		})
 		st, err := c.RefreshOnce(rctx, a)
 		attrs := []any{
-			"account", a.Name, "folders", st.Folders, "new_uids", st.NewUIDs,
+			"account", a.Name, "folders", st.Folders, "folders_total", st.FoldersTotal,
+			"folders_skipped_unchanged", st.FoldersSkipped, "folders_scanned", st.FoldersScanned, "new_uids", st.NewUIDs,
 			"new_ids", st.NewIDs, "new_bodies", st.NewBodies, "removed", st.Removed, "skipped", st.Skipped,
 			"took", time.Since(start).Round(time.Millisecond).String(),
 		}

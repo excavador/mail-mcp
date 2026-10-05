@@ -191,7 +191,7 @@ func (c *Cache) RefreshFolders(ctx context.Context, client *imapclient.Client, a
 		if err := ctx.Err(); err != nil {
 			return st, err
 		}
-		fs, err := c.refreshFolder(ctx, a, client, f)
+		fs, err := c.refreshFolder(ctx, a, client, f, folderStatus{})
 		st.add(fs)
 		if err != nil {
 			errs = append(errs, fmt.Errorf("%s: folder %q: %w", a.Name, f, err))

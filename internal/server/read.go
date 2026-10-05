@@ -307,9 +307,11 @@ func serverSearch(ctx context.Context, byName map[string]accounts.Account, store
 		folder string
 		uids   []imap.UID
 	)
+	// The All Mail name recorded by the last refresh saves a LIST round trip.
+	allMail := store.AllMailFolder(ctx, a.Name)
 	err = imapx.Do(ctx, a, "search", liveTimeout, func(ctx context.Context, c *imapclient.Client) error {
 		var serr error
-		folder, uids, serr = imapx.GmailRawSearch(ctx, c, q)
+		folder, uids, serr = imapx.GmailRawSearchIn(ctx, c, q, allMail)
 		return serr
 	})
 	switch {

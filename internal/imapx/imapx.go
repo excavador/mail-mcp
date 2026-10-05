@@ -260,7 +260,7 @@ type Folder struct {
 
 // ListFolders returns every selectable folder with its message count.
 //
-// LIST then one STATUS per folder, rather than LIST-STATUS: Bridge does not
+// LIST then one pipelined STATUS batch, rather than LIST-STATUS: Bridge does not
 // advertise LIST-STATUS (its capability line is AUTH=PLAIN ID IDLE IMAP4rev1
 // MOVE STARTTLS UIDPLUS UNSELECT), and one code path for both providers is
 // worth a round trip per folder.
@@ -271,11 +271,14 @@ func ListFolders(ctx context.Context, c *imapclient.Client) ([]Folder, error) {
 		return nil, fmt.Errorf("list: %w", err)
 	}
 	SetPhase(ctx, "status")
-	var out []Folder
+	// Every STATUS is sent before any is waited for: the server's latency is
+	// paid once, not once per folder.
+	type item struct {
+		f   Folder
+		cmd *imapclient.StatusCommand
+	}
+	var items []item
 	for _, m := range list {
-		if err := ctx.Err(); err != nil {
-			return nil, err
-		}
 		f := Folder{Name: m.Mailbox}
 		noSelect := false
 		for _, at := range m.Attrs {
@@ -287,15 +290,22 @@ func ListFolders(ctx context.Context, c *imapclient.Client) ([]Folder, error) {
 		if noSelect {
 			continue
 		}
-		st, err := c.Status(m.Mailbox, &imap.StatusOptions{NumMessages: true}).Wait()
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		items = append(items, item{f: f, cmd: c.Status(m.Mailbox, &imap.StatusOptions{NumMessages: true})})
+	}
+	var out []Folder
+	for _, it := range items {
+		st, err := it.cmd.Wait()
 		if err != nil {
 			if cerr := ctx.Err(); cerr != nil {
 				return nil, fmt.Errorf("status: %w", cerr) // the session ended, not a folder that refuses STATUS
 			}
 		} else if st.NumMessages != nil {
-			f.Messages = *st.NumMessages
+			it.f.Messages = *st.NumMessages
 		}
-		out = append(out, f)
+		out = append(out, it.f)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
 	return out, nil
@@ -324,10 +334,21 @@ func GmailAllMail(c *imapclient.Client) (string, error) {
 	return gmailAllMailFallback, nil
 }
 
-// GmailRawSearch runs query verbatim as X-GM-RAW (Gmail's own search syntax)
+// GmailRawSearch is GmailRawSearchIn with no known All Mail name (it LISTs).
+func GmailRawSearch(ctx context.Context, c *imapclient.Client, query string) (string, []imap.UID, error) {
+	return GmailRawSearchIn(ctx, c, query, "")
+}
+
+// GmailRawSearchIn runs query verbatim as X-GM-RAW (Gmail's own search syntax)
 // with UID SEARCH in the All Mail folder, opened read-only (EXAMINE). It
 // returns the folder name and the matching UIDs, ascending. c must be logged in.
-func GmailRawSearch(ctx context.Context, c *imapclient.Client, query string) (string, []imap.UID, error) {
+//
+// allMail is the folder to search when the caller already knows it (the cache
+// records the \All folder). With it, the session needs no LIST, and EXAMINE
+// and UID SEARCH are sent back to back and answered in one round trip, which
+// matters on an account where every command costs seconds. If EXAMINE refuses
+// the hint (a renamed folder), it falls back to LIST. With "" it LISTs first.
+func GmailRawSearchIn(ctx context.Context, c *imapclient.Client, query, allMail string) (string, []imap.UID, error) {
 	SetPhase(ctx, "caps")
 	if !c.Caps().Has(imap.CapGmailExt1) {
 		if err := ctx.Err(); err != nil {
@@ -335,24 +356,53 @@ func GmailRawSearch(ctx context.Context, c *imapclient.Client, query string) (st
 		}
 		return "", nil, ErrNoGmailExt
 	}
+	folder := allMail
+	if folder == "" {
+		var err error
+		if folder, err = listAllMail(ctx, c); err != nil {
+			return "", nil, err
+		}
+	}
+	uids, err := examineAndSearch(ctx, c, folder, query)
+	if err != nil && allMail != "" && ctx.Err() == nil && errors.Is(err, errExamine) {
+		if folder, err = listAllMail(ctx, c); err != nil {
+			return "", nil, err
+		}
+		uids, err = examineAndSearch(ctx, c, folder, query)
+	}
+	if err != nil {
+		return "", nil, err
+	}
+	return folder, uids, nil
+}
+
+func listAllMail(ctx context.Context, c *imapclient.Client) (string, error) {
 	SetPhase(ctx, "list")
 	folder, err := GmailAllMail(c)
 	if err != nil {
-		return "", nil, err
+		return "", err
 	}
-	if err := ctx.Err(); err != nil {
-		return "", nil, err
-	}
+	return folder, ctx.Err()
+}
+
+var errExamine = errors.New("examine")
+
+// examineAndSearch sends EXAMINE and UID SEARCH X-GM-RAW without waiting in
+// between: one round trip for both.
+func examineAndSearch(ctx context.Context, c *imapclient.Client, folder, query string) ([]imap.UID, error) {
 	SetPhase(ctx, "examine")
-	if _, err := c.Select(folder, &imap.SelectOptions{ReadOnly: true}).Wait(); err != nil {
-		return "", nil, fmt.Errorf("examine: %w", err)
+	selCmd := c.Select(folder, &imap.SelectOptions{ReadOnly: true})
+	searchCmd := c.UIDSearch(&imap.SearchCriteria{GmailRaw: query}, nil)
+	if _, err := selCmd.Wait(); err != nil {
+		_, _ = searchCmd.Wait() // answered with an error too; drain it
+		return nil, fmt.Errorf("examine: %w: %w", errExamine, err)
 	}
 	SetPhase(ctx, "search")
-	data, err := c.UIDSearch(&imap.SearchCriteria{GmailRaw: query}, nil).Wait()
+	data, err := searchCmd.Wait()
 	if err != nil {
-		return "", nil, fmt.Errorf("search: %w", err)
+		return nil, fmt.Errorf("search: %w", err)
 	}
 	uids := data.AllUIDs()
 	sort.Slice(uids, func(i, j int) bool { return uids[i] < uids[j] })
-	return folder, uids, nil
+	return uids, nil
 }
