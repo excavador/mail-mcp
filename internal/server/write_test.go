@@ -784,7 +784,7 @@ func TestPartialFailureWritesHistoryWithTheCompletedChunk(t *testing.T) {
 	e.refresh("acct")
 	e.log.reset()
 	// An elicitation client: a preview this large needs the owner's own yes.
-	cs := e.connect(Admin, acceptConfirm(t), WithHistory(e.hist), WithOrganiser(e.org))
+	cs := e.connect(Admin, acceptConfirm(t), WithHistory(e.hist), WithOrganiser(e.org), WithApprovalMode(ApprovalElicitation))
 	p := preview(t, cs, "acct", "INBOX", fromCrit("bulk@example.com"), "Work", "move")
 	if p.Matched != 600 || p.Sampled != 20 {
 		t.Fatalf("preview = %d matched %d sampled", p.Matched, p.Sampled)
@@ -957,7 +957,7 @@ func TestApprovalByElicitationAndByClientToolApproval(t *testing.T) {
 					return inner(ctx, r)
 				}
 			}
-			cs := e.connect(Admin, h, WithHistory(e.hist), WithOrganiser(e.org))
+			cs := e.connect(Admin, h, WithHistory(e.hist), WithOrganiser(e.org), WithApprovalMode(ApprovalElicitation))
 			p := preview(t, cs, "acct", "INBOX", fromCrit("alice@example.com"), "Work", "move")
 			if c.applies {
 				a := apply(t, cs, p)
@@ -1062,13 +1062,13 @@ func TestApplyWithoutElicitationIsLimitedToFiftyMessages(t *testing.T) {
 				}
 				return
 			}
-			requireToolError(t, cs, "apply_intent", applyArgs(p), "more than 50 messages needs a client that supports confirmation (elicitation)")
+			requireToolError(t, cs, "apply_intent", applyArgs(p), "more than 50 messages cannot be applied on the client's tool approval alone")
 			e.noWrites(t)
 			if n := e.serverCount("INBOX"); n != 51 {
 				t.Errorf("INBOX = %d", n)
 			}
 			// The refusal did not burn the token: an elicitation client may use it.
-			cs2 := e.connect(Admin, acceptConfirm(t), WithHistory(e.hist), WithOrganiser(e.org))
+			cs2 := e.connect(Admin, acceptConfirm(t), WithHistory(e.hist), WithOrganiser(e.org), WithApprovalMode(ApprovalElicitation))
 			if a := apply(t, cs2, p); a.Done != 51 || a.ApprovedBy != "elicitation" {
 				t.Errorf("apply with elicitation = %+v", a)
 			}
@@ -1080,7 +1080,7 @@ func TestWithMaxUnelicitedConfiguresTheLimit(t *testing.T) {
 	e := basic(t, true)
 	cs := e.connect(Admin, nil, WithHistory(e.hist), WithOrganiser(e.org), WithMaxUnelicited(1))
 	p := preview(t, cs, "acct", "INBOX", fromCrit("alice@example.com"), "Work", "move")
-	requireToolError(t, cs, "apply_intent", applyArgs(p), "more than 1 messages needs")
+	requireToolError(t, cs, "apply_intent", applyArgs(p), "more than 1 messages cannot be applied on the client's tool approval alone")
 	p1 := preview(t, cs, "acct", "INBOX", fromCrit("bob@example.com"), "Work", "move")
 	if a := apply(t, cs, p1); a.Done != 1 {
 		t.Errorf("apply = %+v", a)
@@ -1091,7 +1091,7 @@ func TestApplyOverFiftyWithElicitationAfterAccept(t *testing.T) {
 	e := newWEnv(t, true, gmailPair, "INBOX", "Work")
 	e.addMany("INBOX", "bulk@example.com", 60)
 	e.refresh("acct")
-	cs := e.connect(Admin, acceptConfirm(t), WithHistory(e.hist), WithOrganiser(e.org))
+	cs := e.connect(Admin, acceptConfirm(t), WithHistory(e.hist), WithOrganiser(e.org), WithApprovalMode(ApprovalElicitation))
 	a := apply(t, cs, preview(t, cs, "acct", "INBOX", fromCrit("bulk@example.com"), "Work", "move"))
 	if a.Done != 60 || a.ApprovedBy != "elicitation" {
 		t.Errorf("apply = %+v", a)
@@ -1115,7 +1115,7 @@ func TestElicitationOnTheNewestProtocolAppliesThroughMRTR(t *testing.T) {
 		asked++
 		return acceptConfirm(t)(ctx, r)
 	}
-	cs := e.connectP(Admin, h, false, WithHistory(e.hist), WithOrganiser(e.org))
+	cs := e.connectP(Admin, h, false, WithHistory(e.hist), WithOrganiser(e.org), WithApprovalMode(ApprovalElicitation))
 	p := preview(t, cs, "acct", "INBOX", fromCrit("alice@example.com"), "Work", "move")
 	a := apply(t, cs, p)
 	if a.ApprovedBy != "elicitation" || a.Done != 2 || asked != 1 {
@@ -1132,7 +1132,7 @@ func TestNewestProtocolDeclineCancelAndUnconfirmedAreRefused(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			e := basic(t, true)
-			cs := e.connectP(Admin, h, false, WithHistory(e.hist), WithOrganiser(e.org))
+			cs := e.connectP(Admin, h, false, WithHistory(e.hist), WithOrganiser(e.org), WithApprovalMode(ApprovalElicitation))
 			p := preview(t, cs, "acct", "INBOX", fromCrit("alice@example.com"), "Work", "move")
 			res := call(t, cs, "apply_intent", applyArgs(p))
 			if !res.IsError {
@@ -1146,7 +1146,7 @@ func TestNewestProtocolDeclineCancelAndUnconfirmedAreRefused(t *testing.T) {
 				t.Errorf("history has %d records", hh.Count)
 			}
 			// The token survives a refusal.
-			cs2 := e.connectP(Admin, acceptConfirm(t), false, WithHistory(e.hist), WithOrganiser(e.org))
+			cs2 := e.connectP(Admin, acceptConfirm(t), false, WithHistory(e.hist), WithOrganiser(e.org), WithApprovalMode(ApprovalElicitation))
 			if a := apply(t, cs2, p); a.Done != 2 {
 				t.Errorf("token burned by a refusal: %+v", a)
 			}
@@ -1192,7 +1192,7 @@ var yes = &mcp.ElicitResult{Action: "accept", Content: map[string]any{"confirm":
 func TestNewestProtocolWithoutMRTRGetsNeedsInputAndNothingChanges(t *testing.T) {
 	e := basic(t, true)
 	e.mrtrOff = true
-	cs := e.connectP(Admin, acceptConfirm(t), false, WithHistory(e.hist), WithOrganiser(e.org))
+	cs := e.connectP(Admin, acceptConfirm(t), false, WithHistory(e.hist), WithOrganiser(e.org), WithApprovalMode(ApprovalElicitation))
 	p := preview(t, cs, "acct", "INBOX", fromCrit("alice@example.com"), "Work", "move")
 	key, state := ask(t, cs, p)
 	e.noWrites(t)
@@ -1225,7 +1225,7 @@ func TestNewestProtocolWithoutMRTRGetsNeedsInputAndNothingChanges(t *testing.T) 
 func TestInputResponsesGivenForOneTokenCannotApplyAnother(t *testing.T) {
 	e := basic(t, true)
 	e.mrtrOff = true
-	cs := e.connectP(Admin, acceptConfirm(t), false, WithHistory(e.hist), WithOrganiser(e.org))
+	cs := e.connectP(Admin, acceptConfirm(t), false, WithHistory(e.hist), WithOrganiser(e.org), WithApprovalMode(ApprovalElicitation))
 	pa := preview(t, cs, "acct", "INBOX", fromCrit("alice@example.com"), "Work", "move")
 	pb := preview(t, cs, "acct", "INBOX", fromCrit("bob@example.com"), "Work2", "move")
 	ka, sa := ask(t, cs, pa)
@@ -1254,7 +1254,7 @@ func TestInputResponsesGivenForOneTokenCannotApplyAnother(t *testing.T) {
 func TestForgedOrMissingRequestStateAsksAgainAndAppliesNothing(t *testing.T) {
 	e := basic(t, true)
 	e.mrtrOff = true
-	cs := e.connectP(Admin, acceptConfirm(t), false, WithHistory(e.hist), WithOrganiser(e.org))
+	cs := e.connectP(Admin, acceptConfirm(t), false, WithHistory(e.hist), WithOrganiser(e.org), WithApprovalMode(ApprovalElicitation))
 	p := preview(t, cs, "acct", "INBOX", fromCrit("alice@example.com"), "Work", "move")
 	key, state := ask(t, cs, p)
 	flipped := []byte(state)
@@ -1282,7 +1282,7 @@ func TestForgedOrMissingRequestStateAsksAgainAndAppliesNothing(t *testing.T) {
 func TestReplayingAnAnswerAndStateAfterApplyDoesNotApplyTwice(t *testing.T) {
 	e := basic(t, true)
 	e.mrtrOff = true
-	cs := e.connectP(Admin, acceptConfirm(t), false, WithHistory(e.hist), WithOrganiser(e.org))
+	cs := e.connectP(Admin, acceptConfirm(t), false, WithHistory(e.hist), WithOrganiser(e.org), WithApprovalMode(ApprovalElicitation))
 	p := preview(t, cs, "acct", "INBOX", fromCrit("alice@example.com"), "Work", "move")
 	key, state := ask(t, cs, p)
 	if res := retry(t, cs, p, key, state, yes); res.IsError || res.NeedsInput() {
@@ -1331,7 +1331,7 @@ func TestElicitationMessageHasWarningsCriterionAndFiveSanitisedSamples(t *testin
 		msgs = append(msgs, r.Params.Message)
 		return &mcp.ElicitResult{Action: "accept", Content: map[string]any{"confirm": true}}, nil
 	}
-	cs := e.connect(Admin, h, WithHistory(e.hist), WithOrganiser(e.org))
+	cs := e.connect(Admin, h, WithHistory(e.hist), WithOrganiser(e.org), WithApprovalMode(ApprovalElicitation))
 	apply(t, cs, preview(t, cs, "acct", "INBOX", fromCrit("eve@example.com"), "Work", "move"))
 	if len(msgs) != 1 {
 		t.Fatalf("asked %d times", len(msgs))
