@@ -113,6 +113,9 @@ type SearchHit struct {
 func ftsPhrases(text string) (expr string, ok bool) {
 	var terms []string
 	for _, t := range strings.Fields(text) {
+		// A NUL ends the SQL string early inside the driver; it is never
+		// part of a word.
+		t = strings.ReplaceAll(t, "\x00", "")
 		if !strings.ContainsFunc(t, func(r rune) bool { return unicode.IsLetter(r) || unicode.IsDigit(r) }) {
 			continue
 		}
@@ -124,56 +127,109 @@ func ftsPhrases(text string) (expr string, ok bool) {
 // likeEscaper makes s literal inside a LIKE pattern with ESCAPE '\'.
 var likeEscaper = strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`)
 
+// Bounds on what a search may ask for, so one call cannot be made expensive.
+const (
+	maxQueryBytes   = 512
+	maxQueryTerms   = 32
+	maxFromBytes    = 256
+	searchTimeout   = 5 * time.Second
+	maxAddrsListed  = 50
+	listedAddrsNote = "+%d more"
+)
+
+// ErrQueryLimit is a search refused for its size. Its message is safe to show.
+var ErrQueryLimit = errors.New("query too large")
+
 // Search answers from the index only. It returns at most q.Limit hits (newest
-// first) and reports whether more matched than were returned.
+// first) and reports whether more matched than were returned. It gives up
+// after searchTimeout.
 func (c *Cache) Search(ctx context.Context, q SearchQuery) ([]SearchHit, bool, error) {
 	limit := clampLimit(q.Limit)
-
-	var (
-		sb   strings.Builder
-		args []any
-	)
 	text := strings.TrimSpace(q.Text)
-	switch {
-	case text == "":
-		sb.WriteString(`SELECT m.account, m.stable_id, ` + dateCol + `, m.from_addr, m.subject, '' FROM messages m WHERE 1=1`)
-	default:
-		expr := text
+	if len(text) > maxQueryBytes {
+		return nil, false, fmt.Errorf("%w: query is longer than %d bytes", ErrQueryLimit, maxQueryBytes)
+	}
+	if len(q.From) > maxFromBytes {
+		return nil, false, fmt.Errorf("%w: from filter is longer than %d bytes", ErrQueryLimit, maxFromBytes)
+	}
+	var expr string
+	if text != "" {
+		expr = text
 		if !q.FTSSyntax {
+			if len(strings.Fields(text)) > maxQueryTerms {
+				return nil, false, fmt.Errorf("%w: query has more than %d words", ErrQueryLimit, maxQueryTerms)
+			}
 			var ok bool
 			if expr, ok = ftsPhrases(text); !ok {
 				return []SearchHit{}, false, nil // nothing searchable in the query: nothing matches
 			}
 		}
-		sb.WriteString(`SELECT m.account, m.stable_id, ` + dateCol + `, m.from_addr, m.subject, ` +
-			`snippet(message_fts, 4, '[', ']', '…', 20) ` +
-			`FROM message_fts JOIN messages m ON m.account = message_fts.account AND m.stable_id = message_fts.stable_id ` +
-			`WHERE message_fts MATCH ?`)
-		args = append(args, expr)
 	}
+	ctx, cancel := context.WithTimeout(ctx, searchTimeout)
+	defer cancel()
+
+	// Filters, shared by both shapes of the query; m is messages.
+	var (
+		filt []string
+		fa   []any
+	)
 	if q.Account != "" {
-		sb.WriteString(` AND m.account = ?`)
-		args = append(args, q.Account)
+		filt = append(filt, `m.account = ?`)
+		fa = append(fa, q.Account)
 	}
 	if q.Folder != "" {
-		sb.WriteString(` AND EXISTS (SELECT 1 FROM membership s WHERE s.account = m.account AND s.stable_id = m.stable_id AND s.folder = ?)`)
-		args = append(args, q.Folder)
+		filt = append(filt, `EXISTS (SELECT 1 FROM membership s WHERE s.account = m.account AND s.stable_id = m.stable_id AND s.folder = ?)`)
+		fa = append(fa, q.Folder)
 	}
 	if q.From != "" {
-		sb.WriteString(` AND lower(m.from_addr) LIKE ? ESCAPE '\'`)
-		args = append(args, "%"+likeEscaper.Replace(strings.ToLower(q.From))+"%")
+		// Known limitation: SQLite's lower() folds ASCII only, so a From
+		// with non-ASCII letters matches case-sensitively.
+		filt = append(filt, `lower(m.from_addr) LIKE ? ESCAPE '\'`)
+		fa = append(fa, "%"+likeEscaper.Replace(strings.ToLower(q.From))+"%")
 	}
 	if !q.Since.IsZero() {
-		sb.WriteString(` AND ` + dateCol + ` >= ?`)
-		args = append(args, q.Since.Unix())
+		filt = append(filt, dateCol+` >= ?`)
+		fa = append(fa, q.Since.Unix())
 	}
 	if !q.Until.IsZero() {
-		sb.WriteString(` AND ` + dateCol + ` < ?`)
-		args = append(args, q.Until.Unix())
+		filt = append(filt, dateCol+` < ?`)
+		fa = append(fa, q.Until.Unix())
 	}
-	// One extra row tells "exactly limit" from "more than limit".
-	sb.WriteString(` ORDER BY ` + dateCol + ` DESC, m.account, m.stable_id LIMIT ?`)
-	args = append(args, limit+1)
+	and := ""
+	for _, f := range filt {
+		and += ` AND ` + f
+	}
+
+	var (
+		query string
+		args  []any
+	)
+	if expr == "" {
+		// No full-text part: nothing to snippet, so one bounded pass.
+		query = `SELECT m.account, m.stable_id, ` + dateCol + `, m.from_addr, m.subject, '' FROM messages m WHERE 1=1` + and +
+			` ORDER BY ` + dateCol + ` DESC, m.account, m.stable_id LIMIT ?`
+		args = append(append(args, fa...), limit+1)
+	} else {
+		// The FTS table is the base of the inner query so that MATCH drives
+		// the scan; starting from messages would walk every message and test
+		// MATCH per row. The inner query picks the surviving rows (by rowid,
+		// with one extra to detect truncation) and only then does the outer
+		// query pay for snippet() and the wide columns, looking each row up
+		// by rowid. One extra row tells "exactly limit" from "more than limit".
+		query = `WITH hit AS (
+	SELECT message_fts.rowid AS rid, m.account AS account, m.stable_id AS stable_id, ` + dateCol + ` AS d
+	FROM message_fts JOIN messages m ON m.account = message_fts.account AND m.stable_id = message_fts.stable_id
+	WHERE message_fts MATCH ?` + and + `
+	ORDER BY d DESC, m.account, m.stable_id LIMIT ?
+)
+SELECT hit.account, hit.stable_id, hit.d, m.from_addr, m.subject, snippet(message_fts, 4, '[', ']', '…', 20)
+FROM hit
+JOIN message_fts ON message_fts.rowid = hit.rid
+JOIN messages m ON m.account = hit.account AND m.stable_id = hit.stable_id
+WHERE message_fts MATCH ?
+ORDER BY hit.d DESC, hit.account, hit.stable_id`
+		args = append(append([]any{expr}, fa...), limit+1, expr)
+	}
 
 	queryErr := func(err error) error {
 		if q.FTSSyntax && text != "" {
@@ -181,7 +237,7 @@ func (c *Cache) Search(ctx context.Context, q SearchQuery) ([]SearchHit, bool, e
 		}
 		return fmt.Errorf("cache: search: %w", err)
 	}
-	rows, err := c.db.QueryContext(ctx, sb.String(), args...)
+	rows, err := c.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, false, queryErr(err)
 	}
@@ -203,6 +259,9 @@ func (c *Cache) Search(ctx context.Context, q SearchQuery) ([]SearchHit, bool, e
 	}
 	// FTS5 reports a bad expression while stepping, not when preparing.
 	if err := rows.Err(); err != nil {
+		if ctx.Err() != nil {
+			return nil, false, fmt.Errorf("cache: search: %w", ctx.Err())
+		}
 		return nil, false, queryErr(err)
 	}
 	_ = rows.Close()
@@ -219,6 +278,28 @@ func (c *Cache) Search(ctx context.Context, q SearchQuery) ([]SearchHit, bool, e
 		hits[i].Folders = fs
 	}
 	return hits, truncated, nil
+}
+
+// addrsLimited renders an address header like addrs, but lists at most
+// maxAddrsListed addresses and says how many it left out.
+func addrsLimited(h gomail.Header, key string) string {
+	l, err := h.AddressList(key)
+	if err != nil || len(l) == 0 {
+		return strings.TrimSpace(h.Get(key))
+	}
+	more := 0
+	if len(l) > maxAddrsListed {
+		more = len(l) - maxAddrsListed
+		l = l[:maxAddrsListed]
+	}
+	parts := make([]string, 0, len(l)+1)
+	for _, a := range l {
+		parts = append(parts, a.String())
+	}
+	if more > 0 {
+		parts = append(parts, fmt.Sprintf(listedAddrsNote, more))
+	}
+	return strings.Join(parts, ", ")
 }
 
 func (c *Cache) messageFolders(ctx context.Context, account, stableID string) ([]string, error) {
@@ -305,7 +386,7 @@ func (c *Cache) ReadMessage(ctx context.Context, account, stableID string, maxBo
 		return m, nil // unparseable: still a message, with no headers or body
 	}
 	h := gomail.Header{Header: e.Header}
-	m.From, m.To, m.Cc = addrs(h, "From"), addrs(h, "To"), addrs(h, "Cc")
+	m.From, m.To, m.Cc = addrsLimited(h, "From"), addrsLimited(h, "To"), addrsLimited(h, "Cc")
 	m.Subject, _ = h.Subject()
 	if m.Subject == "" {
 		m.Subject = e.Header.Get("Subject")

@@ -51,12 +51,21 @@ func tlsConfig(a accounts.Account) *tls.Config {
 	}
 }
 
+// ErrLogin is what errors.Is matches when the server refused the credentials.
+var ErrLogin = errors.New("login refused")
+
+type loginError struct{ msg string }
+
+func (e loginError) Error() string        { return e.msg }
+func (e loginError) Is(target error) bool { return target == ErrLogin }
+
 // connectTimeout bounds TCP connect, TLS handshake, greeting and login
 // together. A server that accepts the connection and then says nothing must
 // not be able to hold a caller forever.
 const connectTimeout = 30 * time.Second
 
 // Dial connects and logs in. It honours ctx and gives up after connectTimeout.
+// Cancelling ctx later also closes the returned client.
 //
 // The connection is dialled here, not by imapclient.Dial*, because those take
 // no context: a deadline on the raw connection covers the handshake and the
@@ -91,13 +100,14 @@ func Dial(ctx context.Context, a accounts.Account) (*imapclient.Client, error) {
 		return nil, fmt.Errorf("unknown tls mode %q", a.TLS)
 	}
 
-	stop := make(chan struct{})
-	defer close(stop)
+	// The watcher lives as long as the client, not just the login: a ctx
+	// that ends mid-session (a listing that overruns its deadline) closes
+	// the connection and unblocks whatever command is waiting on it.
 	go func() {
 		select {
 		case <-ctx.Done():
 			_ = c.Close()
-		case <-stop:
+		case <-c.Closed():
 		}
 	}()
 
@@ -105,7 +115,7 @@ func Dial(ctx context.Context, a accounts.Account) (*imapclient.Client, error) {
 		_ = c.Close()
 		// Never include the password, and keep the message generic: a wrong
 		// password and a disabled app password look identical from here.
-		return nil, fmt.Errorf("%s: login refused for %s", a.Name, a.Username)
+		return nil, loginError{fmt.Sprintf("%s: login refused for %s", a.Name, a.Username)}
 	}
 	// Past login the deadline would kill a healthy long session; from here
 	// the caller's context is the bound.
@@ -133,6 +143,9 @@ func ListFolders(ctx context.Context, c *imapclient.Client) ([]Folder, error) {
 	}
 	var out []Folder
 	for _, m := range list {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		f := Folder{Name: m.Mailbox}
 		noSelect := false
 		for _, at := range m.Attrs {

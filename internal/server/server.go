@@ -102,7 +102,7 @@ func addCacheStatus(s *mcp.Server, store *cache.Cache) {
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, _ struct{}) (*mcp.CallToolResult, any, error) {
 		st, err := store.Status(ctx)
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, fail("cache_status", "cache status failed", err)
 		}
 		return nil, map[string]any{"accounts": st}, nil
 	})
