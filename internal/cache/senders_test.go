@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 )
@@ -15,10 +16,19 @@ func TestClassifySender(t *testing.T) {
 		want string
 	}{
 		{"github notifications", KindInputs{Addr: "notifications@github.com"}, KindNotification},
-		{"gh reason on any sender", KindInputs{Addr: "bob@corp.example", NGH: 1}, KindNotification},
-		{"linear", KindInputs{Addr: "notifications@linear.app"}, KindNotification},
+		{"forged gh reason is ignored off github.com", KindInputs{Addr: "bob@corp.example", NMsgs: 1, NGH: 1}, KindHuman},
+		{"gh reason at github.com", KindInputs{Addr: "octocat@github.com", NMsgs: 1, NGH: 1}, KindNotification},
+		{"owner replied beats notifier domain", KindInputs{Addr: "jane@atlassian.com", NMsgs: 4, NAuto: 4, NReplied: 1}, KindHuman},
+		{"github addresses stay notification even if replied", KindInputs{Addr: "noreply@github.com", NReplied: 1}, KindNotification},
+		{"notifier domain needs automated majority", KindInputs{Addr: "bob@cloudflare.com", NMsgs: 3, NAuto: 1}, KindHuman},
+		{"notifier domain automated majority", KindInputs{Addr: "alerts@cloudflare.com", NMsgs: 3, NAuto: 3}, KindNotification},
+		{"private suffix is not the shop", KindInputs{Addr: "x@ups.github.io"}, KindHuman},
+		{"private suffix ebay", KindInputs{Addr: "x@ebay.vercel.app"}, KindHuman},
+		{"piano.reply is not noreply", KindInputs{Addr: "piano.reply@x.example", NTxn: 1, NList: 0, NUnsub: 1}, KindHuman},
+		{"no.reply separated", KindInputs{Addr: "no.reply@x.example", NTxn: 1}, KindTransactional},
+		{"linear", KindInputs{Addr: "notifications@linear.app", NMsgs: 2, NAuto: 2}, KindNotification},
 		{"replied beats noreply+list", KindInputs{Addr: "noreply@x.example", NList: 3, NReplied: 1}, KindHuman},
-		{"notifier beats replied", KindInputs{Addr: "notifications@github.com", NReplied: 2}, KindNotification},
+		{"github notifications beats replied", KindInputs{Addr: "notifications@github.com", NReplied: 2}, KindNotification},
 		{"amazon any tld", KindInputs{Addr: "auto-confirm@amazon.co.uk"}, KindTransactional},
 		{"amazonaws is not amazon", KindInputs{Addr: "x@amazonaws.com"}, KindHuman},
 		{"bol", KindInputs{Addr: "info@bol.com"}, KindTransactional},
@@ -115,7 +125,24 @@ func sndFixture(t *testing.T) *Cache {
 	sndAdd(t, c, "m5", "g1@x", "GitHub <notifications@github.com>", "me@home.test", "[r] PR", t0, "X-GitHub-Reason: mention")
 	sndAdd(t, c, "m6", "s1@x", "Shop <no-reply@shop.example>", "me@home.test", "Your order 42 has shipped", t0)
 	sndAdd(t, c, "m7", "r1@x", "Me <me@home.test>", "news@lists.example", "Re: weekly", t0.Add(time.Hour), "In-Reply-To: <zzz@nowhere>")
+	// A forged owner From in INBOX answering an attacker's mail: not a reply.
+	sndAdd(t, c, "m8", "mal1@x", "Mallory <mallory@evil.example>", "me@home.test", "hi", t0)
+	sndAdd(t, c, "m9", "forged@x", "Me <me@home.test>", "mallory@evil.example", "Re: hi", t0.Add(time.Hour), "In-Reply-To: <mal1@x>")
 	return c
+}
+
+// sndSent puts the owner's genuine replies (m3, m7) in the Sent folder; m9 stays in INBOX.
+func sndSent(t *testing.T, c *Cache) {
+	t.Helper()
+	for _, q := range []string{
+		`INSERT OR REPLACE INTO folders (account, folder, uidvalidity, attrs) VALUES ('acc', 'Sent Items', 1, '\Sent')`,
+		`INSERT OR REPLACE INTO folders (account, folder, uidvalidity, attrs) VALUES ('acc', 'INBOX', 1, '')`,
+		`INSERT OR REPLACE INTO membership (account, stable_id, folder, uid, uidvalidity) VALUES ('acc', 'm3', 'Sent Items', 1, 1), ('acc', 'm7', 'Sent Items', 2, 1), ('acc', 'm9', 'INBOX', 1, 1)`,
+	} {
+		if _, err := c.db.Exec(q); err != nil {
+			t.Fatal(err)
+		}
+	}
 }
 
 func checkFixture(t *testing.T, c *Cache) {
@@ -135,8 +162,11 @@ func checkFixture(t *testing.T, c *Cache) {
 	if s := sndRow(t, c, "no-reply@shop.example"); s.Kind != KindTransactional {
 		t.Errorf("shop: %+v", s)
 	}
-	if me := sndRow(t, c, "me@home.test"); me.NMsgs != 2 || me.NRepliedByMe != 0 {
+	if me := sndRow(t, c, "me@home.test"); me.NMsgs != 3 || me.NRepliedByMe != 0 {
 		t.Errorf("me: %+v", me)
+	}
+	if m := sndRow(t, c, "mallory@evil.example"); m.NRepliedByMe != 0 || m.Kind != KindHuman {
+		t.Errorf("spoofed owner From in INBOX credited a reply: %+v", m)
 	}
 	rows, total, err := c.ListSenders(context.Background(), SenderQuery{Account: "acc", Kind: KindTransactional, NeverReplied: true})
 	if err != nil || total != 1 || rows[0].Addr != "no-reply@shop.example" {
@@ -150,6 +180,7 @@ func TestSendersJobCountsEveryMessageOnce(t *testing.T) {
 	if _, err := c.db.Exec(`UPDATE messages SET list_unsub = NULL`); err != nil {
 		t.Fatal(err)
 	}
+	sndSent(t, c)
 	restartSenders(t, c)
 	if err := c.RunSenders(context.Background(), nil); err != nil {
 		t.Fatal(err)
@@ -158,15 +189,15 @@ func TestSendersJobCountsEveryMessageOnce(t *testing.T) {
 	var nulls, total int
 	_ = c.db.QueryRow(`SELECT COUNT(*) FROM messages WHERE list_unsub IS NULL`).Scan(&nulls)
 	_ = c.db.QueryRow(`SELECT SUM(n_msgs) FROM senders`).Scan(&total)
-	if nulls != 0 || total != 7 {
-		t.Errorf("null list_unsub = %d, summed n_msgs = %d (want 0, 7)", nulls, total)
+	if nulls != 0 || total != 9 {
+		t.Errorf("null list_unsub = %d, summed n_msgs = %d (want 0, 9)", nulls, total)
 	}
 	// Running again changes nothing (done).
 	if err := c.RunSenders(context.Background(), nil); err != nil {
 		t.Fatal(err)
 	}
 	_ = c.db.QueryRow(`SELECT SUM(n_msgs) FROM senders`).Scan(&total)
-	if total != 7 {
+	if total != 9 {
 		t.Errorf("second run counted again: %d", total)
 	}
 }
@@ -180,6 +211,10 @@ func TestSendersIncrementalMatchesJob(t *testing.T) {
 		t.Fatalf("job on an empty cache should be complete: %+v", st)
 	}
 	sndFixtureInto(t, c)
+	sndSent(t, c)
+	if err := c.creditSentReplies(context.Background(), "acc"); err != nil {
+		t.Fatal(err)
+	}
 	checkFixture(t, c)
 }
 
@@ -230,6 +265,7 @@ func sndFixtureInto(t *testing.T, c *Cache) *Cache {
 
 func TestOwnerKindSurvivesRulesAndRestart(t *testing.T) {
 	c := sndFixture(t)
+	sndSent(t, c)
 	restartSenders(t, c)
 	if err := c.RunSenders(context.Background(), nil); err != nil {
 		t.Fatal(err)
@@ -242,7 +278,7 @@ func TestOwnerKindSurvivesRulesAndRestart(t *testing.T) {
 	// A new list message must not flip it back.
 	tx, _ := c.db.Begin()
 	sb := c.newSenderBatch()
-	sb.add("acc", "News <news@lists.example>", "me@home.test", "weekly 2", 0, time.Now().Unix(), "<weekly.lists.example>", false, false, "", "")
+	sb.add("acc", "News <news@lists.example>", "me@home.test", "weekly 2", 0, time.Now().Unix(), "<weekly.lists.example>", false, false)
 	if err := sb.flushTx(ctx, tx); err != nil {
 		t.Fatal(err)
 	}
@@ -292,7 +328,7 @@ func TestSendersQueryFilters(t *testing.T) {
 		}
 		return out
 	}
-	if got := addrs(SenderQuery{MinMsgs: 2}); !slices.Equal(got, []string{"alice@x.example", "me@home.test"}) {
+	if got := addrs(SenderQuery{MinMsgs: 2}); !slices.Equal(got, []string{"me@home.test", "alice@x.example"}) {
 		t.Errorf("min_msgs: %v", got)
 	}
 	if got := addrs(SenderQuery{Query: "GITHUB"}); !slices.Equal(got, []string{"notifications@github.com"}) {
@@ -315,5 +351,58 @@ func TestSendersQueryFilters(t *testing.T) {
 	}
 	if got := addrs(SenderQuery{Limit: 2}); len(got) != 2 {
 		t.Errorf("limit: %v", got)
+	}
+}
+
+func TestParentLookupRefusesAmbiguousAndLateParents(t *testing.T) {
+	c := thrOpen(t)
+	c.SetOwners(map[string][]string{"acc": {"me@home.test"}})
+	t0 := time.Date(2026, 3, 1, 9, 0, 0, 0, time.UTC)
+	// Two different senders reuse one Message-ID: ambiguous, nobody credited.
+	sndAdd(t, c, "p1", "dup@x", "A <a@x.example>", "me@home.test", "s", t0)
+	sndAdd(t, c, "p2", "dup@x", "B <b@x.example>", "me@home.test", "s", t0)
+	// A parent that arrives after the reply.
+	sndAdd(t, c, "late", "late@x", "L <l@x.example>", "me@home.test", "s", t0.Add(5*time.Hour))
+	// A clean parent.
+	sndAdd(t, c, "ok", "ok@x", "O <o@x.example>", "me@home.test", "s", t0)
+	sndAdd(t, c, "r1", "r1@x", "Me <me@home.test>", "a@x.example", "Re: s", t0.Add(time.Hour), "In-Reply-To: <dup@x>")
+	sndAdd(t, c, "r2", "r2@x", "Me <me@home.test>", "l@x.example", "Re: s", t0.Add(time.Hour), "In-Reply-To: <late@x>")
+	sndAdd(t, c, "r3", "r3@x", "Me <me@home.test>", "o@x.example", "Re: s", t0.Add(time.Hour), "In-Reply-To: <ok@x>")
+	for _, q := range []string{
+		`INSERT INTO folders (account, folder, uidvalidity, attrs) VALUES ('acc', 'Sent', 1, '')`,
+		`INSERT INTO membership (account, stable_id, folder, uid, uidvalidity) VALUES ('acc','r1','Sent',1,1),('acc','r2','Sent',2,1),('acc','r3','Sent',3,1)`,
+	} {
+		if _, err := c.db.Exec(q); err != nil { // no \Sent attribute: the name "Sent" is the fallback
+			t.Fatal(err)
+		}
+	}
+	restartSenders(t, c)
+	if err := c.RunSenders(context.Background(), nil); err != nil {
+		t.Fatal(err)
+	}
+	for addr, want := range map[string]int{"a@x.example": 0, "b@x.example": 0, "l@x.example": 0, "o@x.example": 1} {
+		if got := sndRow(t, c, addr).NRepliedByMe; got != want {
+			t.Errorf("%s n_replied_by_me = %d, want %d", addr, got, want)
+		}
+	}
+}
+
+func TestToMeIsExactAndAddressesAreValidated(t *testing.T) {
+	b := thrOpen(t).newSenderBatch()
+	b.owners["acc"] = []string{"me@home.test"}
+	b.add("acc", "A <a@x.example>", "Bob <notme@home.test>, c@x.example", "s", 0, 1, "", false, false)
+	b.add("acc", "B <b@x.example>", "Me <ME@home.test>", "s", 0, 1, "", false, false)
+	if d := b.deltas[senderKey{"acc", "a@x.example"}]; d.toMe != 0 {
+		t.Errorf("substring address matched: %+v", d)
+	}
+	if d := b.deltas[senderKey{"acc", "b@x.example"}]; d.toMe != 1 {
+		t.Errorf("exact address missed: %+v", d)
+	}
+	long := strings.Repeat("a", 330) + "@x.example"
+	for _, bad := range []string{long, "a\x01b@x.example", "a\u202eb@x.example", "a b@x.example"} {
+		b.add("acc", bad, "", "s", 0, 1, "", false, false)
+	}
+	if len(b.deltas) != 2 {
+		t.Errorf("invalid addresses were stored: %d keys", len(b.deltas))
 	}
 }

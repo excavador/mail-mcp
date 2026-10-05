@@ -113,15 +113,11 @@ func TestSendersTagsAndSavedQueriesEndToEnd(t *testing.T) {
 	if s, _ := ok[searchT](t, cs, "search", map[string]any{"account": "acct", "tag": "case/shop"}); s.Total != 1 {
 		t.Errorf("untag undo: %+v", s)
 	}
-	// The tag now belongs to the untag-undo, not to the original tag call, so
-	// undoing the original removes nothing.
-	if r, _ := ok[map[string]any](t, cs, "undo", map[string]any{"history_id": tg.HistoryID}); r["untagged"] != float64(0) {
-		t.Errorf("undo of an overtaken tag removed %v", r["untagged"])
+	// Undo of the untag restored the tag under its ORIGINAL history id, so
+	// undoing the original tag_messages still removes it.
+	if r, _ := ok[map[string]any](t, cs, "undo", map[string]any{"history_id": tg.HistoryID}); r["untagged"] != float64(1) {
+		t.Errorf("undo of the original tag removed %v, want 1", r["untagged"])
 	}
-	// A fresh tag/undo cycle does remove it.
-	ok[tagT](t, cs, "untag_messages", map[string]any{"account": "acct", "tag": "case/shop", "query": "order"})
-	tg2, _ := ok[tagT](t, cs, "tag_messages", map[string]any{"account": "acct", "tag": "case/shop", "query": "order"})
-	ok[map[string]any](t, cs, "undo", map[string]any{"history_id": tg2.HistoryID})
 	if s, _ := ok[searchT](t, cs, "search", map[string]any{"account": "acct", "tag": "case/shop"}); s.Total != 0 {
 		t.Errorf("tag undo: %+v", s)
 	}

@@ -241,7 +241,7 @@ func addTagMessages(s *mcp.Server, d writeDeps) {
 			return nil, out, nil
 		}
 		if _, err := d.hist.Append(history.Record{ID: hid, Account: a.Name, Kind: history.KindTagMessages, Target: tag, Touched: map[string][]string{"tag": added}}); err != nil {
-			if _, rerr := d.store.RemoveTags(ctx, a.Name, tag, added, hid); rerr != nil {
+			if _, _, rerr := d.store.RemoveTags(ctx, a.Name, tag, added, hid); rerr != nil {
 				slog.Warn("tag_messages: could not roll back", "err", rerr)
 			}
 			return nil, tagOut{}, fail("tag_messages", "the history could not be written; nothing was changed", err)
@@ -275,7 +275,7 @@ func addUntagMessages(s *mcp.Server, d writeDeps) {
 		if in.DryRun || len(ids) == 0 {
 			return nil, out, nil
 		}
-		removed, err := d.store.RemoveTags(ctx, a.Name, tag, ids, "")
+		removed, byHist, err := d.store.RemoveTags(ctx, a.Name, tag, ids, "")
 		if err != nil {
 			return nil, tagOut{}, fail("untag_messages", "untagging failed", err, "account", a.Name)
 		}
@@ -283,10 +283,13 @@ func addUntagMessages(s *mcp.Server, d writeDeps) {
 		if len(removed) == 0 {
 			return nil, out, nil
 		}
-		rec, err := d.hist.Append(history.Record{Account: a.Name, Kind: history.KindUntagMessages, Target: tag, Touched: map[string][]string{"tag": removed}})
+		rec, err := d.hist.Append(history.Record{Account: a.Name, Kind: history.KindUntagMessages, Target: tag, Touched: byHist})
 		if err != nil {
-			if _, rerr := d.store.AddTags(ctx, a.Name, tag, removed, ""); rerr != nil {
-				slog.Warn("untag_messages: could not roll back", "err", rerr)
+			// Put each tag back under the history id it had.
+			for hid, ids := range byHist {
+				if _, rerr := d.store.AddTags(ctx, a.Name, tag, ids, hid); rerr != nil {
+					slog.Warn("untag_messages: could not roll back", "err", rerr)
+				}
 			}
 			return nil, tagOut{}, fail("untag_messages", "the history could not be written; nothing was changed", err)
 		}
@@ -357,24 +360,34 @@ func undoLocal(ctx context.Context, d writeDeps, rec history.Record) (map[string
 		return nil, errors.New("that record was already undone")
 	}
 	undoID := history.NewID()
-	ids := rec.Touched["tag"]
 	out := map[string]any{"account": a.Name, "undoes": rec.ID, "kind": rec.Kind, "notice": untrustedFieldsNotice}
 	undo := history.Record{ID: undoID, Account: a.Name, Kind: history.KindUndoLocal, Target: rec.Target, Action: rec.Kind, Undoes: rec.ID}
 	switch rec.Kind {
 	case history.KindTagMessages:
-		removed, err := d.store.RemoveTags(ctx, a.Name, rec.Target, ids, rec.ID)
+		removed, _, err := d.store.RemoveTags(ctx, a.Name, rec.Target, rec.Touched["tag"], rec.ID)
 		if err != nil {
 			return nil, fail("undo", "undo failed", err, "account", a.Name)
 		}
 		out["untagged"] = len(removed)
 		undo.Touched = map[string][]string{"tag": removed}
 	case history.KindUntagMessages:
-		added, err := d.store.AddTags(ctx, a.Name, rec.Target, ids, undoID)
-		if err != nil {
-			if e := tagFail(err); e != nil {
-				return nil, e
+		// Each message goes back under the history id it was tagged with, so a
+		// later undo of that tag_messages record still finds it. (An untag
+		// record written by the first release keyed its ids "tag": they come
+		// back under this undo's own id.)
+		var added []string
+		for hid, ids := range rec.Touched {
+			if hid == "tag" {
+				hid = undoID
 			}
-			return nil, fail("undo", "undo failed", err, "account", a.Name)
+			got, err := d.store.AddTags(ctx, a.Name, rec.Target, ids, hid)
+			if err != nil {
+				if e := tagFail(err); e != nil {
+					return nil, e
+				}
+				return nil, fail("undo", "undo failed", err, "account", a.Name)
+			}
+			added = append(added, got...)
 		}
 		out["retagged"] = len(added)
 		undo.Touched = map[string][]string{"tag": added}

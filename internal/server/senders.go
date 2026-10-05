@@ -100,7 +100,7 @@ func addSenders(s *mcp.Server, byName map[string]accounts.Account, store *cache.
 		out := sendersOut{Account: a.Name, Total: total, Senders: make([]senderRowOut, 0, len(rows)), Notice: untrustedFieldsNotice}
 		for _, r := range rows {
 			out.Senders = append(out.Senders, senderRowOut{
-				Addr: field(r.Addr), Name: field(r.Name), Kind: r.Kind, KindSource: r.KindSource, NMsgs: r.NMsgs,
+				Addr: r.Addr, Name: field(r.Name), Kind: r.Kind, KindSource: r.KindSource, NMsgs: r.NMsgs,
 				NRepliedByMe: r.NRepliedByMe, LastAt: fmtTime(r.LastAt), ListID: field(r.ListID),
 			})
 		}

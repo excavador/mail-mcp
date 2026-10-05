@@ -160,6 +160,14 @@ func (c *Cache) Refresh(ctx context.Context, a accounts.Account, client *imapcli
 	// Remember each folder's special-use attributes (\All for Gmail's All
 	// Mail) so server search can skip LIST. Best effort, and for rows that
 	// exist; a folder first seen now gets its attributes on the next refresh.
+	// Registered before the attribute save below, so it runs after it: the
+	// owner's replies in the Sent folder are credited once the folder's
+	// \Sent attribute is known.
+	defer func() {
+		if err := c.creditSentReplies(ctx, a.Name); err != nil && ctx.Err() == nil {
+			slog.Warn("cache: crediting replies failed", "account", a.Name, "err", err)
+		}
+	}()
 	defer func() { c.saveFolderAttrs(a.Name, folders) }()
 
 	now := c.now()

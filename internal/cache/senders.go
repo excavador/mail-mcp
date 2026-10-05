@@ -17,15 +17,19 @@ package cache
 // written back; the kind is then recomputed from the counts unless the owner
 // set it.
 //
-// n_replied_by_me: for each message from the owner (an address in c.owners,
-// the account's username) the parent is the message In-Reply-To names, else
-// the last id of References. The parent is found through message_ref (which
-// indexes every id a message mentions) restricted to the message whose own
-// Message-ID is that id; the sender of the parent gets +1, at most once per
-// owner message. Limits: the parent must be in the cache when the reply is
-// counted (a reply counted before its parent arrived credits nobody); there
-// is no thread-level fallback, because a thread-level credit would also credit
-// every other participant of a mailing-list thread.
+// n_replied_by_me: a From header is forgeable, so a message counts as the
+// owner's reply only when it is a member of the account's Sent folder (the
+// \Sent special-use folder, else "[Gmail]/Sent Mail" or "Sent") AND its From is
+// an owner address. creditSentReplies finds those messages (messages.
+// replied_counted = 0), takes the parent the reply names (In-Reply-To, else the
+// last id of References), looks it up through message_ref restricted to the
+// message whose own Message-ID is that id, and credits the parent's sender
+// +1. It credits nobody unless exactly one distinct sender has that
+// Message-ID in the account (a reused id is ambiguous) and the parent arrived
+// before the reply. Every message looked at is marked counted, so it is
+// examined once: a reply whose parent is not cached yet credits nobody. There
+// is no thread-level fallback: it would credit every participant of a
+// mailing-list thread.
 
 import (
 	"bufio"
@@ -39,9 +43,12 @@ import (
 	"net/mail"
 	"net/textproto"
 	"os"
+	"slices"
 	"sort"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 )
 
 const (
@@ -60,6 +67,32 @@ func flagInt(b bool) int {
 // parseFrom returns the bare lowercase address and display name of the first
 // address in a From header value.
 func parseFrom(raw string) (addr, name string) {
+	addr, name = parseFromRaw(raw)
+	if !validSenderAddr(addr) {
+		return "", ""
+	}
+	return addr, name
+}
+
+// maxAddrBytes is the longest sender address stored (RFC 5321's limit).
+const maxAddrBytes = 320
+
+// validSenderAddr accepts what a stored address may be: valid UTF-8 of at most
+// maxAddrBytes with no control, format or space characters and none of the
+// header punctuation < > , ; " (so it round-trips through BareAddr and the tools).
+func validSenderAddr(a string) bool {
+	if a == "" || len(a) > maxAddrBytes || !utf8.ValidString(a) {
+		return false
+	}
+	for _, r := range a {
+		if unicode.IsControl(r) || unicode.Is(unicode.Cf, r) || unicode.IsSpace(r) || strings.ContainsRune("<>,;\"", r) {
+			return false
+		}
+	}
+	return true
+}
+
+func parseFromRaw(raw string) (addr, name string) {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
 		return "", ""
@@ -90,19 +123,17 @@ type senderDelta struct {
 	first, last              int64
 	n, fromMe, toMe, replied int
 	nList, nUnsub, nGH, nTxn int
+	nAuto                    int
 }
 
 type senderKey struct{ account, addr string }
 
-type replyRef struct{ account, inReplyTo, refsJSON string }
-
 // senderBatch accumulates deltas for a set of messages and writes them in one
 // transaction (flushTx).
 type senderBatch struct {
-	c       *Cache
-	deltas  map[senderKey]*senderDelta
-	replies []replyRef
-	owners  map[string][]string
+	c      *Cache
+	deltas map[senderKey]*senderDelta
+	owners map[string][]string
 }
 
 func (c *Cache) newSenderBatch() *senderBatch {
@@ -147,12 +178,11 @@ func (b *senderBatch) observe(account string, rid int64, info headerInfo, p pars
 	if !p.Date.IsZero() {
 		date = p.Date.Unix()
 	}
-	b.add(account, p.From, p.To, p.Subject, date, info.internal.Unix(), p.ListID, p.ListUnsub, p.GitHubReason != "",
-		p.Thr.InReplyTo, p.Thr.refsJSON())
+	b.add(account, p.From, p.To, p.Subject, date, info.internal.Unix(), p.ListID, p.ListUnsub, p.GitHubReason != "")
 }
 
 // add counts one message.
-func (b *senderBatch) add(account, from, to, subject string, date, internal int64, listID string, unsub, gh bool, inReplyTo, refsJSON string) {
+func (b *senderBatch) add(account, from, to, subject string, date, internal int64, listID string, unsub, gh bool) {
 	addr, name := parseFrom(from)
 	if addr == "" {
 		return
@@ -181,20 +211,40 @@ func (b *senderBatch) add(account, from, to, subject string, date, internal int6
 	if IsTransactionalSubject(subject) {
 		d.nTxn++
 	}
+	if listID != "" && bareListID(listID) != "" || unsub || gh || noreplyRE.MatchString(localPart(addr)) {
+		d.nAuto++
+	}
 	if b.isOwner(account, addr) {
 		d.fromMe++
-		if inReplyTo != "" || (refsJSON != "" && refsJSON != "[]") {
-			b.replies = append(b.replies, replyRef{account, inReplyTo, refsJSON})
-		}
 		return
 	}
-	lt := strings.ToLower(to)
-	for _, o := range b.ownersOf(account) {
-		if o != "" && strings.Contains(lt, o) {
+	for _, ta := range toAddrs(to) {
+		if slices.Contains(b.ownersOf(account), ta) {
 			d.toMe++
 			break
 		}
 	}
+}
+
+// toAddrs is the bare lowercase addresses of a To header, compared exactly.
+func toAddrs(to string) []string {
+	to = strings.TrimSpace(to)
+	if to == "" {
+		return nil
+	}
+	var out []string
+	if l, err := mail.ParseAddressList(to); err == nil {
+		for _, a := range l {
+			out = append(out, strings.ToLower(a.Address))
+		}
+		return out
+	}
+	for _, part := range strings.Split(to, ",") {
+		if a := BareAddr(part); a != "" {
+			out = append(out, a)
+		}
+	}
+	return out
 }
 
 func firstPos(a, b int64) int64 {
@@ -204,13 +254,13 @@ func firstPos(a, b int64) int64 {
 	return b
 }
 
-type rowQuerier interface {
-	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
-}
-
-// parentAddr is the sender of the message a reply answers: In-Reply-To, else
-// the last Reference. "" when the parent is not in the cache.
-func parentAddr(ctx context.Context, q rowQuerier, account, inReplyTo, refsJSON string) (string, error) {
+// parentSender is the sender of the message a reply answers: In-Reply-To,
+// else the last Reference. It is "" unless exactly one distinct sender has
+// that Message-ID in the account and the earliest copy arrived before
+// replyAt, so a reused Message-ID credits nobody.
+func parentSender(ctx context.Context, db interface {
+	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
+}, account, inReplyTo, refsJSON string, replyAt int64) (string, error) {
 	id := inReplyTo
 	if id == "" {
 		var refs []string
@@ -221,18 +271,157 @@ func parentAddr(ctx context.Context, q rowQuerier, account, inReplyTo, refsJSON 
 	if id == "" {
 		return "", nil
 	}
-	var from string
-	err := q.QueryRowContext(ctx, `
-SELECT p.from_addr FROM message_ref r JOIN messages p ON p.account = r.account AND p.stable_id = r.stable_id
-WHERE r.account = ? AND r.ref_id = ? AND p.message_id = ? LIMIT 1`, account, id, id).Scan(&from)
-	if errors.Is(err, sql.ErrNoRows) {
-		return "", nil
-	}
+	rows, err := db.QueryContext(ctx, `
+SELECT DISTINCT p.stable_id, p.from_addr, p.internal_date, p.date_unix
+FROM message_ref r JOIN messages p ON p.account = r.account AND p.stable_id = r.stable_id
+WHERE r.account = ? AND r.ref_id = ? AND p.message_id = ? LIMIT 5`, account, id, id)
 	if err != nil {
 		return "", fmt.Errorf("senders: find parent: %w", err)
 	}
-	addr, _ := parseFrom(from)
-	return addr, nil
+	defer rows.Close()
+	senders := map[string]bool{}
+	earliest := int64(0)
+	for rows.Next() {
+		var (
+			sid, from        string
+			internal, dateAt int64
+		)
+		if err := rows.Scan(&sid, &from, &internal, &dateAt); err != nil {
+			return "", fmt.Errorf("senders: find parent: %w", err)
+		}
+		addr, _ := parseFrom(from)
+		senders[addr] = true
+		if at := firstPos(internal, dateAt); earliest == 0 || at < earliest {
+			earliest = at
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return "", fmt.Errorf("senders: find parent: %w", err)
+	}
+	if len(senders) != 1 || earliest <= 0 || replyAt <= 0 || earliest >= replyAt {
+		return "", nil
+	}
+	for a := range senders {
+		return a, nil
+	}
+	return "", nil
+}
+
+// sentFolders are the account's Sent folders: those with the \Sent attribute,
+// else the conventional names.
+func (c *Cache) sentFolders(ctx context.Context, account string) ([]string, error) {
+	var out []string
+	for _, q := range []string{
+		`SELECT folder FROM folders WHERE account = ? AND (' ' || attrs || ' ') LIKE '% \Sent %'`,
+		`SELECT folder FROM folders WHERE account = ? AND folder IN ('[Gmail]/Sent Mail', 'Sent')`,
+	} {
+		rows, err := c.db.QueryContext(ctx, q, account)
+		if err != nil {
+			return nil, fmt.Errorf("senders: sent folder: %w", err)
+		}
+		for rows.Next() {
+			var f string
+			if err := rows.Scan(&f); err != nil {
+				_ = rows.Close()
+				return nil, fmt.Errorf("senders: sent folder: %w", err)
+			}
+			out = append(out, f)
+		}
+		err = rows.Err()
+		_ = rows.Close()
+		if err != nil {
+			return nil, fmt.Errorf("senders: sent folder: %w", err)
+		}
+		if len(out) > 0 {
+			return out, nil
+		}
+	}
+	return nil, nil
+}
+
+// creditSentReplies credits n_replied_by_me for the account's messages that
+// are in a Sent folder, are from an owner address and have not been looked at
+// yet. Bounded batches, each its own short transaction.
+func (c *Cache) creditSentReplies(ctx context.Context, account string) error {
+	owners := c.threadOpts(account).Owners
+	if len(owners) == 0 {
+		return nil
+	}
+	sent, err := c.sentFolders(ctx, account)
+	if err != nil || len(sent) == 0 {
+		return err
+	}
+	where := `s.account = ? AND s.folder IN (` + tagPlaceholders(len(sent)) + `) AND m.replied_counted = 0`
+	args := []any{account}
+	for _, f := range sent {
+		args = append(args, f)
+	}
+	for {
+		rows, err := c.db.QueryContext(ctx, `
+SELECT DISTINCT m.rowid, m.from_addr, COALESCE(m.in_reply_to, ''), COALESCE(m.references_json, ''), m.internal_date, m.date_unix
+FROM membership s JOIN messages m ON m.account = s.account AND m.stable_id = s.stable_id
+WHERE `+where+` LIMIT ?`, append(append([]any{}, args...), sendersBatch)...)
+		if err != nil {
+			return fmt.Errorf("senders: sent replies: %w", err)
+		}
+		type cand struct {
+			rid                int64
+			from, irt, refs    string
+			internal, dateUnix int64
+		}
+		var cs []cand
+		for rows.Next() {
+			var x cand
+			if err := rows.Scan(&x.rid, &x.from, &x.irt, &x.refs, &x.internal, &x.dateUnix); err != nil {
+				_ = rows.Close()
+				return fmt.Errorf("senders: sent replies: %w", err)
+			}
+			cs = append(cs, x)
+		}
+		err = rows.Err()
+		_ = rows.Close()
+		if err != nil {
+			return fmt.Errorf("senders: sent replies: %w", err)
+		}
+		if len(cs) == 0 {
+			return nil
+		}
+		sb := c.newSenderBatch()
+		for _, x := range cs {
+			from, _ := parseFrom(x.from)
+			if from == "" || !sb.isOwner(account, from) || (x.irt == "" && (x.refs == "" || x.refs == "[]")) {
+				continue
+			}
+			parent, err := parentSender(ctx, c.db, account, x.irt, x.refs, firstPos(x.internal, x.dateUnix))
+			if err != nil {
+				return err
+			}
+			if parent != "" && !sb.isOwner(account, parent) {
+				sb.get(account, parent).replied++
+			}
+		}
+		tx, err := c.db.BeginTx(ctx, nil)
+		if err != nil {
+			return fmt.Errorf("senders: sent replies: %w", err)
+		}
+		if err := func() error {
+			defer func() { _ = tx.Rollback() }()
+			if err := sb.flushTx(ctx, tx); err != nil {
+				return err
+			}
+			for _, x := range cs {
+				if _, err := tx.ExecContext(ctx, `UPDATE messages SET replied_counted = 1 WHERE rowid = ?`, x.rid); err != nil {
+					return err
+				}
+			}
+			return tx.Commit()
+		}(); err != nil {
+			return fmt.Errorf("senders: sent replies: %w", err)
+		}
+		if len(cs) < sendersBatch {
+			return nil
+		}
+	}
 }
 
 type sendersCounts struct {
@@ -250,19 +439,8 @@ func trimCounts(m map[string]int) map[string]int {
 	return m
 }
 
-// flushTx resolves the batch's replies, merges every delta into its senders
-// row and writes it. It reads and writes only through tx.
+// flushTx merges every delta into its senders row and writes it. It reads and writes only through tx.
 func (b *senderBatch) flushTx(ctx context.Context, tx *sql.Tx) error {
-	for _, r := range b.replies {
-		addr, err := parentAddr(ctx, tx, r.account, r.inReplyTo, r.refsJSON)
-		if err != nil {
-			return err
-		}
-		if addr != "" && !b.isOwner(r.account, addr) {
-			b.get(r.account, addr).replied++
-		}
-	}
-	b.replies = nil
 	keys := make([]senderKey, 0, len(b.deltas))
 	for k := range b.deltas {
 		keys = append(keys, k)
@@ -285,17 +463,17 @@ func (b *senderBatch) flushTx(ctx context.Context, tx *sql.Tx) error {
 
 func mergeSenderTx(ctx context.Context, tx *sql.Tx, k senderKey, d *senderDelta, owner bool, now int64) error {
 	var (
-		domain, namesJSON, countsJSON, listID, kind, source string
-		first, last, kindAt                                 int64
-		n, fromMe, toMe, replied, nList, nUnsub, nGH, nTxn  int
-		unsub                                               int
+		domain, namesJSON, countsJSON, listID, kind, source       string
+		first, last, kindAt                                       int64
+		n, fromMe, toMe, replied, nList, nUnsub, nGH, nTxn, nAuto int
+		unsub                                                     int
 	)
 	err := tx.QueryRowContext(ctx, `
 SELECT domain, display_names_json, counts_json, first_at, last_at, n_msgs, n_from_me, n_to_me, n_replied_by_me,
-       list_id, has_list_unsubscribe, n_list, n_unsub, n_gh, n_txn_subj, kind, kind_source, kind_updated_at
+       list_id, has_list_unsubscribe, n_list, n_unsub, n_gh, n_txn_subj, n_auto, kind, kind_source, kind_updated_at
 FROM senders WHERE account = ? AND addr = ?`, k.account, k.addr).Scan(
 		&domain, &namesJSON, &countsJSON, &first, &last, &n, &fromMe, &toMe, &replied,
-		&listID, &unsub, &nList, &nUnsub, &nGH, &nTxn, &kind, &source, &kindAt)
+		&listID, &unsub, &nList, &nUnsub, &nGH, &nTxn, &nAuto, &kind, &source, &kindAt)
 	exists := err == nil
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return fmt.Errorf("senders: read row: %w", err)
@@ -332,6 +510,7 @@ FROM senders WHERE account = ? AND addr = ?`, k.account, k.addr).Scan(
 	nUnsub += d.nUnsub
 	nGH += d.nGH
 	nTxn += d.nTxn
+	nAuto += d.nAuto
 	if owner {
 		fromMe = n
 	} else {
@@ -344,24 +523,24 @@ FROM senders WHERE account = ? AND addr = ?`, k.account, k.addr).Scan(
 	nj, _ := json.Marshal(topKeys(counts.Names, 3))
 	cj, _ := json.Marshal(counts)
 	if source == SourceRule {
-		nk := ClassifySender(KindInputs{Addr: k.addr, Domain: domain, NMsgs: n, NReplied: replied, NList: nList, NUnsub: nUnsub, NGH: nGH, NTxn: nTxn})
+		nk := ClassifySender(KindInputs{Addr: k.addr, Domain: domain, NMsgs: n, NReplied: replied, NList: nList, NUnsub: nUnsub, NGH: nGH, NTxn: nTxn, NAuto: nAuto})
 		if nk != kind || !exists {
 			kind, kindAt = nk, now
 		}
 	}
 	_, err = tx.ExecContext(ctx, `
 INSERT INTO senders (account, addr, domain, display_names_json, counts_json, first_at, last_at, n_msgs, n_from_me, n_to_me,
-	n_replied_by_me, list_id, has_list_unsubscribe, n_list, n_unsub, n_gh, n_txn_subj, kind, kind_source, kind_updated_at)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	n_replied_by_me, list_id, has_list_unsubscribe, n_list, n_unsub, n_gh, n_txn_subj, n_auto, kind, kind_source, kind_updated_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(account, addr) DO UPDATE SET
 	domain = excluded.domain, display_names_json = excluded.display_names_json, counts_json = excluded.counts_json,
 	first_at = excluded.first_at, last_at = excluded.last_at, n_msgs = excluded.n_msgs, n_from_me = excluded.n_from_me,
 	n_to_me = excluded.n_to_me, n_replied_by_me = excluded.n_replied_by_me, list_id = excluded.list_id,
 	has_list_unsubscribe = excluded.has_list_unsubscribe, n_list = excluded.n_list, n_unsub = excluded.n_unsub,
-	n_gh = excluded.n_gh, n_txn_subj = excluded.n_txn_subj, kind = excluded.kind, kind_source = excluded.kind_source,
+	n_gh = excluded.n_gh, n_txn_subj = excluded.n_txn_subj, n_auto = excluded.n_auto, kind = excluded.kind, kind_source = excluded.kind_source,
 	kind_updated_at = excluded.kind_updated_at`,
 		k.account, k.addr, domain, string(nj), string(cj), first, last, n, fromMe, toMe, replied, listID,
-		flagInt(nUnsub > 0), nList, nUnsub, nGH, nTxn, kind, source, kindAt)
+		flagInt(nUnsub > 0), nList, nUnsub, nGH, nTxn, nAuto, kind, source, kindAt)
 	if err != nil {
 		return fmt.Errorf("senders: write row: %w", err)
 	}
@@ -413,6 +592,9 @@ CREATE TEMP TABLE IF NOT EXISTS senders_keep AS SELECT account, addr, domain, ki
 	if _, err := tx.Exec(`DELETE FROM senders`); err != nil {
 		return fmt.Errorf("reset senders: %w", err)
 	}
+	if _, err := tx.Exec(`UPDATE messages SET replied_counted = 0 WHERE replied_counted <> 0`); err != nil {
+		return fmt.Errorf("reset senders: %w", err)
+	}
 	if _, err := tx.Exec(`INSERT INTO senders (account, addr, domain, kind, kind_source, kind_updated_at)
 SELECT account, addr, domain, kind, 'owner', kind_updated_at FROM senders_keep`); err != nil {
 		return fmt.Errorf("reset senders: %w", err)
@@ -450,6 +632,37 @@ func (c *Cache) RunSenders(ctx context.Context, log *slog.Logger) error {
 	if log == nil {
 		log = slog.Default()
 	}
+	if err := c.countSenders(ctx, log); err != nil {
+		return err
+	}
+	// Replies last: they look at the Sent folders' membership.
+	rows, err := c.db.QueryContext(ctx, `SELECT DISTINCT account FROM folders`)
+	if err != nil {
+		return fmt.Errorf("senders: accounts: %w", err)
+	}
+	var accts []string
+	for rows.Next() {
+		var a string
+		if err := rows.Scan(&a); err != nil {
+			_ = rows.Close()
+			return fmt.Errorf("senders: accounts: %w", err)
+		}
+		accts = append(accts, a)
+	}
+	err = rows.Err()
+	_ = rows.Close()
+	if err != nil {
+		return fmt.Errorf("senders: accounts: %w", err)
+	}
+	for _, a := range accts {
+		if err := c.creditSentReplies(ctx, a); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (c *Cache) countSenders(ctx context.Context, log *slog.Logger) error {
 	c.sendersJob.running.Store(true)
 	defer c.sendersJob.running.Store(false)
 	if err := c.fillListUnsub(ctx, log); err != nil {
@@ -477,8 +690,7 @@ func (c *Cache) RunSenders(ctx context.Context, log *slog.Logger) error {
 			unsub, gh                   bool
 		}
 		rows, err := c.db.QueryContext(ctx, `
-SELECT rowid, account, from_addr, to_addr, subject, date_unix, internal_date, list_id, gh_reason <> '', COALESCE(list_unsub, 0) <> 0,
-       COALESCE(in_reply_to, ''), COALESCE(references_json, '')
+SELECT rowid, account, from_addr, to_addr, subject, date_unix, internal_date, list_id, gh_reason <> '', COALESCE(list_unsub, 0) <> 0
 FROM messages WHERE rowid > ? AND rowid <= ? ORDER BY rowid LIMIT ?`, last, max, sendersBatch)
 		if err != nil {
 			return fmt.Errorf("senders read: %w", err)
@@ -486,7 +698,7 @@ FROM messages WHERE rowid > ? AND rowid <= ? ORDER BY rowid LIMIT ?`, last, max,
 		var batchRows []row
 		for rows.Next() {
 			var r row
-			if err := rows.Scan(&r.rid, &r.account, &r.from, &r.to, &r.subject, &r.date, &r.internal, &r.listID, &r.gh, &r.unsub, &r.inReplyTo, &r.refsJSON); err != nil {
+			if err := rows.Scan(&r.rid, &r.account, &r.from, &r.to, &r.subject, &r.date, &r.internal, &r.listID, &r.gh, &r.unsub); err != nil {
 				_ = rows.Close()
 				return fmt.Errorf("senders read: %w", err)
 			}
@@ -509,7 +721,7 @@ FROM messages WHERE rowid > ? AND rowid <= ? ORDER BY rowid LIMIT ?`, last, max,
 			}
 			sb := c.newSenderBatch()
 			for _, r := range batchRows {
-				sb.add(r.account, r.from, r.to, r.subject, r.date, r.internal, r.listID, r.unsub, r.gh, r.inReplyTo, r.refsJSON)
+				sb.add(r.account, r.from, r.to, r.subject, r.date, r.internal, r.listID, r.unsub, r.gh)
 			}
 			tx, err := c.db.BeginTx(ctx, nil)
 			if err != nil {

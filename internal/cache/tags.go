@@ -22,6 +22,7 @@ const (
 	// MaxTagTargets is the most messages one tag or untag call may change.
 	MaxTagTargets = 5000
 	maxTagsPerAcc = 1000
+	maxTagRows    = 100000 // tag rows per account
 	maxSavedPerAc = 200
 	maxSavedJSON  = 4096
 	maxNoteRunes  = 500
@@ -170,6 +171,13 @@ func (c *Cache) AddTags(ctx context.Context, account, tag string, ids []string, 
 	if known >= maxTagsPerAcc {
 		return nil, fmt.Errorf("%w: at most %d different tags per account", ErrTagLimit, maxTagsPerAcc)
 	}
+	var rowsNow int
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM tags WHERE account = ?`, account).Scan(&rowsNow); err != nil {
+		return nil, fmt.Errorf("cache: add tags: %w", err)
+	}
+	if rowsNow+len(ids) > maxTagRows {
+		return nil, fmt.Errorf("%w: at most %d tagged messages per account", ErrTagLimit, maxTagRows)
+	}
 	now := c.now().Unix()
 	var added []string
 	for _, id := range ids {
@@ -189,42 +197,50 @@ SELECT account, stable_id, ?, ?, ? FROM messages WHERE account = ? AND stable_id
 	return added, nil
 }
 
-// RemoveTags removes the tag from the given messages and returns the ids that
-// carried it. With onlyHistoryID set, only rows written by that history record
-// are removed (undo of tag_messages).
-func (c *Cache) RemoveTags(ctx context.Context, account, tag string, ids []string, onlyHistoryID string) ([]string, error) {
+// RemoveTags removes the tag from the given messages. It returns the ids that
+// carried it and, by the history id each row was written under, the same ids
+// grouped (so an undo can put each back under its original id). With
+// onlyHistoryID set, only rows written by that history record are removed
+// (undo of tag_messages).
+func (c *Cache) RemoveTags(ctx context.Context, account, tag string, ids []string, onlyHistoryID string) ([]string, map[string][]string, error) {
 	tag, err := NormalizeTag(tag)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if len(ids) > MaxTagTargets {
-		return nil, fmt.Errorf("%w: at most %d messages per call", ErrTagLimit, MaxTagTargets)
+		return nil, nil, fmt.Errorf("%w: at most %d messages per call", ErrTagLimit, MaxTagTargets)
 	}
 	tx, err := c.db.BeginTx(ctx, nil)
 	if err != nil {
-		return nil, fmt.Errorf("cache: remove tags: %w", err)
+		return nil, nil, fmt.Errorf("cache: remove tags: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
 	var removed []string
+	byHist := map[string][]string{}
 	for _, id := range ids {
-		q := `DELETE FROM tags WHERE account = ? AND stable_id = ? AND tag = ?`
+		var hid string
+		q := `SELECT history_id FROM tags WHERE account = ? AND stable_id = ? AND tag = ?`
 		args := []any{account, id, tag}
 		if onlyHistoryID != "" {
 			q += ` AND history_id = ?`
 			args = append(args, onlyHistoryID)
 		}
-		res, err := tx.ExecContext(ctx, q, args...)
-		if err != nil {
-			return nil, fmt.Errorf("cache: remove tags: %w", err)
+		switch err := tx.QueryRowContext(ctx, q, args...).Scan(&hid); {
+		case errors.Is(err, sql.ErrNoRows):
+			continue
+		case err != nil:
+			return nil, nil, fmt.Errorf("cache: remove tags: %w", err)
 		}
-		if n, _ := res.RowsAffected(); n == 1 {
-			removed = append(removed, id)
+		if _, err := tx.ExecContext(ctx, `DELETE FROM tags WHERE account = ? AND stable_id = ? AND tag = ?`, account, id, tag); err != nil {
+			return nil, nil, fmt.Errorf("cache: remove tags: %w", err)
 		}
+		removed = append(removed, id)
+		byHist[hid] = append(byHist[hid], id)
 	}
 	if err := tx.Commit(); err != nil {
-		return nil, fmt.Errorf("cache: remove tags: %w", err)
+		return nil, nil, fmt.Errorf("cache: remove tags: %w", err)
 	}
-	return removed, nil
+	return removed, byHist, nil
 }
 
 // TagCount is a tag with how many messages carry it.
@@ -236,6 +252,8 @@ type TagCount struct {
 
 // ListTags lists an account's tags, most used first.
 func (c *Cache) ListTags(ctx context.Context, account string) ([]TagCount, error) {
+	ctx, cancel := context.WithTimeout(ctx, searchTimeout)
+	defer cancel()
 	rows, err := c.db.QueryContext(ctx, `SELECT tag, COUNT(*), MAX(added_at) FROM tags WHERE account = ? GROUP BY tag ORDER BY COUNT(*) DESC, tag LIMIT ?`, account, maxTagsPerAcc)
 	if err != nil {
 		return nil, fmt.Errorf("cache: list tags: %w", err)
@@ -327,6 +345,8 @@ var ErrNoSavedQuery = errors.New("no such saved query")
 
 // GetSavedQuery returns one saved query.
 func (c *Cache) GetSavedQuery(ctx context.Context, account, name string) (SavedQuery, error) {
+	ctx, cancel := context.WithTimeout(ctx, searchTimeout)
+	defer cancel()
 	name = strings.ToLower(strings.TrimSpace(name))
 	var (
 		q    SavedQuery
@@ -349,6 +369,8 @@ func (c *Cache) GetSavedQuery(ctx context.Context, account, name string) (SavedQ
 
 // ListSavedQueries lists an account's saved queries by name.
 func (c *Cache) ListSavedQueries(ctx context.Context, account string) ([]SavedQuery, error) {
+	ctx, cancel := context.WithTimeout(ctx, searchTimeout)
+	defer cancel()
 	rows, err := c.db.QueryContext(ctx, `SELECT name, query_json, note, created_at FROM saved_queries WHERE account = ? ORDER BY name LIMIT ?`, account, maxSavedPerAc)
 	if err != nil {
 		return nil, fmt.Errorf("cache: saved queries: %w", err)

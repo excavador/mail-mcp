@@ -56,11 +56,11 @@ func TestTagsAddRemoveSearchAndUndoScoping(t *testing.T) {
 		t.Errorf("ResolveSearch text+tag: %v %v", got, err)
 	}
 	// Undo of h1 removes only what h1 added (m1 stays? no: m1 was added by h1).
-	rm, _ := c.RemoveTags(ctx, "acc", "case/x", []string{"m1", "m2", "m3"}, "h1")
+	rm, _, _ := c.RemoveTags(ctx, "acc", "case/x", []string{"m1", "m2", "m3"}, "h1")
 	if !slices.Equal(rm, []string{"m1", "m2"}) {
 		t.Errorf("history-scoped removal: %v", rm)
 	}
-	rm, _ = c.RemoveTags(ctx, "acc", "case/x", []string{"m3"}, "")
+	rm, _, _ = c.RemoveTags(ctx, "acc", "case/x", []string{"m3"}, "")
 	if !slices.Equal(rm, []string{"m3"}) {
 		t.Errorf("unscoped removal: %v", rm)
 	}

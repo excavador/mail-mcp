@@ -99,6 +99,12 @@ var addedColumns = []columnSet{
 		// list_unsub: 1 when the message has a List-Unsubscribe header. NULL
 		// means "not read from the blob yet" (the senders job fills it).
 		{"list_unsub", "INTEGER"},
+		// replied_counted: 1 once the message has been looked at as a possible
+		// owner reply (senders.go), so it is credited at most once.
+		{"replied_counted", "INTEGER NOT NULL DEFAULT 0"},
+	}},
+	{"senders", []struct{ name, def string }{
+		{"n_auto", "INTEGER NOT NULL DEFAULT 0"},
 	}},
 }
 
@@ -314,6 +320,7 @@ CREATE TABLE IF NOT EXISTS senders (
 	n_unsub              INTEGER NOT NULL DEFAULT 0,
 	n_gh                 INTEGER NOT NULL DEFAULT 0,
 	n_txn_subj           INTEGER NOT NULL DEFAULT 0,
+	n_auto               INTEGER NOT NULL DEFAULT 0,
 	kind                 TEXT    NOT NULL DEFAULT 'human',
 	kind_source          TEXT    NOT NULL DEFAULT 'rule',
 	kind_updated_at      INTEGER NOT NULL DEFAULT 0,

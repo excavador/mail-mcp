@@ -191,11 +191,11 @@ func (c *Cache) RestoreSenderKind(ctx context.Context, account, addr, currentKin
 	}
 	defer func() { _ = tx.Rollback() }()
 	var (
-		kind, source, domain                 string
-		n, replied, nList, nUnsub, nGH, nTxn int
+		kind, source, domain                        string
+		n, replied, nList, nUnsub, nGH, nTxn, nAuto int
 	)
-	err = tx.QueryRowContext(ctx, `SELECT kind, kind_source, domain, n_msgs, n_replied_by_me, n_list, n_unsub, n_gh, n_txn_subj
-FROM senders WHERE account = ? AND addr = ?`, account, addr).Scan(&kind, &source, &domain, &n, &replied, &nList, &nUnsub, &nGH, &nTxn)
+	err = tx.QueryRowContext(ctx, `SELECT kind, kind_source, domain, n_msgs, n_replied_by_me, n_list, n_unsub, n_gh, n_txn_subj, n_auto
+FROM senders WHERE account = ? AND addr = ?`, account, addr).Scan(&kind, &source, &domain, &n, &replied, &nList, &nUnsub, &nGH, &nTxn, &nAuto)
 	if errors.Is(err, sql.ErrNoRows) {
 		return ErrSenderNotFound
 	}
@@ -207,7 +207,7 @@ FROM senders WHERE account = ? AND addr = ?`, account, addr).Scan(&kind, &source
 	}
 	nk, ns := prev.Kind, prev.Source
 	if ns == SourceRule {
-		nk = ClassifySender(KindInputs{Addr: addr, Domain: domain, NMsgs: n, NReplied: replied, NList: nList, NUnsub: nUnsub, NGH: nGH, NTxn: nTxn})
+		nk = ClassifySender(KindInputs{Addr: addr, Domain: domain, NMsgs: n, NReplied: replied, NList: nList, NUnsub: nUnsub, NGH: nGH, NTxn: nTxn, NAuto: nAuto})
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE senders SET kind = ?, kind_source = ?, kind_updated_at = ? WHERE account = ? AND addr = ?`,
 		nk, ns, c.now().Unix(), account, addr); err != nil {

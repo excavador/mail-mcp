@@ -43,11 +43,14 @@ type KindInputs struct {
 	NUnsub       int // messages with a List-Unsubscribe
 	NGH          int // messages with X-GitHub-Reason
 	NTxn         int // messages whose subject has an order/invoice/receipt/shipping shape
+	NAuto        int // messages that look automated: noreply-style sender, List-Id, List-Unsubscribe or X-GitHub-Reason
 }
 
 var (
-	noreplyRE = regexp.MustCompile(`(?i)no[-_.]?reply|do[-_.]?not[-_.]?reply`)
-	txnSubjRE = regexp.MustCompile(`(?i)\b(order|orders|invoice|receipt|shipping|shipped|shipment|delivery|delivered|payment|paid|refund|tracking|bestelling|factuur|bezorg\w*|betaling|pakket|verzonden|bestellbest\w+|rechnung|commande|facture|livraison)\b`)
+	// noreplyRE matches a no-reply local part delimited by separators or the
+	// ends, so "piano.reply" does not match.
+	noreplyRE = regexp.MustCompile(`(?i)(^|[._+-])(no[-_.]?reply|do[-_.]?not[-_.]?reply)($|[._+0-9-])`)
+	txnSubjRE = regexp.MustCompile(`(?i)\b(order|orders|invoice|receipt|shipping|shipped|shipment|delivery|delivered|payment|paid|refund|tracking|bestell\w*|factuur|bezorg\w*|betaling|pakket|verzonden|unterwegs|versand\w*|rechnung|commande|facture|livraison)\b`)
 
 	// notifierDomains are registrable domains whose mail is automated
 	// notification traffic (CI, tracker, chat, monitoring, compliance).
@@ -105,6 +108,11 @@ func isShop(domain string) bool {
 	if shopDomains[domain] {
 		return true
 	}
+	// The first-label match is for ICANN suffixes only: ups.github.io or
+	// ebay.vercel.app are someone's page, not the shop.
+	if _, icann := publicsuffix.PublicSuffix(domain); !icann {
+		return false
+	}
 	label, _, _ := strings.Cut(domain, ".")
 	return shopLabels[label]
 }
@@ -115,14 +123,19 @@ func IsTransactionalSubject(s string) bool { return txnSubjRE.MatchString(s) }
 
 // ClassifySender applies the rules, in this order, first match wins:
 //
-//  1. notification: a known notifier domain, or any X-GitHub-Reason
-//  2. human: the owner has replied to this sender
-//  3. transactional: a known shop, carrier or payment domain
-//  4. noreply-style address: transactional when any subject has an order shape,
-//     notification when any message carries List-Id, List-Unsubscribe or
-//     X-GitHub-Reason (automated headers)
-//  5. list: any message carries a List-Id
-//  6. human: everything else
+//  1. notification: the GitHub notification addresses (notifications@ and
+//     noreply@github.com)
+//  2. human: the owner has replied to this sender (from the Sent folder, see
+//     senders.go), even at a notifier domain
+//  3. notification: X-GitHub-Reason, honoured only at github.com (anyone can
+//     forge the header)
+//  4. notification: a known notifier domain AND a majority of the sender's
+//     messages look automated (so a person at cloudflare.com is not caught)
+//  5. transactional: a known shop, carrier or payment domain
+//  6. noreply-style address: transactional when any subject has an order
+//     shape, notification when any message carries List-Id or List-Unsubscribe
+//  7. list: any message carries a List-Id
+//  8. human: everything else
 //
 // The rules see only headers and subjects, never bodies, so they are
 // conservative about "human": a marketing sender without List-Id or
@@ -132,11 +145,16 @@ func ClassifySender(in KindInputs) string {
 	if domain == "" {
 		domain = RegistrableDomain(in.Addr)
 	}
-	switch {
-	case notifierDomains[domain] || in.NGH > 0:
+	isGH := domain == "github.com"
+	switch lp := localPart(in.Addr); {
+	case isGH && (lp == "notifications" || lp == "noreply"):
 		return KindNotification
 	case in.NReplied > 0:
 		return KindHuman
+	case isGH && in.NGH > 0:
+		return KindNotification
+	case notifierDomains[domain] && in.NMsgs > 0 && in.NAuto*2 > in.NMsgs:
+		return KindNotification
 	case isShop(domain):
 		return KindTransactional
 	}
