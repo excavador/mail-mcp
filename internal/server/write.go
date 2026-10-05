@@ -31,6 +31,8 @@ type writeDeps struct {
 	// maxUnelicited is the most messages apply_intent will change when the
 	// client cannot show the owner a confirmation of its own.
 	maxUnelicited int
+	// approvalMode decides whether apply_intent may elicit at all.
+	approvalMode ApprovalMode
 }
 
 func ptr[T any](v T) *T { return &v }
@@ -304,10 +306,10 @@ func clientElicits(req *mcp.CallToolRequest) bool {
 // readable. That is weaker (the model fills in "approved"), so it is capped at
 // maxUnelicited messages and recorded as "client-tool-approval".
 func approve(ctx context.Context, req *mcp.CallToolRequest, d writeDeps, p *organise.Preview) (by string, pending *mcp.CallToolResult, err error) {
-	if !clientElicits(req) {
+	if d.approvalMode != ApprovalElicitation || !clientElicits(req) {
 		if p.Matched > d.maxUnelicited {
 			return "", nil, organise.SafeError(fmt.Sprintf(
-				"more than %d messages needs a client that supports confirmation (elicitation)", d.maxUnelicited))
+				"more than %d messages cannot be applied on the client's tool approval alone", d.maxUnelicited))
 		}
 		return history.ApprovedClientTool, nil, nil
 	}
@@ -415,12 +417,21 @@ func elicitMessage(d writeDeps, p *organise.Preview) string {
 	return b.String()
 }
 
+func applyDescription(d writeDeps) string {
+	desc := "Execute a previewed intent (from preview_intent, undo or reapply) after the owner approves it. " +
+		"It acts only on messages that were in the preview AND still match, so mail that arrived since is never " +
+		"touched, and it never deletes. Requires approved=true. Recorded in the history, from which it can be undone."
+	if d.approvalMode != ApprovalElicitation {
+		desc += fmt.Sprintf(" Approval is the client's own tool-approval prompt, which must show the account, action, "+
+			"source, target and count (restate them in the expect_* fields); above %d messages the apply is refused.", d.maxUnelicited)
+	}
+	return desc
+}
+
 func addApplyIntent(s *mcp.Server, d writeDeps) {
 	mcp.AddTool(s, &mcp.Tool{
-		Name: "apply_intent",
-		Description: "Execute a previewed intent (from preview_intent, undo or reapply) after the owner approves it. " +
-			"It acts only on messages that were in the preview AND still match, so mail that arrived since is never " +
-			"touched, and it never deletes. Requires approved=true. Recorded in the history, from which it can be undone.",
+		Name:        "apply_intent",
+		Description: applyDescription(d),
 		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: false, DestructiveHint: ptr(false), OpenWorldHint: ptr(false)},
 	}, func(ctx context.Context, req *mcp.CallToolRequest, in applyIn) (*mcp.CallToolResult, applyOut, error) {
 		if !in.Approved {
