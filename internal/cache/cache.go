@@ -46,7 +46,9 @@ type Cache struct {
 
 	fts2Ready atomic.Bool // the message_fts2 backfill is complete
 
-	fts2Job, threadsJob jobState     // in-process state of the backfill jobs
+	fts2Job, threadsJob jobState // in-process state of the backfill jobs
+	sendersJob          jobState
+	sendersMax          atomic.Int64 // messages with a higher rowid are counted into senders by refresh itself
 	fgWriters           atomic.Int64 // refreshes and applies in progress; backfills give way
 	ws                  writeStats
 
@@ -94,6 +96,15 @@ var addedColumns = []columnSet{
 		{"message_id", "TEXT"},
 		{"in_reply_to", "TEXT"},
 		{"references_json", "TEXT"},
+		// list_unsub: 1 when the message has a List-Unsubscribe header. NULL
+		// means "not read from the blob yet" (the senders job fills it).
+		{"list_unsub", "INTEGER"},
+		// replied_counted: 1 once the message has been looked at as a possible
+		// owner reply (senders.go), so it is credited at most once.
+		{"replied_counted", "INTEGER NOT NULL DEFAULT 0"},
+	}},
+	{"senders", []struct{ name, def string }{
+		{"n_auto", "INTEGER NOT NULL DEFAULT 0"},
 	}},
 }
 
@@ -286,6 +297,57 @@ CREATE TABLE IF NOT EXISTS search_log (
 );
 CREATE INDEX IF NOT EXISTS search_log_by_at ON search_log (at);
 
+-- Senders, tags and saved queries (added after v0.3.1, additively, no
+-- schemaVersion bump). senders is derived from messages (see senders.go) except
+-- for kind_source = 'owner', which is the owner's decision. tags and
+-- saved_queries are the owner's own data: local only, never written to the
+-- mailbox, and never dropped with the index.
+CREATE TABLE IF NOT EXISTS senders (
+	account              TEXT    NOT NULL,
+	addr                 TEXT    NOT NULL,
+	domain               TEXT    NOT NULL DEFAULT '',
+	display_names_json   TEXT    NOT NULL DEFAULT '[]',
+	counts_json          TEXT    NOT NULL DEFAULT '{}',
+	first_at             INTEGER NOT NULL DEFAULT 0,
+	last_at              INTEGER NOT NULL DEFAULT 0,
+	n_msgs               INTEGER NOT NULL DEFAULT 0,
+	n_from_me            INTEGER NOT NULL DEFAULT 0,
+	n_to_me              INTEGER NOT NULL DEFAULT 0,
+	n_replied_by_me      INTEGER NOT NULL DEFAULT 0,
+	list_id              TEXT    NOT NULL DEFAULT '',
+	has_list_unsubscribe INTEGER NOT NULL DEFAULT 0,
+	n_list               INTEGER NOT NULL DEFAULT 0,
+	n_unsub              INTEGER NOT NULL DEFAULT 0,
+	n_gh                 INTEGER NOT NULL DEFAULT 0,
+	n_txn_subj           INTEGER NOT NULL DEFAULT 0,
+	n_auto               INTEGER NOT NULL DEFAULT 0,
+	kind                 TEXT    NOT NULL DEFAULT 'human',
+	kind_source          TEXT    NOT NULL DEFAULT 'rule',
+	kind_updated_at      INTEGER NOT NULL DEFAULT 0,
+	PRIMARY KEY (account, addr)
+) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS senders_by_kind ON senders (account, kind, n_msgs);
+CREATE INDEX IF NOT EXISTS senders_by_last ON senders (account, last_at);
+
+CREATE TABLE IF NOT EXISTS tags (
+	account    TEXT    NOT NULL,
+	stable_id  TEXT    NOT NULL,
+	tag        TEXT    NOT NULL,
+	added_at   INTEGER NOT NULL,
+	history_id TEXT    NOT NULL DEFAULT '',
+	PRIMARY KEY (account, stable_id, tag)
+) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS tags_by_tag ON tags (account, tag, added_at);
+
+CREATE TABLE IF NOT EXISTS saved_queries (
+	account    TEXT    NOT NULL,
+	name       TEXT    NOT NULL,
+	query_json TEXT    NOT NULL,
+	note       TEXT    NOT NULL DEFAULT '',
+	created_at INTEGER NOT NULL,
+	PRIMARY KEY (account, name)
+) WITHOUT ROWID;
+
 CREATE TABLE IF NOT EXISTS refreshes (
 	account    TEXT PRIMARY KEY,
 	at         INTEGER NOT NULL,
@@ -387,6 +449,10 @@ func Open(dir string) (*Cache, error) {
 	}
 	c := &Cache{dir: dir, db: db, now: time.Now}
 	if err := c.initBackfill(); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("cache: initialise index: %w", err)
+	}
+	if err := c.initSenders(); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("cache: initialise index: %w", err)
 	}

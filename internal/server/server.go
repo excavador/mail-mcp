@@ -115,6 +115,9 @@ func New(accts []accounts.Account, store *cache.Cache, version string, mode Mode
 	addGetThread(s, byName, store)
 	addSearchStats(s, store)
 	addSenderStats(s, byName, store)
+	addSenders(s, byName, store)
+	addListTags(s, byName, store)
+	addListSavedQueries(s, byName, store)
 	addCacheStatus(s, store)
 	if o.hist != nil {
 		addListHistory(s, byName, o.hist)
@@ -178,6 +181,9 @@ func addCacheStatus(s *mcp.Server, store *cache.Cache) {
 		}
 		if tb, err := store.ThreadsBackfillStatus(ctx); err == nil {
 			out["threads_backfill"] = tb
+		}
+		if sj, err := store.SendersStatus(ctx); err == nil {
+			out["senders_job"] = sj
 		}
 		return nil, out, nil
 	})

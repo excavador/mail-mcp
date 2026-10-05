@@ -201,4 +201,17 @@ func (c *Cache) RunBackfills(ctx context.Context, log *slog.Logger) {
 			log.Error("thread backfill failed", "error", err.Error())
 		}
 	}()
+	if ctx.Err() != nil {
+		return
+	}
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Error("senders job panicked", "panic", fmt.Sprint(r))
+			}
+		}()
+		if err := c.RunSenders(ctx, log); err != nil && ctx.Err() == nil {
+			log.Error("senders job failed", "error", err.Error())
+		}
+	}()
 }

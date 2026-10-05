@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -119,6 +120,7 @@ type SearchQuery struct {
 	From      string
 	Since     time.Time // inclusive
 	Until     time.Time // exclusive
+	Tag       string    // only messages carrying this tag (SearchV2 and ResolveSearch)
 	Limit     int
 }
 
@@ -727,7 +729,26 @@ GROUP BY b.addr, b.raw, b.subject`, args...)
 		}
 		return out[i].Address < out[j].Address
 	})
+	c.fillSenderNames(ctx, account, out)
 	return out, nil
+}
+
+// fillSenderNames gives a sender with no display name inside the window the
+// name the senders table holds for it (best effort: a failure leaves it blank).
+func (c *Cache) fillSenderNames(ctx context.Context, account string, out []Sender) {
+	for i := range out {
+		if out[i].Name != "" {
+			continue
+		}
+		var names string
+		if c.db.QueryRowContext(ctx, `SELECT display_names_json FROM senders WHERE account = ? AND addr = ?`, account, out[i].Address).Scan(&names) != nil {
+			continue
+		}
+		var ns []string
+		if json.Unmarshal([]byte(names), &ns) == nil && len(ns) > 0 {
+			out[i].Name = ns[0]
+		}
+	}
 }
 
 // topKeys returns the n keys with the highest counts, ties broken by key.

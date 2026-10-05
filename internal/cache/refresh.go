@@ -160,6 +160,14 @@ func (c *Cache) Refresh(ctx context.Context, a accounts.Account, client *imapcli
 	// Remember each folder's special-use attributes (\All for Gmail's All
 	// Mail) so server search can skip LIST. Best effort, and for rows that
 	// exist; a folder first seen now gets its attributes on the next refresh.
+	// Registered before the attribute save below, so it runs after it: the
+	// owner's replies in the Sent folder are credited once the folder's
+	// \Sent attribute is known.
+	defer func() {
+		if err := c.creditSentReplies(ctx, a.Name); err != nil && ctx.Err() == nil {
+			slog.Warn("cache: crediting replies failed", "account", a.Name, "err", err)
+		}
+	}()
 	defer func() { c.saveFolderAttrs(a.Name, folders) }()
 
 	now := c.now()
@@ -550,11 +558,16 @@ func (c *Cache) fetchBodies(ctx context.Context, a accounts.Account, client *ima
 		}
 		defer func() { _ = tx.Rollback() }()
 		ids := make([]string, 0, len(items))
+		sb := c.newSenderBatch()
 		for i := range items {
 			it := &items[i]
 			ids = append(ids, it.info.stableID)
-			if err := insertMessageTx(ctx, tx, a.Name, it.info, it.sum, it.p); err != nil {
+			rid, inserted, err := insertMessageRowTx(ctx, tx, a.Name, it.info, it.sum, it.p)
+			if err != nil {
 				return err
+			}
+			if inserted {
+				sb.observe(a.Name, rid, it.info, it.p)
 			}
 			stored++
 			for _, u := range pending[it.info.stableID] {
@@ -563,6 +576,11 @@ func (c *Cache) fetchBodies(ctx context.Context, a accounts.Account, client *ima
 				}
 				rows++
 			}
+		}
+		// Senders: counted in the same short write as the messages (only for
+		// messages newer than the senders job's snapshot; the job counts the rest).
+		if err := sb.flushTx(ctx, tx); err != nil {
+			return err
 		}
 		items, held = nil, 0
 		if err := tx.Commit(); err != nil {
@@ -714,6 +732,13 @@ func (c *Cache) hasMessage(ctx context.Context, account, stableID string) (bool,
 // insertMessageTx adds, inside tx, the index and FTS rows for a message whose
 // blob is already on disk. INSERT OR IGNORE: an existing entry is never rewritten.
 func insertMessageTx(ctx context.Context, tx *sql.Tx, account string, info headerInfo, blobSum string, p parsed) error {
+	_, _, err := insertMessageRowTx(ctx, tx, account, info, blobSum, p)
+	return err
+}
+
+// insertMessageRowTx is insertMessageTx reporting whether the message was new
+// and its messages rowid.
+func insertMessageRowTx(ctx context.Context, tx *sql.Tx, account string, info headerInfo, blobSum string, p parsed) (rid int64, inserted bool, err error) {
 	var dateUnix int64
 	if !p.Date.IsZero() {
 		dateUnix = p.Date.Unix()
@@ -721,31 +746,32 @@ func insertMessageTx(ctx context.Context, tx *sql.Tx, account string, info heade
 	res, err := tx.ExecContext(ctx, `
 INSERT OR IGNORE INTO messages
 	(account, stable_id, blob_sha256, from_addr, to_addr, cc_addr, subject, date_unix, list_id, gh_reason, size, internal_date, gm_thread_id,
-	 message_id, in_reply_to, references_json)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+	 message_id, in_reply_to, references_json, list_unsub)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		account, info.stableID, blobSum, p.From, p.To, p.Cc, p.Subject, dateUnix, p.ListID, p.GitHubReason, info.size, info.internal.Unix(), info.gmThreadID,
-		p.Thr.MessageID, p.Thr.InReplyTo, p.Thr.refsJSON())
+		p.Thr.MessageID, p.Thr.InReplyTo, p.Thr.refsJSON(), flagInt(p.ListUnsub))
 	if err != nil {
-		return fmt.Errorf("index message: %w", err)
+		return 0, false, fmt.Errorf("index message: %w", err)
 	}
 	if n, _ := res.RowsAffected(); n == 1 {
 		rid, err := res.LastInsertId()
 		if err != nil {
-			return fmt.Errorf("index message: %w", err)
+			return 0, false, fmt.Errorf("index message: %w", err)
 		}
 		if _, err := tx.ExecContext(ctx,
 			`INSERT INTO message_fts (subject, from_addr, to_addr, cc_addr, body, account, stable_id) VALUES (?, ?, ?, ?, ?, ?, ?)`,
 			p.Subject, p.From, p.To, p.Cc, p.Body, account, info.stableID); err != nil {
-			return fmt.Errorf("index text: %w", err)
+			return 0, false, fmt.Errorf("index text: %w", err)
 		}
 		if err := indexText2Tx(ctx, tx, rid, account, info.stableID, p); err != nil {
-			return err
+			return 0, false, err
 		}
 		if err := addRefsTx(ctx, tx, account, info.stableID, p.Subject, p.Thr); err != nil {
-			return err
+			return 0, false, err
 		}
+		return rid, true, nil
 	}
-	return nil
+	return 0, false, nil
 }
 
 func (c *Cache) recordRefresh(account string, st Stats, ok bool) {
