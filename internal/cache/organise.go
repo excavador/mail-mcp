@@ -185,6 +185,7 @@ ORDER BY `+dateCol+` DESC, m.stable_id`, args...)
 // an organise it is how membership comes to reflect the move. Blobs and index
 // rows are untouched except for messages new to the cache.
 func (c *Cache) RefreshFolders(ctx context.Context, client *imapclient.Client, a accounts.Account, folders []string) (Stats, error) {
+	defer c.foreground()()
 	var st Stats
 	var errs []error
 	for _, f := range folders {

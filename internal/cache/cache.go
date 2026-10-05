@@ -46,6 +46,10 @@ type Cache struct {
 
 	fts2Ready atomic.Bool // the message_fts2 backfill is complete
 
+	fts2Job, threadsJob jobState     // in-process state of the backfill jobs
+	fgWriters           atomic.Int64 // refreshes and applies in progress; backfills give way
+	ws                  writeStats
+
 	folderQueries atomic.Int64 // membership lookups for folders of messages
 
 	searches searchTracker // recent search results, for the search log
