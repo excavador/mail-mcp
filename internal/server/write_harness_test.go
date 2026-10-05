@@ -163,6 +163,7 @@ type wenv struct {
 	hookMu  sync.Mutex
 	hook    func([]byte) error
 	attrs   map[string]string
+	mrtrOff bool // clients built next do not retry input-required results
 	accts   []accounts.Account
 	org     *organise.Organiser
 	hist    *history.Store
@@ -435,6 +436,12 @@ func (e *wenv) connectP(mode Mode, elicit func(context.Context, *mcp.ElicitReque
 	if elicit != nil {
 		co = &mcp.ClientOptions{ElicitationHandler: elicit}
 	}
+	if e.mrtrOff {
+		if co == nil {
+			co = &mcp.ClientOptions{}
+		}
+		co.MultiRoundTrip = &mcp.MultiRoundTripOptions{Disabled: true}
+	}
 	cs, err := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "0"}, co).Connect(ctx, ct, nil)
 	if err != nil {
 		e.t.Fatal(err)
@@ -468,9 +475,11 @@ func killOnNth(re *regexp.Regexp, n int) func([]byte) error {
 	return func(p []byte) error {
 		mu.Lock()
 		defer mu.Unlock()
-		seen += countRE(re, p)
-		if seen >= n {
-			return io.ErrClosedPipe
+		c := countRE(re, p)
+		before := seen
+		seen += c
+		if before < n && seen >= n {
+			return io.ErrClosedPipe // only the command that crosses n; later connections are fine
 		}
 		return nil
 	}
@@ -531,11 +540,13 @@ type prevT struct {
 }
 
 type applyT struct {
-	Matched    int    `json:"matched"`
-	Done       int    `json:"done"`
-	Skipped    int    `json:"skipped"`
-	ApprovedBy string `json:"approved_by"`
-	HistoryID  string `json:"history_id"`
+	CopiedBack   int    `json:"copied_back"`
+	Matched      int    `json:"matched"`
+	Done         int    `json:"done"`
+	Skipped      int    `json:"skipped"`
+	NotPreviewed int    `json:"not_previewed"`
+	ApprovedBy   string `json:"approved_by"`
+	HistoryID    string `json:"history_id"`
 }
 
 type histT struct {
@@ -548,6 +559,7 @@ type histT struct {
 		TouchedCount    int    `json:"touched_count"`
 		AlreadyInTarget int    `json:"already_in_target"`
 		CopiedBack      int    `json:"copied_back"`
+		NotPreviewed    int    `json:"not_previewed"`
 		Skipped         int    `json:"skipped"`
 		Error           string `json:"error"`
 		Undoes          string `json:"undoes"`

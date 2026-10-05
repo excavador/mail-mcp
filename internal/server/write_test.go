@@ -224,8 +224,11 @@ func TestApplyDoesNotTouchMailThatArrivedAfterThePreview(t *testing.T) {
 	e.add("INBOX", "a4", alice, "a4 late arrival")
 	e.refresh("acct")
 	a := apply(t, cs, p)
-	if a.Done != 2 || a.Matched != 2 {
-		t.Errorf("apply = %+v, want done 2 of 2", a)
+	if a.Done != 2 || a.Matched != 2 || a.NotPreviewed != 1 {
+		t.Errorf("apply = %+v, want done 2 of 2, not_previewed 1", a)
+	}
+	if rs := e.hist.List("acct", 1); len(rs) != 1 || rs[0].NotPreviewed != 1 {
+		t.Errorf("history NotPreviewed = %+v", rs)
 	}
 	if got := e.members("acct", "INBOX"); !has(got, "a4 late arrival") {
 		t.Errorf("late arrival left INBOX: %v", got)
@@ -715,6 +718,10 @@ func TestPartialFailureWritesHistoryWithTheCompletedChunk(t *testing.T) {
 	if h.Count != 1 || h.Records[0].TouchedCount != 500 || h.Records[0].Error == "" || h.Records[0].Kind != "apply" {
 		t.Fatalf("history = %+v", h)
 	}
+	// The cache was refreshed over a fresh connection: it matches the server.
+	if n, m := len(e.members("acct", "Work")), len(e.members("acct", "INBOX")); n != 500 || m != 100 {
+		t.Errorf("cache Work %d INBOX %d after the failure, want 500 and 100", n, m)
+	}
 	if h.Records[0].Preview.ApprovedBy != history.ApprovedElicitation {
 		t.Errorf("approved_by = %q", h.Records[0].Preview.ApprovedBy)
 	}
@@ -1007,19 +1014,223 @@ func TestApplyOverFiftyWithElicitationAfterAccept(t *testing.T) {
 	}
 }
 
-func TestElicitationFailsClosedOnTheNewestProtocol(t *testing.T) {
-	// From protocol 2026-07-28 a server cannot ask mid-request. The apply must
-	// then be refused, never fall back to approving itself.
+func answer(action string, confirm bool) func(context.Context, *mcp.ElicitRequest) (*mcp.ElicitResult, error) {
+	return func(context.Context, *mcp.ElicitRequest) (*mcp.ElicitResult, error) {
+		r := &mcp.ElicitResult{Action: action}
+		if action == "accept" {
+			r.Content = map[string]any{"confirm": confirm}
+		}
+		return r, nil
+	}
+}
+
+func TestElicitationOnTheNewestProtocolAppliesThroughMRTR(t *testing.T) {
 	e := basic(t, true)
+	asked := 0
+	h := func(ctx context.Context, r *mcp.ElicitRequest) (*mcp.ElicitResult, error) {
+		asked++
+		return acceptConfirm(t)(ctx, r)
+	}
+	cs := e.connectP(Admin, h, false, WithHistory(e.hist), WithOrganiser(e.org))
+	p := preview(t, cs, "acct", "INBOX", fromCrit("alice@example.com"), "Work", "move")
+	a := apply(t, cs, p)
+	if a.ApprovedBy != "elicitation" || a.Done != 2 || asked != 1 {
+		t.Fatalf("apply = %+v asked %d", a, asked)
+	}
+	if h, _ := listHistory(t, cs, ""); h.Records[0].Preview.ApprovedBy != "elicitation" {
+		t.Errorf("recorded approved_by = %q", h.Records[0].Preview.ApprovedBy)
+	}
+}
+
+func TestNewestProtocolDeclineCancelAndUnconfirmedAreRefused(t *testing.T) {
+	for name, h := range map[string]func(context.Context, *mcp.ElicitRequest) (*mcp.ElicitResult, error){
+		"decline": answer("decline", false), "cancel": answer("cancel", false), "confirm false": answer("accept", false),
+	} {
+		t.Run(name, func(t *testing.T) {
+			e := basic(t, true)
+			cs := e.connectP(Admin, h, false, WithHistory(e.hist), WithOrganiser(e.org))
+			p := preview(t, cs, "acct", "INBOX", fromCrit("alice@example.com"), "Work", "move")
+			res := call(t, cs, "apply_intent", applyArgs(p))
+			if !res.IsError {
+				t.Fatalf("apply went ahead: %s", text(res))
+			}
+			e.noWrites(t)
+			if n := e.serverCount("INBOX"); n != 3 {
+				t.Errorf("INBOX = %d", n)
+			}
+			if hh, _ := listHistory(t, cs, ""); hh.Count != 0 {
+				t.Errorf("history has %d records", hh.Count)
+			}
+			// The token survives a refusal.
+			cs2 := e.connectP(Admin, acceptConfirm(t), false, WithHistory(e.hist), WithOrganiser(e.org))
+			if a := apply(t, cs2, p); a.Done != 2 {
+				t.Errorf("token burned by a refusal: %+v", a)
+			}
+		})
+	}
+}
+
+// ask makes the first apply_intent call on a client without MRTR retry and
+// returns the single input request's key and the request state.
+func ask(t *testing.T, cs *mcp.ClientSession, p prevT) (key, state string) {
+	t.Helper()
+	res, err := cs.CallTool(context.Background(), &mcp.CallToolParams{Name: "apply_intent", Arguments: applyArgs(p)})
+	if err != nil || res.IsError || !res.NeedsInput() {
+		t.Fatalf("first call: err %v %+v", err, res)
+	}
+	if len(res.InputRequests) != 1 {
+		t.Fatalf("input requests = %+v", res.InputRequests)
+	}
+	for k, v := range res.InputRequests {
+		if _, ok := v.(*mcp.ElicitParams); !ok {
+			t.Fatalf("input request %s is %T", k, v)
+		}
+		key = k
+	}
+	if !strings.HasPrefix(key, "approve-") || res.RequestState == "" {
+		t.Fatalf("key %q state %q", key, res.RequestState)
+	}
+	return key, res.RequestState
+}
+
+func retry(t *testing.T, cs *mcp.ClientSession, p prevT, key, state string, r *mcp.ElicitResult) *mcp.CallToolResult {
+	t.Helper()
+	res, err := cs.CallTool(context.Background(), &mcp.CallToolParams{Name: "apply_intent", Arguments: applyArgs(p),
+		RequestState: state, InputResponses: mcp.InputResponseMap{key: r}})
+	if err != nil {
+		return &mcp.CallToolResult{IsError: true}
+	}
+	return res
+}
+
+var yes = &mcp.ElicitResult{Action: "accept", Content: map[string]any{"confirm": true}}
+
+func TestNewestProtocolWithoutMRTRGetsNeedsInputAndNothingChanges(t *testing.T) {
+	e := basic(t, true)
+	e.mrtrOff = true
 	cs := e.connectP(Admin, acceptConfirm(t), false, WithHistory(e.hist), WithOrganiser(e.org))
 	p := preview(t, cs, "acct", "INBOX", fromCrit("alice@example.com"), "Work", "move")
-	res := call(t, cs, "apply_intent", applyArgs(p))
-	if !res.IsError {
-		t.Fatalf("apply went ahead: %s", text(res))
+	key, state := ask(t, cs, p)
+	e.noWrites(t)
+	if n := e.serverCount("INBOX"); n != 3 {
+		t.Errorf("INBOX = %d", n)
+	}
+	if hh, _ := listHistory(t, cs, ""); hh.Count != 0 {
+		t.Errorf("history has %d records", hh.Count)
+	}
+	res := retry(t, cs, p, key, state, yes)
+	if res.IsError || res.NeedsInput() {
+		t.Fatalf("manual retry: %+v", res)
+	}
+	if n := e.serverCount("Work"); n != 2 {
+		t.Errorf("Work = %d", n)
+	}
+	// A retry with a decline or without confirm changes nothing.
+	p2 := preview(t, cs, "acct", "INBOX", fromCrit("bob@example.com"), "Work2", "move")
+	k2, s2 := ask(t, cs, p2)
+	for _, r := range []*mcp.ElicitResult{{Action: "decline"}, {Action: "accept", Content: map[string]any{"confirm": false}}, {Action: "accept"}} {
+		if res := retry(t, cs, p2, k2, s2, r); !res.IsError && !res.NeedsInput() {
+			t.Errorf("response %+v applied", r)
+		}
+	}
+	if n := e.serverCount("Work2"); n != 0 {
+		t.Errorf("Work2 = %d", n)
+	}
+}
+
+func TestInputResponsesGivenForOneTokenCannotApplyAnother(t *testing.T) {
+	e := basic(t, true)
+	e.mrtrOff = true
+	cs := e.connectP(Admin, acceptConfirm(t), false, WithHistory(e.hist), WithOrganiser(e.org))
+	pa := preview(t, cs, "acct", "INBOX", fromCrit("alice@example.com"), "Work", "move")
+	pb := preview(t, cs, "acct", "INBOX", fromCrit("bob@example.com"), "Work2", "move")
+	ka, sa := ask(t, cs, pa)
+	kb, sb := ask(t, cs, pb)
+	if ka == kb || sa == sb {
+		t.Fatal("two previews share a question key or state")
+	}
+	// A's answer replayed on B's call, with every combination of key and state.
+	for _, c := range [][2]string{{ka, sa}, {ka, sb}, {kb, sa}, {"approve", sb}, {"approve", ""}} {
+		res := retry(t, cs, pb, c[0], c[1], yes)
+		if !res.IsError && !res.NeedsInput() {
+			t.Errorf("BUG: key %q state %q applied B: %s", c[0], c[1], text(res))
+		}
+	}
+	if n := e.serverCount("Work2"); n != 0 {
+		t.Errorf("Work2 = %d, B was applied by a replayed answer", n)
+	}
+	// B still applies once it is asked afresh and the owner answers that
+	// question (a question is single-use, so the earlier pair may be spent).
+	kb, sb = ask(t, cs, pb)
+	if res := retry(t, cs, pb, kb, sb, yes); res.IsError || res.NeedsInput() {
+		t.Errorf("B with its own answer: %+v", res)
+	}
+}
+
+func TestForgedOrMissingRequestStateAsksAgainAndAppliesNothing(t *testing.T) {
+	e := basic(t, true)
+	e.mrtrOff = true
+	cs := e.connectP(Admin, acceptConfirm(t), false, WithHistory(e.hist), WithOrganiser(e.org))
+	p := preview(t, cs, "acct", "INBOX", fromCrit("alice@example.com"), "Work", "move")
+	key, state := ask(t, cs, p)
+	flipped := []byte(state)
+	if flipped[len(flipped)-1] == 'A' {
+		flipped[len(flipped)-1] = 'B'
+	} else {
+		flipped[len(flipped)-1] = 'A'
+	}
+	for name, st := range map[string]string{"missing": "", "forged": "forged", "one char changed": string(flipped), "truncated": state[:len(state)/2]} {
+		res := retry(t, cs, p, key, st, yes)
+		if !res.NeedsInput() {
+			t.Errorf("%s state: NeedsInput %v isError %v: %s", name, res.NeedsInput(), res.IsError, text(res))
+		}
 	}
 	e.noWrites(t)
 	if n := e.serverCount("INBOX"); n != 3 {
 		t.Errorf("INBOX = %d", n)
+	}
+	key, state = ask(t, cs, p)
+	if res := retry(t, cs, p, key, state, yes); res.IsError || res.NeedsInput() {
+		t.Errorf("fresh pair after forgeries: %+v", res)
+	}
+}
+
+func TestReplayingAnAnswerAndStateAfterApplyDoesNotApplyTwice(t *testing.T) {
+	e := basic(t, true)
+	e.mrtrOff = true
+	cs := e.connectP(Admin, acceptConfirm(t), false, WithHistory(e.hist), WithOrganiser(e.org))
+	p := preview(t, cs, "acct", "INBOX", fromCrit("alice@example.com"), "Work", "move")
+	key, state := ask(t, cs, p)
+	if res := retry(t, cs, p, key, state, yes); res.IsError || res.NeedsInput() {
+		t.Fatalf("apply: %+v", res)
+	}
+	moves := e.log.count("MOVE")
+	for range 2 {
+		if res := retry(t, cs, p, key, state, yes); !res.IsError {
+			t.Errorf("replay applied again: %s", text(res))
+		}
+	}
+	if e.log.count("MOVE") != moves {
+		t.Errorf("MOVE sent again: %v", e.log.verbs())
+	}
+	if h, _ := listHistory(t, cs, ""); h.Count != 1 {
+		t.Errorf("history has %d records", h.Count)
+	}
+}
+
+func TestListHistoryShowsNotPreviewed(t *testing.T) {
+	e := basic(t, true)
+	cs := e.admin()
+	p := preview(t, cs, "acct", "INBOX", fromCrit("alice@example.com"), "Work", "move")
+	e.add("INBOX", "a5", alice, "a5 late")
+	e.refresh("acct")
+	e.log.reset()
+	if a := apply(t, cs, p); a.NotPreviewed != 1 {
+		t.Fatalf("apply = %+v", a)
+	}
+	h, raw := listHistory(t, cs, "acct")
+	if h.Records[0].NotPreviewed != 1 || !strings.Contains(raw, `"not_previewed":1`) {
+		t.Errorf("list_history = %s", raw)
 	}
 }
 
@@ -1167,7 +1378,11 @@ func TestUndoCopiesAlreadyInTargetBackAndMovesTheRestBack(t *testing.T) {
 	e.add("INBOX", "x2", alice, "x2")
 	// x2 already carries the Work label: the same message (same id) is in Work.
 	e.add("Work", "x2", alice, "x2")
+	e.add("Work", "x2", alice, "x2") // a second UID for the same message
 	e.refresh("acct")
+	if n := len(e.uids("acct", "Work")); n != 2 {
+		t.Fatalf("Work holds %d UIDs of x2, want 2", n)
+	}
 	e.log.reset()
 	cs := e.admin()
 
@@ -1187,8 +1402,12 @@ func TestUndoCopiesAlreadyInTargetBackAndMovesTheRestBack(t *testing.T) {
 	}
 	e.log.reset()
 	ua := apply(t, cs, u)
-	if ua.Done < 1 {
-		t.Errorf("undo apply = %+v", ua)
+	// done counts messages moved (1); the copied-back one is in the record.
+	if ua.CopiedBack != 1 {
+		t.Errorf("undo output copied_back = %d, want 1", ua.CopiedBack)
+	}
+	if ua.Done != 1 || ua.Matched != 2 {
+		t.Errorf("undo apply = %+v, want done 1 (distinct moved) of matched 2", ua)
 	}
 	// x1 is moved back; x2 regains INBOX and keeps Work.
 	// (imapmemserver, unlike Gmail, does not de-duplicate a label, so a
@@ -1202,8 +1421,8 @@ func TestUndoCopiesAlreadyInTargetBackAndMovesTheRestBack(t *testing.T) {
 		t.Errorf("verbs = %v, want one MOVE (x1) and one COPY (x2)", e.log.verbs())
 	}
 	h, _ = listHistory(t, cs, "acct")
-	if h.Records[0].Kind != "undo" || h.Records[0].Undoes != a.HistoryID || h.Records[0].CopiedBack < 1 {
-		t.Errorf("undo record = %+v, want undoes %s and copied_back >= 1", h.Records[0], a.HistoryID)
+	if h.Records[0].Kind != "undo" || h.Records[0].Undoes != a.HistoryID || h.Records[0].CopiedBack != 1 {
+		t.Errorf("undo record = %+v, want undoes %s and copied_back 1 (distinct ids, not UIDs)", h.Records[0], a.HistoryID)
 	}
 	// A record is undone once.
 	requireToolError(t, cs, "undo", map[string]any{"history_id": a.HistoryID}, "already undone")
