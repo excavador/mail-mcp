@@ -13,6 +13,7 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"fmt"
+	"log/slog"
 	"strings"
 	"sync"
 	"time"
@@ -267,4 +268,41 @@ FROM search_log WHERE at >= ? AND mode NOT LIKE '%:page'`, since, since).Scan(&s
 		st.Verdict = fmt.Sprintf("keyword search is enough for now: %.0f%% abandoned then reformulated, at or below the 10%% trigger", st.AbandonedP*100)
 	}
 	return st, nil
+}
+
+// searchLogRetention is how long search_log rows are kept. The query text is
+// kept for the whole time: it is the owner's own data, in the owner's own cache.
+const searchLogRetention = 400 * 24 * time.Hour
+
+// PruneSearchLog deletes log rows older than the retention and returns how many.
+func (c *Cache) PruneSearchLog(ctx context.Context) (int64, error) {
+	res, err := c.db.ExecContext(ctx, `DELETE FROM search_log WHERE at < ?`, c.now().Add(-searchLogRetention).Unix())
+	if err != nil {
+		return 0, fmt.Errorf("cache: prune search log: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	return n, nil
+}
+
+// RunSearchLogRetention prunes the search log now and then once a day until ctx ends.
+func (c *Cache) RunSearchLogRetention(ctx context.Context, log *slog.Logger) {
+	t := time.NewTicker(24 * time.Hour)
+	defer t.Stop()
+	for {
+		if n, err := c.PruneSearchLog(ctx); err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			if log != nil {
+				log.Warn("search log prune failed", "error", err.Error())
+			}
+		} else if n > 0 && log != nil {
+			log.Info("search log pruned", "deleted", n)
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+	}
 }

@@ -322,6 +322,17 @@ SELECT tid, account, d, stable_id, rid, att, hitn, COUNT(*) OVER () FROM (
 		_ = rows.Close()
 	}
 
+	if len(pg) == 0 && o.Offset > 0 {
+		// A page past the end has no row to carry COUNT(*) OVER (): count apart.
+		q := `WITH ` + plan.ctes + ` SELECT COUNT(*) FROM match`
+		if o.GroupBy != "message" {
+			q = `WITH ` + plan.ctes + ` SELECT COUNT(*) FROM (SELECT 1 FROM match x LEFT JOIN message_thread mt ON mt.account = x.account AND mt.stable_id = x.stable_id
+GROUP BY x.account, COALESCE(mt.tid, 'u:' || x.stable_id))`
+		}
+		if err := c.db.QueryRowContext(ctx, q, margs...).Scan(&res.Total); err != nil {
+			return res, queryErr(err)
+		}
+	}
 	srefs := make([]snipRef, len(pg))
 	for i, p := range pg {
 		srefs[i] = snipRef{p.rid, p.att}

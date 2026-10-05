@@ -183,6 +183,12 @@ func run(ctx context.Context, cmd *cli.Command) error {
 	if err != nil {
 		return err
 	}
+	// The owner's own addresses, before anything can thread a message.
+	owners := map[string][]string{}
+	for _, a := range accts {
+		owners[a.Name] = []string{a.Username}
+	}
+	store.SetOwners(owners)
 	hist, err := history.Open(cmd.String("history-dir"))
 	if err != nil {
 		_ = store.Close()
@@ -220,9 +226,20 @@ func run(ctx context.Context, cmd *cli.Command) error {
 	}
 	// Thread backfill: fills threading headers and threads for mail cached
 	// before threads existed. Resumable and rate-limited; stops with ctx.
-	wg.Add(1)
+	wg.Add(2)
 	go func() {
 		defer wg.Done()
+		store.RunSearchLogRetention(ctx, log)
+	}()
+	go func() {
+		defer wg.Done()
+		// Last resort: the backfill recovers per batch, but a panic here must
+		// never take the process down.
+		defer func() {
+			if r := recover(); r != nil {
+				log.Error("thread backfill panicked", "panic", fmt.Sprint(r))
+			}
+		}()
 		if err := store.BackfillThreads(ctx, log); err != nil && ctx.Err() == nil {
 			log.Error("thread backfill failed", "error", err.Error())
 		}

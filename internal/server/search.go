@@ -120,7 +120,7 @@ func addSearch(s *mcp.Server, byName map[string]accounts.Account, store *cache.C
 			"With server=true on a Gmail account the query is instead sent verbatim to Gmail as X-GM-RAW over " +
 			"[Gmail]/All Mail (Gmail's own search syntax); results are the matches the cache holds, with the rest " +
 			"counted in uncached_count, and snippets are empty. The cache holds only what the last refresh fetched " +
-			"(see cache_status).",
+			"(see cache_status). search, get_thread and fetch_message write only to a local log of searches, never to the mailbox.",
 		Annotations: readOnly(),
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, in searchIn) (*mcp.CallToolResult, searchOut, error) {
 		out, err := runSearch(ctx, byName, store, in)

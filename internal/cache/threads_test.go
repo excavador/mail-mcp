@@ -3,6 +3,7 @@ package cache
 import (
 	"context"
 	"fmt"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -555,5 +556,262 @@ func TestThreadsAndFts2BackfillJobsCoexist(t *testing.T) {
 	st, err := c.ThreadsBackfillStatus(ctx)
 	if err != nil || !st.Complete || st.Total != 5 || st.Done != 5 {
 		t.Errorf("status = %+v %v", st, err)
+	}
+}
+
+func TestThreadNewSurvivesDummyOnlyTopPair(t *testing.T) {
+	c := thrOpen(t)
+	ctx := context.Background()
+	thrAdd(t, c, "p", "pm:1", "", thrMsg("m1@x", "A <a@x.com>", "x", "one", thr0, "References: <p@x> <d2@x>"), thr0)
+	thrAdd(t, c, "p", "pm:2", "", thrMsg("m2@x", "B <b@x.com>", "x", "two", thr0.Add(time.Hour), "References: <d1@x> <d2@x>"), thr0.Add(time.Hour))
+	c.threadNew(ctx, "p", []string{"pm:1", "pm:2"})
+	if n := thrCount(t, c, `SELECT COUNT(*) FROM message_thread`); n != 2 {
+		t.Errorf("%d threaded, want 2", n)
+	}
+}
+
+func TestStoredIDsAndReferencesAreCapped(t *testing.T) {
+	long := strings.Repeat("x", 300)
+	var refs []string
+	for i := 0; i < 90; i++ {
+		refs = append(refs, fmt.Sprintf("<%s%d@h>", strings.Repeat("r", 240), i))
+	}
+	raw := "Message-ID: <" + long + "@h>\r\nIn-Reply-To: <" + long + "@h>\r\nReferences: <ok@h> " + strings.Join(refs, " ") + "\r\n\r\nbody\r\n"
+	th := parseMessage([]byte(raw)).Thr
+	if th.MessageID != "" || th.InReplyTo != "" {
+		t.Errorf("over-long ids kept: %d %d", len(th.MessageID), len(th.InReplyTo))
+	}
+	if len(th.refsJSON()) > maxRefsJSON {
+		t.Errorf("references_json is %d bytes", len(th.refsJSON()))
+	}
+	if len(th.Refs) < 2 || th.Refs[0] != "ok@h" {
+		t.Errorf("first reference lost: %d refs", len(th.Refs))
+	}
+	for _, r := range th.Refs {
+		if len(r) > maxIDBytes {
+			t.Fatalf("ref of %d bytes kept", len(r))
+		}
+	}
+}
+
+func TestSearchLogRetention(t *testing.T) {
+	c := thrOpen(t)
+	ctx := context.Background()
+	now := time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC)
+	c.now = func() time.Time { return now }
+	if _, err := c.db.Exec(`INSERT INTO search_log (at, query, mode) VALUES (?, 'old', 'thread'), (?, 'new', 'thread')`,
+		now.Add(-401*24*time.Hour).Unix(), now.Add(-399*24*time.Hour).Unix()); err != nil {
+		t.Fatal(err)
+	}
+	n, err := c.PruneSearchLog(ctx)
+	if err != nil || n != 1 {
+		t.Fatalf("pruned %d err %v", n, err)
+	}
+	var q string
+	_ = c.db.QueryRow(`SELECT query FROM search_log`).Scan(&q)
+	if q != "new" {
+		t.Errorf("kept %q, want the query text of the recent row", q)
+	}
+}
+
+func TestThreadOutlineUsesIndexesNotBlobs(t *testing.T) {
+	c := thrOpen(t)
+	ctx := context.Background()
+	thrAdd(t, c, "p", "pm:a", "", thrMsg("a@x", "A <a@x.com>", "s", "hello outline text", thr0), thr0)
+	thrAdd(t, c, "p", "pm:b", "", thrAttMsg("b@x", "B <b@x.com>", "s2", "with a file", "f.bin", thr0), thr0)
+	// Remove the blobs: the outline must still come from the index.
+	for _, id := range []string{"pm:a", "pm:b"} {
+		var sum string
+		_ = c.db.QueryRow(`SELECT blob_sha256 FROM messages WHERE stable_id = ?`, id).Scan(&sum)
+		_ = os.Chmod(c.BlobPath(sum), 0o600)
+		_ = os.Remove(c.BlobPath(sum))
+	}
+	got := c.ThreadOutline(ctx, "p", []string{"pm:a", "pm:b", "pm:none"})
+	if got["pm:a"].Text != "hello outline text" || got["pm:a"].HasAtt {
+		t.Errorf("a = %+v", got["pm:a"])
+	}
+	if got["pm:b"].Text != "with a file" || !got["pm:b"].HasAtt {
+		t.Errorf("b = %+v", got["pm:b"])
+	}
+	if _, ok := got["pm:none"]; ok {
+		t.Error("unknown id present")
+	}
+}
+
+func TestRootSubjectAndDuplicateOwnerFollowInternalDate(t *testing.T) {
+	c := thrOpen(t)
+	ctx := context.Background()
+	// A thread whose top is a message we never got: two messages name it. The
+	// attacker's forges an early Date but arrived last.
+	thrAdd(t, c, "p", "pm:m1", "", thrMsg("m1@x", "Alice <alice@x.com>", "Honest subject", "a", thr0.Add(10*time.Hour), "References: <gone@x>"), thr0.Add(time.Hour))
+	thrAdd(t, c, "p", "pm:m2", "", thrMsg("m2@x", "Mallory <m@evil.test>", "Forged subject", "b", thr0.Add(-100*24*time.Hour), "References: <gone@x>"), thr0.Add(2*time.Hour))
+	c.threadNew(ctx, "p", []string{"pm:m1", "pm:m2"})
+	tid := thrTid(t, c, "p", "pm:m1")
+	if thrTid(t, c, "p", "pm:m2") != tid {
+		t.Fatal("both name the same missing parent: one thread")
+	}
+	var root, subj string
+	var first int64
+	_ = c.db.QueryRow(`SELECT root_stable_id, subject_norm, first_at FROM threads WHERE tid = ?`, tid).Scan(&root, &subj, &first)
+	if root != "pm:m1" || subj != "honest subject" || first != thr0.Add(time.Hour).Unix() {
+		t.Errorf("root %s subject %q first_at %d: must follow arrival, not the forged Date", root, subj, first)
+	}
+	// Duplicate Message-ID: the earliest arrival owns the id, though its Date is later.
+	thrAdd(t, c, "p", "pm:real", "", thrMsg("dup@x", "Alice <alice@x.com>", "real one", "r", thr0.Add(50*time.Hour)), thr0.Add(3*time.Hour))
+	thrAdd(t, c, "p", "pm:fake", "", thrMsg("dup@x", "Mallory <m@evil.test>", "fake one", "f", thr0.Add(-90*24*time.Hour)), thr0.Add(9*time.Hour))
+	thrAdd(t, c, "p", "pm:rep", "", thrMsg("rep@x", "Alice <alice@x.com>", "Re: real one", "x", thr0.Add(60*time.Hour), "References: <dup@x>"), thr0.Add(10*time.Hour))
+	c.threadNew(ctx, "p", []string{"pm:real", "pm:fake", "pm:rep"})
+	var parent string
+	_ = c.db.QueryRow(`SELECT parent_stable_id FROM message_thread WHERE stable_id = 'pm:rep'`).Scan(&parent)
+	if parent != "pm:real" {
+		t.Errorf("reply's parent = %q, want pm:real (first arrival owns the id)", parent)
+	}
+}
+
+func TestOutsiderIsStoredAndOwnerExempt(t *testing.T) {
+	c := thrOpen(t)
+	c.SetOwners(map[string][]string{"p": {"Me@Home.test"}})
+	ctx := context.Background()
+	thrAdd(t, c, "p", "pm:a", "", thrMsg("a@x", "Alice <alice@x.com>", "s", "a", thr0), thr0)
+	thrAdd(t, c, "p", "pm:me", "", thrMsg("me@x", "Me <me@home.test>", "Re: s", "b", thr0.Add(time.Hour), "References: <a@x>"), thr0.Add(time.Hour))
+	thrAdd(t, c, "p", "pm:evil", "", thrMsg("e@x", "Eve <eve@evil.test>", "Re: s", "c", thr0.Add(2*time.Hour), "References: <a@x>"), thr0.Add(2*time.Hour))
+	c.threadNew(ctx, "p", []string{"pm:a", "pm:me", "pm:evil"})
+	flag := func(id string) int {
+		return thrCount(t, c, `SELECT outsider FROM message_thread WHERE stable_id = ?`, id)
+	}
+	if flag("pm:a") != 0 || flag("pm:me") != 0 || flag("pm:evil") != 1 {
+		t.Errorf("outsider flags a=%d me=%d evil=%d, want 0 0 1", flag("pm:a"), flag("pm:me"), flag("pm:evil"))
+	}
+	ms, _, err := c.ThreadMessages(ctx, "p", thrTid(t, c, "p", "pm:a"))
+	if err != nil || len(ms) != 3 || !ms[2].Outsider || ms[1].Outsider {
+		t.Errorf("ThreadMessages outsiders: %+v %v", ms, err)
+	}
+}
+
+func TestCappedComponentIsNotRegatheredPerSeed(t *testing.T) {
+	old := maxComponent
+	maxComponent = 10
+	defer func() { maxComponent = old }()
+	c := thrOpen(t)
+	ctx := context.Background()
+	const n = 60
+	var ids []string
+	for i := 0; i < n; i++ { // one long chain, far over the cap
+		hdr := []string{}
+		if i > 0 {
+			hdr = append(hdr, fmt.Sprintf("References: <c%d@x>", i-1))
+		}
+		id := fmt.Sprintf("pm:%d", i)
+		thrAdd(t, c, "p", id, "", thrMsg(fmt.Sprintf("c%d@x", i), "A <a@x.com>", "chain", "b", thr0.Add(time.Duration(i)*time.Minute), hdr...), thr0.Add(time.Duration(i)*time.Minute))
+		ids = append(ids, id)
+	}
+	gathers := 0
+	gatherHook = func() { gathers++ }
+	defer func() { gatherHook = nil }()
+	tx, _ := c.db.Begin()
+	defer func() { _ = tx.Rollback() }()
+	if err := threadTx(ctx, tx, "p", ids); err != nil {
+		t.Fatal(err)
+	}
+	if gathers > 2 {
+		t.Errorf("%d gathers for %d seeds over a capped component: seeds beyond the cap must not each gather", gathers, n)
+	}
+	var threaded int
+	_ = tx.QueryRow(`SELECT COUNT(*) FROM message_thread`).Scan(&threaded)
+	if threaded != n {
+		t.Errorf("%d threaded, want %d", threaded, n)
+	}
+	// Run again on a settled component: reads only, no writes.
+	var before, after int
+	_ = tx.QueryRow(`SELECT total_changes()`).Scan(&before)
+	if err := threadTx(ctx, tx, "p", ids[:5]); err != nil {
+		t.Fatal(err)
+	}
+	_ = tx.QueryRow(`SELECT total_changes()`).Scan(&after)
+	// The savepoint bookkeeping is not a change; rows written must be zero.
+	if after != before {
+		t.Errorf("re-threading an unchanged component wrote %d rows", after-before)
+	}
+}
+
+func TestBackfillSurvivesPoisonComponentAndBatch(t *testing.T) {
+	backfillPause = 0
+	c := thrOpen(t)
+	ctx := context.Background()
+	thrAdd(t, c, "p", "pm:good", "", thrMsg("g@x", "A <a@x.com>", "good", "b", thr0), thr0)
+	thrAdd(t, c, "p", "pm:bad", "", thrMsg("bad@x", "A <a@x.com>", "bad", "b", thr0), thr0)
+	thrAdd(t, c, "p", "pm:bad2", "", thrMsg("bad2@x", "A <a@x.com>", "Re: bad", "b", thr0.Add(time.Hour), "References: <bad@x>"), thr0)
+	componentHook = func(comp []threadRow) {
+		for _, r := range comp {
+			if r.stableID == "pm:bad" {
+				panic("poison")
+			}
+		}
+	}
+	defer func() { componentHook = nil }()
+	if err := c.BackfillThreads(ctx, nil); err != nil {
+		t.Fatalf("backfill died on a poison component: %v", err)
+	}
+	if thrCount(t, c, `SELECT COUNT(*) FROM message_thread`) != 3 {
+		t.Error("every message, poisoned or not, must end up threaded")
+	}
+	if thrTid(t, c, "p", "pm:bad") != soloTID("pm:bad") || thrTid(t, c, "p", "pm:bad2") != soloTID("pm:bad2") {
+		t.Error("poisoned component must be threaded alone")
+	}
+	if thrTid(t, c, "p", "pm:good") == soloTID("pm:good") {
+		t.Error("the good component must be threaded normally")
+	}
+	if _, done, _ := c.backfillState(ctx, threadBackfillName); !done {
+		t.Error("backfill must finish")
+	}
+
+	// A panic outside any component: the batch is stepped over, not retried.
+	c2 := thrOpen(t)
+	for i := 0; i < 3; i++ {
+		thrAdd(t, c2, "p", fmt.Sprintf("pm:%d", i), "", thrMsg(fmt.Sprintf("m%d@x", i), "A <a@x.com>", "s", "b", thr0), thr0)
+	}
+	calls := 0
+	batchHook = func() {
+		calls++
+		if calls == 1 {
+			panic("poison batch")
+		}
+	}
+	defer func() { batchHook = nil }()
+	if err := c2.BackfillThreads(ctx, nil); err != nil {
+		t.Fatalf("backfill died on a poison batch: %v", err)
+	}
+	if thrCount(t, c2, `SELECT COUNT(*) FROM message_thread`) != 3 {
+		t.Error("stepped-over rows must count as threaded")
+	}
+}
+
+func TestSearchV2TotalOnPageBeyondTheEnd(t *testing.T) {
+	c := thrOpen(t)
+	ctx := context.Background()
+	for i := 0; i < 3; i++ {
+		thrAdd(t, c, "p", fmt.Sprintf("pm:%d", i), "", thrMsg(fmt.Sprintf("m%d@x", i), "A <a@x.com>", fmt.Sprintf("s%d", i), "needle", thr0.Add(time.Duration(i)*time.Hour)), thr0)
+	}
+	c.threadNew(ctx, "p", []string{"pm:0", "pm:1", "pm:2"})
+	for _, g := range []string{"thread", "message"} {
+		r, err := c.SearchV2(ctx, SearchOptions{SearchQuery: SearchQuery{Text: "needle", Limit: 2}, GroupBy: g, Offset: 10})
+		if err != nil || r.Total != 3 || len(r.Threads)+len(r.Messages) != 0 {
+			t.Errorf("%s: total %d hits %d err %v, want total 3 and no hits", g, r.Total, len(r.Threads)+len(r.Messages), err)
+		}
+	}
+}
+
+func TestOutsiderToCcRecipientIsNotOutsiderInDatabase(t *testing.T) {
+	c := thrOpen(t)
+	ctx := context.Background()
+	thrAdd(t, c, "p", "pm:a", "", "From: Alice <alice@x.com>\r\nTo: Bob <bob@x.com>\r\nCc: carol@x.com, \"D, E\" <dee@x.com>\r\nSubject: s\r\nDate: "+thr0.Format(time.RFC1123Z)+"\r\nMessage-ID: <a@x>\r\n\r\nhi\r\n", thr0)
+	thrAdd(t, c, "p", "pm:b", "", thrMsg("b@x", "Bob <bob@x.com>", "Re: s", "b", thr0.Add(time.Hour), "References: <a@x>"), thr0.Add(time.Hour))
+	thrAdd(t, c, "p", "pm:c", "", thrMsg("c@x", "Dee <dee@x.com>", "Re: s", "c", thr0.Add(2*time.Hour), "References: <a@x>"), thr0.Add(2*time.Hour))
+	thrAdd(t, c, "p", "pm:e", "", thrMsg("e@x", "Eve <eve@evil.test>", "Re: s", "e", thr0.Add(3*time.Hour), "References: <a@x>"), thr0.Add(3*time.Hour))
+	c.threadNew(ctx, "p", []string{"pm:a", "pm:b", "pm:c", "pm:e"})
+	for id, want := range map[string]int{"pm:a": 0, "pm:b": 0, "pm:c": 0, "pm:e": 1} {
+		if got := thrCount(t, c, `SELECT outsider FROM message_thread WHERE stable_id = ?`, id); got != want {
+			t.Errorf("%s outsider = %d, want %d", id, got, want)
+		}
 	}
 }

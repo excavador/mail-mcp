@@ -29,6 +29,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -48,6 +49,9 @@ type Cache struct {
 	folderQueries atomic.Int64 // membership lookups for folders of messages
 
 	searches searchTracker // recent search results, for the search log
+
+	ownerMu sync.RWMutex
+	owners  map[string][]string // account -> the owner's own addresses
 
 	// now is the clock; tests replace it to exercise the full-scan interval.
 	now func() time.Time
@@ -76,6 +80,9 @@ var addedColumns = []columnSet{
 		{"max_rowid", "INTEGER NOT NULL DEFAULT 0"},
 		{"total", "INTEGER NOT NULL DEFAULT 0"},
 		{"processed", "INTEGER NOT NULL DEFAULT 0"},
+	}},
+	{"message_thread", []struct{ name, def string }{
+		{"outsider", "INTEGER NOT NULL DEFAULT 0"},
 	}},
 	// messages: the threading headers. NULL means "not read from the blob
 	// yet" (the thread backfill fills it); '' means "read, there is none".
@@ -246,6 +253,7 @@ CREATE TABLE IF NOT EXISTS message_thread (
 	tid              TEXT    NOT NULL,
 	parent_stable_id TEXT    NOT NULL DEFAULT '',
 	depth            INTEGER NOT NULL DEFAULT 0,
+	outsider         INTEGER NOT NULL DEFAULT 0,
 	PRIMARY KEY (account, stable_id)
 ) WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS message_thread_by_tid ON message_thread (account, tid);
