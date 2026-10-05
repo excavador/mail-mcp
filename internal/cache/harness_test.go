@@ -18,6 +18,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -120,6 +121,8 @@ func (c recConn) Read(p []byte) (int, error) {
 type recListener struct {
 	net.Listener
 	log *cmdLog
+	// delay is the one-way server-to-client latency of new connections.
+	delay *atomic.Int64
 }
 
 func (l recListener) Accept() (net.Conn, error) {
@@ -130,7 +133,11 @@ func (l recListener) Accept() (net.Conn, error) {
 	l.log.mu.Lock()
 	l.log.conns = append(l.log.conns, c)
 	l.log.mu.Unlock()
-	return recConn{Conn: c, log: l.log}, nil
+	var rc net.Conn = recConn{Conn: c, log: l.log}
+	if l.delay != nil {
+		rc = maybeDelay(rc, time.Duration(l.delay.Load()))
+	}
+	return rc, nil
 }
 
 func selfSigned(t *testing.T) (tls.Certificate, string) {
@@ -165,7 +172,12 @@ type env struct {
 	acct  accounts.Account
 	cache *Cache
 	dir   string
+	delay *atomic.Int64
 }
+
+// setDelay sets the one-way server-to-client latency of connections made from
+// now on.
+func (e *env) setDelay(d time.Duration) { e.delay.Store(int64(d)) }
 
 // newEnv starts an in-process IMAP server (TLS, self-signed, pinned) with the
 // given folders and opens a fresh cache.
@@ -191,12 +203,13 @@ func newEnv(t *testing.T, provider accounts.Provider, folders ...string) *env {
 		t.Fatal(err)
 	}
 	log := &cmdLog{}
-	go func() { _ = srv.Serve(recListener{Listener: raw, log: log}) }()
+	delay := &atomic.Int64{}
+	go func() { _ = srv.Serve(recListener{Listener: raw, log: log, delay: delay}) }()
 	t.Cleanup(func() { _ = srv.Close() })
 
 	h, p, _ := net.SplitHostPort(raw.Addr().String())
 	port, _ := strconv.Atoi(p)
-	e := &env{t: t, log: log, host: h, port: port, pin: pin, dir: t.TempDir()}
+	e := &env{t: t, log: log, host: h, port: port, pin: pin, dir: t.TempDir(), delay: delay}
 	e.acct = e.account("acct", provider, testPass)
 
 	c, err := Open(filepath.Join(e.dir, "cache"))

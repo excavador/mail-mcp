@@ -6,7 +6,6 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
-	"regexp"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -59,31 +58,36 @@ func TestSecondRefreshOfUnchangedMailboxIsQuietAndReadOnly(t *testing.T) {
 	if second.NewBodies != 0 || second.NewIDs != 0 || second.NewUIDs != 0 || second.Removed != 0 {
 		t.Fatalf("second refresh not quiet: %+v", second)
 	}
-	if second.Folders != 2 {
-		t.Errorf("Folders = %d, want 2", second.Folders)
+	if second.Folders != 2 || second.FoldersTotal != 2 {
+		t.Errorf("Folders = %d, FoldersTotal = %d, want 2, 2", second.Folders, second.FoldersTotal)
 	}
-	bodyNoPeek := regexp.MustCompile(`BODY\[`) // a non-PEEK body fetch would set \Seen
-	for _, ln := range e.log.lines() {
-		if bodyNoPeek.MatchString(strings.ToUpper(ln)) {
-			t.Errorf("non-PEEK body fetch: %q", ln)
-		}
+	if second.FoldersSkipped != second.FoldersTotal || second.FoldersScanned != 0 {
+		t.Errorf("FoldersSkipped = %d, FoldersScanned = %d, want %d, 0", second.FoldersSkipped, second.FoldersScanned, second.FoldersTotal)
 	}
-	// A second refresh must not fetch any body at all.
-	if strings.Contains(strings.ToUpper(strings.Join(e.log.lines(), "\n")), "BODY.PEEK[]") {
-		t.Errorf("second refresh fetched bodies:\n%s", strings.Join(e.log.lines(), "\n"))
-	}
-	forbidden := map[string]bool{"STORE": true, "COPY": true, "MOVE": true, "EXPUNGE": true, "SELECT": true, "APPEND": true, "DELETE": true, "CREATE": true, "RENAME": true}
-	sawExamine := false
+	// An unchanged mailbox costs LIST and one STATUS per folder: no folder is
+	// opened, no UID listing, no body.
+	forbidden := map[string]bool{"STORE": true, "COPY": true, "MOVE": true, "EXPUNGE": true, "SELECT": true, "EXAMINE": true, "FETCH": true, "SEARCH": true, "APPEND": true, "DELETE": true, "CREATE": true, "RENAME": true}
+	counts := map[string]int{}
 	for _, v := range e.log.verbs() {
+		counts[v]++
 		if forbidden[v] {
-			t.Errorf("mailbox-mutating or read-write command %s sent during refresh", v)
-		}
-		if v == "EXAMINE" {
-			sawExamine = true
+			t.Errorf("command %s sent during an unchanged refresh", v)
 		}
 	}
-	if !sawExamine {
-		t.Error("no EXAMINE seen")
+	if counts["LIST"] != 1 || counts["STATUS"] != second.FoldersTotal {
+		t.Errorf("verbs = %v, want 1 LIST and %d STATUS", e.log.verbs(), second.FoldersTotal)
+	}
+	for _, ln := range e.log.lines() {
+		if strings.Contains(strings.ToUpper(ln), " STATUS ") {
+			for _, item := range []string{"MESSAGES", "UIDNEXT", "UIDVALIDITY"} {
+				if !strings.Contains(strings.ToUpper(ln), item) {
+					t.Errorf("STATUS without %s: %q", item, ln)
+				}
+			}
+		}
+	}
+	if strings.Contains(strings.ToUpper(strings.Join(e.log.lines(), "\n")), "BODY") {
+		t.Errorf("second refresh fetched a body:\n%s", strings.Join(e.log.lines(), "\n"))
 	}
 }
 
