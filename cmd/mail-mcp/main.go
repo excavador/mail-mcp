@@ -210,12 +210,14 @@ func run(ctx context.Context, cmd *cli.Command) error {
 		_ = store.Close()
 		_ = hist.Close()
 	}()
-	// Index existing mail into the split-body FTS table and the attachment
-	// tables from the blobs on disk (no IMAP); search switches over when done.
+	// Background backfills, one goroutine, one after the other: the fts2
+	// index (search depends on it) from the blobs on disk, then threading.
+	// Both are resumable, use short write transactions and give way to
+	// refresh; they never touch IMAP and stop with ctx.
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		store.RunBackfill(ctx, log)
+		store.RunBackfills(ctx, log)
 	}()
 	for _, a := range accts {
 		wg.Add(1)
@@ -224,25 +226,10 @@ func run(ctx context.Context, cmd *cli.Command) error {
 			store.Run(ctx, log, a, cmd.Duration("refresh-interval"))
 		}()
 	}
-	// Thread backfill: fills threading headers and threads for mail cached
-	// before threads existed. Resumable and rate-limited; stops with ctx.
-	wg.Add(2)
+	wg.Add(1)
 	go func() {
 		defer wg.Done()
 		store.RunSearchLogRetention(ctx, log)
-	}()
-	go func() {
-		defer wg.Done()
-		// Last resort: the backfill recovers per batch, but a panic here must
-		// never take the process down.
-		defer func() {
-			if r := recover(); r != nil {
-				log.Error("thread backfill panicked", "panic", fmt.Sprint(r))
-			}
-		}()
-		if err := store.BackfillThreads(ctx, log); err != nil && ctx.Err() == nil {
-			log.Error("thread backfill failed", "error", err.Error())
-		}
 	}()
 	log.Info("approval", "mode", string(approval), "max_unelicited_apply", cmd.Int("max-unelicited-apply"))
 	log.Info("history", "dir", cmd.String("history-dir"))

@@ -13,23 +13,37 @@ import (
 // backfillName names the message_fts2 job in the backfill table.
 const backfillName = "fts2"
 
-// Backfill pacing. A batch ends at backfillBatch messages or backfillSlice of
-// wall time, whichever comes first: the batch holds the database write lock
-// (refresh waits on it), and a PDF-heavy stretch must not hold it for minutes.
-// Between batches the worker sleeps as long as the batch took, floored at
-// backfillMinYield, so it uses at most about half of the write capacity.
+// Backfill pacing. The batch is listed and parsed with no transaction, for at
+// most backfillSlice of wall time; the results are then written in
+// transactions of at most writeRows rows or writeSlice of work (scheduler.go),
+// with a rest between them, so refresh and live tools get the write lock.
 const (
 	backfillBatch    = 500
-	backfillSlice    = 750 * time.Millisecond
-	backfillMinYield = 50 * time.Millisecond
+	backfillSlice    = 200 * time.Millisecond
 	backfillLogEvery = time.Minute
 )
+
+// backfillMinYield is the least rest between write transactions.
+var backfillMinYield = 50 * time.Millisecond
 
 // BackfillStatus is the progress of the message_fts2 backfill.
 type BackfillStatus struct {
 	Done     int  `json:"done"`
 	Total    int  `json:"total"`
 	Complete bool `json:"complete"`
+	// State is "complete", "running", or "pending" (not started: the jobs run
+	// one after another, fts2 first, then threads).
+	State string `json:"state"`
+}
+
+func jobStateName(complete bool, j *jobState) string {
+	switch {
+	case complete:
+		return "complete"
+	case j.running.Load():
+		return "running"
+	}
+	return "pending"
 }
 
 // initBackfill creates the job row on first start: it snapshots the highest
@@ -77,6 +91,7 @@ func (c *Cache) BackfillStatus(ctx context.Context) (BackfillStatus, error) {
 	if st.Complete {
 		st.Done = st.Total
 	}
+	st.State = jobStateName(st.Complete, &c.fts2Job)
 	return st, nil
 }
 
@@ -108,21 +123,29 @@ func (c *Cache) RunBackfill(ctx context.Context, log *slog.Logger) {
 	if log == nil {
 		log = slog.Default()
 	}
+	c.fts2Job.running.Store(true)
+	defer c.fts2Job.running.Store(false)
 	start := time.Now()
-	lastLog := start
-	var startProcessed int
+	var rl *rateLog
 	if st, err := c.BackfillStatus(ctx); err == nil {
-		startProcessed = st.Done
+		rl = newRateLog("fts2 backfill", log, st.Done)
 		log.Info("fts2 backfill starting", "done", st.Done, "total", st.Total)
+	} else {
+		rl = newRateLog("fts2 backfill", log, 0)
 	}
 	missing := 0
 	for {
 		if ctx.Err() != nil {
 			return
 		}
-		began := time.Now()
-		complete, miss, err := c.backfillBatch(ctx)
-		missing += miss
+		var complete bool
+		err := c.retryBusy(ctx, log, "fts2 backfill", func() error {
+			var miss int
+			var err error
+			complete, miss, err = c.backfillBatch(ctx)
+			missing += miss
+			return err
+		})
 		if err != nil {
 			if ctx.Err() != nil {
 				return
@@ -139,14 +162,9 @@ func (c *Cache) RunBackfill(ctx context.Context, log *slog.Logger) {
 			log.Info("fts2 backfill complete", "total", st.Total, "missing_blobs", missing, "took", time.Since(start).Round(time.Second).String())
 			return
 		}
-		if time.Since(lastLog) >= backfillLogEvery {
-			lastLog = time.Now()
+		if time.Since(rl.last) >= backfillLogEvery {
 			st, _ := c.BackfillStatus(ctx)
-			rate := float64(st.Done-startProcessed) / max(time.Since(start).Seconds(), 1)
-			log.Info("fts2 backfill progress", "done", st.Done, "total", st.Total, "per_second", int(rate), "missing_blobs", missing)
-		}
-		if !sleepCtx(ctx, max(time.Since(began), backfillMinYield)) {
-			return
+			rl.tick(st.Done, st.Total)
 		}
 	}
 }
@@ -205,16 +223,17 @@ FROM messages WHERE rowid > ? AND rowid <= ? ORDER BY rowid LIMIT ?`, last, maxR
 
 	// Phase 1, no transaction: skip rows already indexed, read and parse the
 	// rest (PDF extraction can take seconds). It ends at backfillSlice of wall
-	// time or backfillMaxHeld bytes of parsed text, so memory stays bounded.
-	// Phase 2 holds the write lock only for the inserts.
+	// time or maxHeldParsed bytes of parsed text, so memory stays bounded.
+	// Phase 2 writes the results in short transactions.
 	type item struct {
 		rid         int64
 		account, id string
+		skip        bool
 		p           parsed
 	}
 	var items []item
 	began := time.Now()
-	held, n, lastDone := 0, 0, last
+	held := 0
 	for _, r := range batch {
 		if ctx.Err() != nil {
 			return false, 0, ctx.Err()
@@ -224,6 +243,7 @@ FROM messages WHERE rowid > ? AND rowid <= ? ORDER BY rowid LIMIT ?`, last, maxR
 		switch {
 		case err == nil:
 			// already indexed (a retry after a partial failure)
+			items = append(items, item{rid: r.rid, skip: true})
 		case errors.Is(err, sql.ErrNoRows):
 			p := parsed{From: r.from, To: r.to, Cc: r.cc, Subject: r.sub}
 			if path := c.BlobPath(r.blob); path != "" {
@@ -236,35 +256,46 @@ FROM messages WHERE rowid > ? AND rowid <= ? ORDER BY rowid LIMIT ?`, last, maxR
 				missing++
 			}
 			held += parsedSize(p)
-			items = append(items, item{r.rid, r.account, r.id, p})
+			items = append(items, item{r.rid, r.account, r.id, false, p})
 		default:
 			return false, 0, fmt.Errorf("check fts2 row: %w", err)
 		}
-		n++
-		lastDone = r.rid
 		if time.Since(began) >= backfillSlice || held >= maxHeldParsed {
 			break
 		}
 	}
-	tx, err := c.db.BeginTx(ctx, nil)
-	if err != nil {
-		return false, 0, fmt.Errorf("begin: %w", err)
-	}
-	defer func() { _ = tx.Rollback() }()
-	for i := range items {
-		it := &items[i]
-		if err := indexText2Tx(ctx, tx, it.rid, it.account, it.id, it.p); err != nil {
+	for i := 0; i < len(items); {
+		tx, err := c.db.BeginTx(ctx, nil)
+		if err != nil {
+			return false, 0, fmt.Errorf("begin: %w", err)
+		}
+		locked := time.Now()
+		j := i
+		for j < len(items) && (j == i || (j-i < writeRows && time.Since(locked) < writeSlice)) {
+			it := &items[j]
+			if !it.skip {
+				if err := indexText2Tx(ctx, tx, it.rid, it.account, it.id, it.p); err != nil {
+					_ = tx.Rollback()
+					return false, 0, err
+				}
+				it.p = parsed{}
+			}
+			j++
+		}
+		if _, err := tx.ExecContext(ctx,
+			`UPDATE backfill SET last_rowid = ?, processed = processed + ?, updated_at = ? WHERE name = ?`,
+			items[j-1].rid, j-i, c.now().Unix(), backfillName); err != nil {
+			_ = tx.Rollback()
+			return false, 0, fmt.Errorf("record backfill progress: %w", err)
+		}
+		hold, err := c.commitHeld(tx, locked)
+		if err != nil {
 			return false, 0, err
 		}
-		it.p = parsed{}
-	}
-	if _, err := tx.ExecContext(ctx,
-		`UPDATE backfill SET last_rowid = ?, processed = processed + ?, updated_at = ? WHERE name = ?`,
-		lastDone, n, c.now().Unix(), backfillName); err != nil {
-		return false, 0, fmt.Errorf("record backfill progress: %w", err)
-	}
-	if err := tx.Commit(); err != nil {
-		return false, 0, fmt.Errorf("commit: %w", err)
+		i = j
+		if !c.yield(ctx, hold, backfillMinYield) {
+			return false, missing, ctx.Err()
+		}
 	}
 	return false, missing, nil
 }

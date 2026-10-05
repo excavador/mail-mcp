@@ -193,7 +193,7 @@ func strArgs(account string, ids []string) []any {
 }
 
 // loadThreadRows loads the threading view of the given messages.
-func loadThreadRows(ctx context.Context, tx *sql.Tx, account string, ids []string) ([]threadRow, error) {
+func loadThreadRows(ctx context.Context, tx dbq, account string, ids []string) ([]threadRow, error) {
 	var out []threadRow
 	for _, part := range chunks(ids, idChunk) {
 		rows, err := tx.QueryContext(ctx, `
@@ -361,7 +361,7 @@ func distinctTids(ctx context.Context, tx *sql.Tx, q string, args ...any) ([]str
 // by-Gmail message that shares an id with a member, transitively, plus the
 // threads a header-less reply could join by subject. Members are marked
 // visited.
-func gatherComponent(ctx context.Context, tx *sql.Tx, account, seed string, visited map[string]bool) ([]threadRow, bool, error) {
+func gatherComponent(ctx context.Context, tx dbq, account, seed string, visited map[string]bool) ([]threadRow, bool, error) {
 	if gatherHook != nil {
 		gatherHook()
 	}
@@ -466,7 +466,7 @@ func gatherComponent(ctx context.Context, tx *sql.Tx, account, seed string, visi
 
 // rootsBySubject returns the root messages of JWZ threads with this
 // normalised subject whose first message is within the subject window of date.
-func rootsBySubject(ctx context.Context, tx *sql.Tx, account, ns string, date int64) ([]string, error) {
+func rootsBySubject(ctx context.Context, tx dbq, account, ns string, date int64) ([]string, error) {
 	rs, err := tx.QueryContext(ctx, `SELECT root_stable_id FROM threads
 WHERE account = ? AND subject_norm = ? AND tid LIKE 'j:%' AND first_at BETWEEN ? AND ? LIMIT 20`,
 		account, ns, date-subjectWindow, date+subjectWindow)
@@ -499,6 +499,186 @@ func applyComponent(ctx context.Context, tx *sql.Tx, account string, comp []thre
 		msgs[i], ids[i] = r.msg(), r.stableID
 	}
 	return applyAssigns(ctx, tx, account, ids, BuildThreadsOpts(msgs, opts))
+}
+
+// dbq is what the read side of threading needs: a *sql.DB (a plan computed
+// outside any transaction) or a *sql.Tx.
+type dbq interface {
+	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
+	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+}
+
+// loadHave reads the current assignment of ids.
+func loadHave(ctx context.Context, q dbq, account string, ids []string) (map[string]assignRow, error) {
+	have := map[string]assignRow{}
+	for _, part := range chunks(ids, idChunk) {
+		rows, err := q.QueryContext(ctx, `SELECT stable_id, tid, parent_stable_id, depth, outsider FROM message_thread
+WHERE account = ? AND stable_id IN (`+inList(len(part))+`)`, strArgs(account, part)...)
+		if err != nil {
+			return nil, fmt.Errorf("rewrite threads: %w", err)
+		}
+		for rows.Next() {
+			var id string
+			var r assignRow
+			var o int
+			if err := rows.Scan(&id, &r.tid, &r.parent, &r.depth, &o); err != nil {
+				_ = rows.Close()
+				return nil, fmt.Errorf("rewrite threads: %w", err)
+			}
+			r.outsider = o == 1
+			have[id] = r
+		}
+		if err := rows.Err(); err != nil {
+			_ = rows.Close()
+			return nil, fmt.Errorf("rewrite threads: %w", err)
+		}
+		_ = rows.Close()
+	}
+	return have, nil
+}
+
+// threadPlan is the result of threading one component (or one Gmail thread),
+// computed with reads only, to be applied later in a short transaction.
+type threadPlan struct {
+	account string
+	opts    ThreadOpts
+	gm      string // a Gmail thread: applied by threadGmail
+	ids     []string
+	assigns []ThreadAssign
+	have    map[string]assignRow // the assignments the plan was computed against
+}
+
+// planThreads is threadTxOpts without the writes: it returns what each
+// component would be written as. Panics in the threading code turn the
+// component into single-message threads, as in threadTxOpts.
+func planThreads(ctx context.Context, q dbq, account string, seeds []string, opts ThreadOpts) ([]threadPlan, error) {
+	rows, err := loadThreadRows(ctx, q, account, seeds)
+	if err != nil {
+		return nil, err
+	}
+	var plans []threadPlan
+	gmSeen := map[string]bool{}
+	var jSeeds []string
+	for _, r := range rows {
+		switch {
+		case r.gm != "":
+			if !gmSeen[r.gm] {
+				gmSeen[r.gm] = true
+				plans = append(plans, threadPlan{account: account, opts: opts, gm: r.gm})
+			}
+		case r.filled:
+			jSeeds = append(jSeeds, r.stableID)
+		}
+	}
+	sort.Strings(jSeeds)
+	solo := func(ids ...string) threadPlan {
+		as := make([]ThreadAssign, len(ids))
+		for i, id := range ids {
+			as[i] = ThreadAssign{StableID: id, TID: soloTID(id)}
+		}
+		return threadPlan{account: account, opts: opts, ids: ids, assigns: as}
+	}
+	visited := map[string]bool{}
+	capped := false
+	for _, seed := range jSeeds {
+		if visited[seed] {
+			continue
+		}
+		if capped {
+			visited[seed] = true
+			plans = append(plans, solo(seed))
+			continue
+		}
+		var (
+			comp []threadRow
+			plan *threadPlan
+			gerr error
+		)
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					slog.Error("cache: threading panicked; component threaded alone", "account", account, "seed", seed, "panic", fmt.Sprint(r))
+					ids := []string{seed}
+					for _, m := range comp {
+						ids = append(ids, m.stableID)
+					}
+					for _, id := range ids {
+						visited[id] = true
+					}
+					p := solo(ids...)
+					plan, gerr = &p, nil
+				}
+			}()
+			comp, capped, gerr = gatherComponent(ctx, q, account, seed, visited)
+			if gerr != nil || len(comp) == 0 {
+				return
+			}
+			if componentHook != nil {
+				componentHook(comp)
+			}
+			msgs := make([]ThreadMsg, len(comp))
+			ids := make([]string, len(comp))
+			for i, r := range comp {
+				msgs[i], ids[i] = r.msg(), r.stableID
+			}
+			plan = &threadPlan{account: account, opts: opts, ids: ids, assigns: BuildThreadsOpts(msgs, opts)}
+		}()
+		if gerr != nil {
+			return nil, gerr
+		}
+		if plan != nil {
+			plans = append(plans, *plan)
+		}
+	}
+	for i := range plans {
+		if plans[i].gm != "" {
+			continue
+		}
+		if plans[i].have, err = loadHave(ctx, q, account, plans[i].ids); err != nil {
+			return nil, err
+		}
+	}
+	return plans, nil
+}
+
+// applyPlan writes a plan inside tx. If any member's assignment changed since
+// the plan was computed (a refresh threaded it meanwhile), the plan is stale
+// and the component is planned again inside tx, where nothing can move.
+func applyPlan(ctx context.Context, tx *sql.Tx, p threadPlan) error {
+	if p.gm != "" {
+		return threadGmail(ctx, tx, p.account, p.gm)
+	}
+	cur, err := loadHave(ctx, tx, p.account, p.ids)
+	if err != nil {
+		return err
+	}
+	if len(cur) == len(p.have) {
+		fresh := true
+		for id, a := range cur {
+			if b, ok := p.have[id]; !ok || a != b {
+				fresh = false
+				break
+			}
+		}
+		if fresh {
+			return applyAssigns(ctx, tx, p.account, p.ids, p.assigns)
+		}
+	}
+	again, err := planThreads(ctx, tx, p.account, p.ids, p.opts)
+	if err != nil {
+		return err
+	}
+	for _, q := range again {
+		if err := applyAssigns(ctx, tx, q.account, q.ids, q.assigns); err != nil {
+			return err
+		}
+		if q.gm != "" {
+			if err := threadGmail(ctx, tx, q.account, q.gm); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 type assignRow struct {
@@ -703,7 +883,8 @@ func (c *Cache) ThreadsBackfillStatus(ctx context.Context) (BackfillStatus, erro
 	)
 	err := c.db.QueryRowContext(ctx, `SELECT processed, total, done FROM backfill WHERE name = ?`, threadBackfillName).Scan(&st.Done, &st.Total, &done)
 	if errors.Is(err, sql.ErrNoRows) {
-		return st, nil // not started yet
+		st.State = "pending" // not started yet
+		return st, nil
 	}
 	if err != nil {
 		return st, fmt.Errorf("cache: threads backfill status: %w", err)
@@ -712,6 +893,7 @@ func (c *Cache) ThreadsBackfillStatus(ctx context.Context) (BackfillStatus, erro
 	if st.Complete {
 		st.Done = st.Total
 	}
+	st.State = jobStateName(st.Complete, &c.threadsJob)
 	return st, nil
 }
 
@@ -725,6 +907,8 @@ func (c *Cache) ThreadsBackfillStatus(ctx context.Context) (BackfillStatus, erro
 // never threaded (an inline threading step that failed) and, if there are
 // any, runs again from the start.
 func (c *Cache) BackfillThreads(ctx context.Context, log *slog.Logger) error {
+	c.threadsJob.running.Store(true)
+	defer c.threadsJob.running.Store(false)
 	last, done, err := c.backfillState(ctx, threadBackfillName)
 	if err != nil {
 		return fmt.Errorf("backfill state: %w", err)
@@ -748,8 +932,21 @@ func (c *Cache) BackfillThreads(ctx context.Context, log *slog.Logger) error {
 		}
 	}
 	start, processed := c.now(), 0
+	var rl *rateLog
+	if log != nil {
+		rl = newRateLog("thread backfill", log, 0)
+	}
 	for {
-		n, next, finished, err := c.safeThreadBatch(ctx, last, log)
+		var (
+			n        int
+			next     int64
+			finished bool
+		)
+		err := c.retryBusy(ctx, log, "thread backfill", func() error {
+			var err error
+			n, next, finished, err = c.safeThreadBatch(ctx, last, log)
+			return err
+		})
 		if err != nil {
 			if ctx.Err() != nil {
 				return ctx.Err()
@@ -764,13 +961,10 @@ func (c *Cache) BackfillThreads(ctx context.Context, log *slog.Logger) error {
 			}
 			return nil
 		}
-		if log != nil && processed%(threadBackfillBatch*20) == 0 {
-			log.Info("thread backfill", "messages", processed, "last_rowid", last)
-		}
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(backfillPause):
+		if rl != nil && time.Since(rl.last) >= backfillLogEvery {
+			if st, err := c.ThreadsBackfillStatus(ctx); err == nil {
+				rl.tick(st.Done, st.Total)
+			}
 		}
 	}
 }
@@ -784,6 +978,13 @@ type backfillRow struct {
 
 // backfillThreadBatch handles up to threadBackfillBatch messages after last.
 // It returns how many it saw, the new position and whether the table ended.
+//
+// Only the writes hold the database lock, in transactions of at most
+// writeRows rows or writeSlice of work with a rest between them: the blob
+// headers are read first, then the header columns and id index are written in
+// chunks, then threading is computed from reads alone (planThreads) and the
+// plans are applied in chunks. Every step is idempotent, so a batch cut short
+// is redone from the unthreaded rows.
 func (c *Cache) backfillThreadBatch(ctx context.Context, last int64) (int, int64, bool, error) {
 	if batchHook != nil {
 		batchHook()
@@ -819,38 +1020,68 @@ FROM messages WHERE rowid > ? ORDER BY rowid LIMIT ?`, last, threadBackfillBatch
 		return 0, last, true, tx.Commit()
 	}
 
-	// Blob reads happen before the write transaction, so the lock is not
+	// Blob reads happen before any write transaction, so the lock is not
 	// held while the disk is slow.
 	headers := make(map[int64]threadHeaders, len(batch))
+	var withHeaders []backfillRow
 	for _, r := range batch {
 		if !r.needsHeaders {
 			continue
 		}
+		if ctx.Err() != nil {
+			return 0, last, false, ctx.Err()
+		}
 		headers[r.rowid] = c.readBlobThreadHeaders(r.sum)
+		withHeaders = append(withHeaders, r)
 	}
 
-	tx, err := c.db.BeginTx(ctx, nil)
-	if err != nil {
-		return 0, last, false, fmt.Errorf("backfill begin: %w", err)
-	}
-	defer func() { _ = tx.Rollback() }()
-	byAcct := map[string][]string{}
-	for _, r := range batch {
-		if th, ok := headers[r.rowid]; ok {
+	// Header columns and id index, in short transactions. Each row's UPDATE is
+	// guarded (message_id IS NULL) and the index insert is OR IGNORE.
+	for i := 0; i < len(withHeaders); {
+		tx, err := c.db.BeginTx(ctx, nil)
+		if err != nil {
+			return 0, last, false, fmt.Errorf("backfill begin: %w", err)
+		}
+		locked := time.Now()
+		j := i
+		for j < len(withHeaders) && (j == i || (j-i < writeRows && time.Since(locked) < writeSlice)) {
+			r := withHeaders[j]
+			th := headers[r.rowid]
 			if _, err := tx.ExecContext(ctx, `UPDATE messages SET message_id = ?, in_reply_to = ?, references_json = ? WHERE rowid = ? AND message_id IS NULL`,
 				th.MessageID, th.InReplyTo, th.refsJSON(), r.rowid); err != nil {
+				_ = tx.Rollback()
 				return 0, last, false, fmt.Errorf("backfill headers: %w", err)
 			}
 			if err := addRefsTx(ctx, tx, r.account, r.id, r.subject, th); err != nil {
+				_ = tx.Rollback()
 				return 0, last, false, err
 			}
+			j++
+		}
+		hold, err := c.commitHeld(tx, locked)
+		if err != nil {
+			return 0, last, false, err
+		}
+		i = j
+		if !c.yield(ctx, hold, backfillPause) {
+			return 0, last, false, ctx.Err()
+		}
+	}
+
+	// Which rows still need threading, then the plans: reads only.
+	byAcct := map[string][]string{}
+	var accts []string
+	for _, r := range batch {
+		if _, ok := byAcct[r.account]; !ok {
+			accts = append(accts, r.account)
 		}
 		byAcct[r.account] = append(byAcct[r.account], r.id)
 	}
-	for acct, ids := range byAcct {
+	var plans []threadPlan
+	for _, acct := range accts {
 		var todo []string
-		for _, part := range chunks(ids, idChunk) {
-			rs, err := tx.QueryContext(ctx, `SELECT stable_id FROM messages m WHERE account = ? AND stable_id IN (`+inList(len(part))+`)
+		for _, part := range chunks(byAcct[acct], idChunk) {
+			rs, err := c.db.QueryContext(ctx, `SELECT stable_id FROM messages m WHERE account = ? AND stable_id IN (`+inList(len(part))+`)
 AND NOT EXISTS (SELECT 1 FROM message_thread t WHERE t.account = m.account AND t.stable_id = m.stable_id)`, strArgs(acct, part)...)
 			if err != nil {
 				return 0, last, false, fmt.Errorf("backfill unthreaded: %w", err)
@@ -865,15 +1096,52 @@ AND NOT EXISTS (SELECT 1 FROM message_thread t WHERE t.account = m.account AND t
 			}
 			_ = rs.Close()
 		}
-		if err := threadTxOpts(ctx, tx, acct, todo, c.threadOpts(acct)); err != nil {
+		ps, err := planThreads(ctx, c.db, acct, todo, c.threadOpts(acct))
+		if err != nil {
 			return 0, last, false, err
 		}
+		plans = append(plans, ps...)
 	}
+
+	// Apply the plans in short transactions.
+	for i := 0; i < len(plans); {
+		tx, err := c.db.BeginTx(ctx, nil)
+		if err != nil {
+			return 0, last, false, fmt.Errorf("backfill begin: %w", err)
+		}
+		locked := time.Now()
+		j := i
+		for j < len(plans) && (j == i || (j-i < writeRows && time.Since(locked) < writeSlice)) {
+			if err := applyPlan(ctx, tx, plans[j]); err != nil {
+				_ = tx.Rollback()
+				return 0, last, false, err
+			}
+			j++
+		}
+		hold, err := c.commitHeld(tx, locked)
+		if err != nil {
+			return 0, last, false, err
+		}
+		i = j
+		if !c.yield(ctx, hold, backfillPause) {
+			return 0, last, false, ctx.Err()
+		}
+	}
+
 	next := batch[len(batch)-1].rowid
+	tx, err := c.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, last, false, fmt.Errorf("backfill begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	locked := time.Now()
 	if err := setBackfillTx(ctx, tx, threadBackfillName, next, false, c.now(), len(batch)); err != nil {
 		return 0, last, false, err
 	}
-	return len(batch), next, false, tx.Commit()
+	if _, err := c.commitHeld(tx, locked); err != nil {
+		return 0, last, false, err
+	}
+	return len(batch), next, false, nil
 }
 
 // readBlobThreadHeaders reads only the header block of a cached blob. A

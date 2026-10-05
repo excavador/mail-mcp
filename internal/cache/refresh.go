@@ -116,6 +116,7 @@ func (s *Stats) add(o Stats) {
 // and returned after every folder has been tried, and what was already
 // stored stays valid, so the next refresh resumes rather than restarts.
 func (c *Cache) Refresh(ctx context.Context, a accounts.Account, client *imapclient.Client) (st Stats, err error) {
+	defer c.foreground()()
 	defer func() { c.recordRefresh(a.Name, st, err == nil) }()
 
 	imapx.SetPhase(ctx, "list")
