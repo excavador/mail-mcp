@@ -42,6 +42,7 @@ type parsed struct {
 	Body                  string // whole text, quotes included (message_fts)
 	BodyNew               string // CleanBody(Body) (message_fts2.body_new)
 	Atts                  []AttachmentMeta
+	Thr                   threadHeaders // Message-ID, In-Reply-To, References, from the same parse
 }
 
 // parseMessage extracts headers and searchable text from raw RFC 822. It is
@@ -75,6 +76,7 @@ func parseMessage(raw []byte) (out parsed) {
 	if d, err := h.Date(); err == nil {
 		out.Date = d
 	}
+	out.Thr = headersFromTextproto(e.Header.Header)
 	out.ListID = capField(strings.TrimSpace(e.Header.Get("List-Id")))
 	out.GitHubReason = capField(strings.TrimSpace(e.Header.Get("X-Github-Reason")))
 

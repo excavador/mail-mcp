@@ -218,6 +218,15 @@ func run(ctx context.Context, cmd *cli.Command) error {
 			store.Run(ctx, log, a, cmd.Duration("refresh-interval"))
 		}()
 	}
+	// Thread backfill: fills threading headers and threads for mail cached
+	// before threads existed. Resumable and rate-limited; stops with ctx.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		if err := store.BackfillThreads(ctx, log); err != nil && ctx.Err() == nil {
+			log.Error("thread backfill failed", "error", err.Error())
+		}
+	}()
 	log.Info("approval", "mode", string(approval), "max_unelicited_apply", cmd.Int("max-unelicited-apply"))
 	log.Info("history", "dir", cmd.String("history-dir"))
 	log.Info("cache", "dir", cmd.String("cache-dir"), "refresh_interval", cmd.Duration("refresh-interval").String())

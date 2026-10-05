@@ -115,7 +115,7 @@ func TestServerSearchStalledTimesOutFreesSlotAndRecovers(t *testing.T) {
 
 	e.fake.release()
 	got, _ := ok[gmSearchOut](t, e.cs, "search", args)
-	if got.Count == 0 {
+	if len(got.Results) == 0 {
 		t.Errorf("search after release returned nothing: %+v", got)
 	}
 }

@@ -84,9 +84,9 @@ type gmSearchOut struct {
 		Subject  string   `json:"subject"`
 		Snippet  string   `json:"snippet"`
 		Folders  []string `json:"folders"`
-	} `json:"results"`
-	Count         int    `json:"count"`
-	Truncated     bool   `json:"truncated"`
+	} `json:"hits"`
+	NextCursor    string `json:"next_cursor"`
+	Note          string `json:"note"`
 	UncachedCount int    `json:"uncached_count"`
 	Notice        string `json:"notice"`
 }
@@ -120,11 +120,11 @@ func TestServerSearchValidationErrors(t *testing.T) {
 		{"newline", map[string]any{"server": true, "account": g, "query": "a\nb"}, "single line"},
 		{"carriage return", map[string]any{"server": true, "account": g, "query": "a\rb"}, "single line"},
 		{"NUL", map[string]any{"server": true, "account": g, "query": "a\x00b"}, "single line"},
-		{"folder", map[string]any{"server": true, "account": g, "query": "x", "folder": "INBOX"}, "only account, query and limit"},
-		{"from", map[string]any{"server": true, "account": g, "query": "x", "from": "a@b"}, "only account, query and limit"},
-		{"since", map[string]any{"server": true, "account": g, "query": "x", "since": "2026-01-01"}, "only account, query and limit"},
-		{"until", map[string]any{"server": true, "account": g, "query": "x", "until": "2026-01-01"}, "only account, query and limit"},
-		{"fts_syntax", map[string]any{"server": true, "account": g, "query": "x", "fts_syntax": true}, "only account, query and limit"},
+		{"folder", map[string]any{"server": true, "account": g, "query": "x", "folder": "INBOX"}, "only account, query"},
+		{"from", map[string]any{"server": true, "account": g, "query": "x", "from": "a@b"}, "only account, query"},
+		{"since", map[string]any{"server": true, "account": g, "query": "x", "since": "2026-01-01"}, "only account, query"},
+		{"until", map[string]any{"server": true, "account": g, "query": "x", "until": "2026-01-01"}, "only account, query"},
+		{"fts_syntax", map[string]any{"server": true, "account": g, "query": "x", "fts_syntax": true}, "only account, query"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			res := call(t, e.cs, "search", tc.args)
@@ -240,7 +240,7 @@ func TestServerSearchSuccess(t *testing.T) {
 				t.Errorf("query not sent verbatim.\nwant tail %q\nsent:\n%q", tc.wire(tc.query), sent)
 			}
 			// Results: the cached UIDs of All Mail, newest first, rest counted.
-			if out.Count != 2 || len(out.Results) != 2 || out.UncachedCount != 2 || out.Truncated {
+			if len(out.Results) != 2 || out.UncachedCount != 2 || (out.NextCursor != "") {
 				t.Fatalf("out = %+v", out)
 			}
 			if out.Results[0].Subject != "beta" || out.Results[1].Subject != "alpha" {
@@ -312,8 +312,8 @@ func TestServerSearchUsesAllFolderAndFallback(t *testing.T) {
 	e := gmailEnv(t, cfg, Read)
 	off := len(e.fake.log.raw())
 	out, _ := ok[gmSearchOut](t, e.cs, "search", map[string]any{"server": true, "account": e.g.Name, "query": "x"})
-	if !strings.Contains(e.sent(off), `EXAMINE "[Gmail]/Alle Nachrichten"`) || out.Count != 2 {
-		t.Errorf("\\All folder not used: count=%d sent=%q", out.Count, e.sent(off))
+	if !strings.Contains(e.sent(off), `EXAMINE "[Gmail]/Alle Nachrichten"`) || len(out.Results) != 2 {
+		t.Errorf("\\All folder not used: count=%d sent=%q", len(out.Results), e.sent(off))
 	}
 
 	// No \All attribute: falls back to [Gmail]/All Mail.
@@ -322,15 +322,15 @@ func TestServerSearchUsesAllFolderAndFallback(t *testing.T) {
 	e = gmailEnv(t, cfg, Read)
 	off = len(e.fake.log.raw())
 	out, _ = ok[gmSearchOut](t, e.cs, "search", map[string]any{"server": true, "account": e.g.Name, "query": "x"})
-	if !strings.Contains(e.sent(off), `EXAMINE "[Gmail]/All Mail"`) || out.Count != 2 {
-		t.Errorf("fallback not used: count=%d sent=%q", out.Count, e.sent(off))
+	if !strings.Contains(e.sent(off), `EXAMINE "[Gmail]/All Mail"`) || len(out.Results) != 2 {
+		t.Errorf("fallback not used: count=%d sent=%q", len(out.Results), e.sent(off))
 	}
 }
 
 func TestServerSearchLimitAndEmptyResult(t *testing.T) {
 	e := gmailEnv(t, defaultFake(), Read)
 	out, _ := ok[gmSearchOut](t, e.cs, "search", map[string]any{"server": true, "account": e.g.Name, "query": "x", "limit": 1})
-	if out.Count != 1 || !out.Truncated || out.Results[0].Subject != "beta" || out.UncachedCount != 2 {
+	if len(out.Results) != 1 || !(out.NextCursor != "") || out.Results[0].Subject != "beta" || out.UncachedCount != 2 {
 		t.Errorf("limit 1: %+v", out)
 	}
 
@@ -338,7 +338,7 @@ func TestServerSearchLimitAndEmptyResult(t *testing.T) {
 	cfg.Search = nil
 	e = gmailEnv(t, cfg, Read)
 	out, raw := ok[gmSearchOut](t, e.cs, "search", map[string]any{"server": true, "account": e.g.Name, "query": "x"})
-	if out.Count != 0 || out.Truncated || out.UncachedCount != 0 || !strings.Contains(raw, `"results":[]`) {
+	if len(out.Results) != 0 || (out.NextCursor != "") || out.UncachedCount != 0 || !strings.Contains(raw, `"hits":[]`) {
 		t.Errorf("empty: %s", raw)
 	}
 }
@@ -352,8 +352,8 @@ func TestServerSearchCapsUIDsAtTwentyThousand(t *testing.T) {
 	// 77 and 78 are cached in All Mail and are inside the newest 20000.
 	e := gmailEnv(t, cfg, Read)
 	out, _ := ok[gmSearchOut](t, e.cs, "search", map[string]any{"server": true, "account": e.g.Name, "query": "x", "limit": 500})
-	if out.Count != 2 || !out.Truncated || out.UncachedCount != 20000-2 {
-		t.Errorf("capped: count=%d truncated=%v uncached=%d, want 2 true 19998", out.Count, out.Truncated, out.UncachedCount)
+	if len(out.Results) != 2 || out.Note == "" || out.UncachedCount != 20000-2 {
+		t.Errorf("capped: count=%d truncated=%v uncached=%d, want 2 true 19998", len(out.Results), (out.NextCursor != ""), out.UncachedCount)
 	}
 }
 
