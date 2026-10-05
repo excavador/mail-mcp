@@ -511,16 +511,48 @@ func (c *Cache) fetchBodies(ctx context.Context, a accounts.Account, client *ima
 	if err != nil {
 		return 0, 0, fmt.Errorf("fetch bodies: %w", err)
 	}
-	// Everything slow happens before the transaction: writing blobs (fsync),
-	// parsing, and PDF text extraction (up to 5 s per PDF). The write lock is
-	// then held only for the inserts. Each raw buffer is dropped as soon as
-	// its message is parsed; parsed values are bounded copies.
+	// Everything slow happens before the transaction: writing blobs (fsync)
+	// and parsing. The write lock is then held only for the inserts. Each raw
+	// buffer is dropped as soon as its message is parsed. Parsed text held
+	// between parse and write is capped at maxHeldParsed: past it the pending
+	// messages are written in their own transaction (each with the membership
+	// rows of its UIDs, so a UID is still a member exactly when its message is
+	// indexed) and the parse continues, so one batch cannot hold unbounded text.
 	type item struct {
 		info headerInfo
 		sum  string
 		p    parsed
 	}
-	items := make([]item, 0, len(msgs))
+	var (
+		items        []item
+		held         int
+		stored, rows int
+	)
+	flush := func() error {
+		if len(items) == 0 {
+			return nil
+		}
+		tx, err := c.db.BeginTx(ctx, nil)
+		if err != nil {
+			return fmt.Errorf("begin: %w", err)
+		}
+		defer func() { _ = tx.Rollback() }()
+		for i := range items {
+			it := &items[i]
+			if err := insertMessageTx(ctx, tx, a.Name, it.info, it.sum, it.p); err != nil {
+				return err
+			}
+			stored++
+			for _, u := range pending[it.info.stableID] {
+				if err := addMembershipTx(ctx, tx, a.Name, folder, validity, memberRow{uid: u, stableID: it.info.stableID}); err != nil {
+					return err
+				}
+				rows++
+			}
+		}
+		items, held = nil, 0
+		return tx.Commit()
+	}
 	for i := range msgs {
 		m := msgs[i]
 		raw := m.FindBodySection(section)
@@ -533,32 +565,19 @@ func (c *Cache) fetchBodies(ctx context.Context, a accounts.Account, client *ima
 			return 0, 0, err
 		}
 		p := parseMessage(raw)
-		raw, m.BodySection, msgs[i].BodySection = nil, nil, nil
+		raw, m.BodySection = nil, nil
 		items = append(items, item{info, sum, p})
-	}
-	tx, err := c.db.BeginTx(ctx, nil)
-	if err != nil {
-		return 0, 0, fmt.Errorf("begin: %w", err)
-	}
-	defer func() { _ = tx.Rollback() }()
-	stored, rows := 0, 0
-	for i := range items {
-		it := &items[i]
-		if err := insertMessageTx(ctx, tx, a.Name, it.info, it.sum, it.p); err != nil {
-			return 0, 0, err
-		}
-		it.p = parsed{}
-		stored++
-		for _, u := range pending[it.info.stableID] {
-			if err := addMembershipTx(ctx, tx, a.Name, folder, validity, memberRow{uid: u, stableID: it.info.stableID}); err != nil {
+		held += parsedSize(p)
+		if held >= maxHeldParsed {
+			if err := flush(); err != nil {
 				return 0, 0, err
 			}
-			rows++
 		}
 	}
-	// All or nothing: a failure above rolls the batch back (blobs stay, they
-	// are write-once and harmless), so no UID is a member without its message.
-	return stored, rows, tx.Commit()
+	if err := flush(); err != nil {
+		return 0, 0, err
+	}
+	return stored, rows, nil
 }
 
 // --- index access -----------------------------------------------------------

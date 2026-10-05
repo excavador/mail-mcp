@@ -31,15 +31,11 @@ func TestCleanBody(t *testing.T) {
 		{"forward only, header on top", "From: Carol <carol@example.com>\nDate: Mon, 5 Jan 2026\nSubject: Invoice 42\nTo: alice@example.com\n\nPlease pay invoice 42.", ForwardedMarker + "\n\nPlease pay invoice 42."},
 		{"apple forward", "Look at this\n\nBegin forwarded message:\n\nFrom: Carol <c@example.com>\nSubject: Offer\nDate: 5 January 2026\nTo: me@example.com\n\nThe offer is valid.", "Look at this\n\n" + ForwardedMarker + "\n\nThe offer is valid."},
 		{"only quote keeps original", "> a\n> b", "> a\n> b"},
-		{"almost all quote keeps original", long + "\n" + "On Mon, Jan 5, 2026 at 10:00 AM Bob <b@example.com> wrote:", ""}, // placeholder, checked below
+		{"header at the end only drops the header", long + "\n" + "On Mon, Jan 5, 2026 at 10:00 AM Bob <b@example.com> wrote:", strings.TrimSpace(long)},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			got := CleanBody(tc.in)
 			want := tc.want
-			if tc.name == "almost all quote keeps original" {
-				// the header is at the very end: stripping removes only it
-				want = strings.TrimSpace(long)
-			}
 			if got != want {
 				t.Fatalf("CleanBody(%q)\n got %q\nwant %q", tc.in, got, want)
 			}
@@ -47,14 +43,13 @@ func TestCleanBody(t *testing.T) {
 	}
 }
 
-func TestCleanBodyKeepsOriginalWhenNearlyEverythingGoes(t *testing.T) {
-	body := "ok\n\nOn Mon, Jan 5, 2026 at 10:00 AM Bob <b@example.com> wrote:\n" + strings.Repeat("> quoted line of text\n", 40)
-	// "ok" is 0.3% of the body but the body is non-trivial: keep it all.
-	if got := CleanBody(body); got != strings.TrimSpace(body) {
-		t.Fatalf("expected original kept, got %q", got)
+func TestCleanBodyShortReplyOverLongQuoteIsKept(t *testing.T) {
+	body := "ok\n\nOn Mon, Jan 5, 2026 at 10:00 AM Bob <b@example.com> wrote:\n" + strings.Repeat("> quoted line of text\n", 400)
+	if got := CleanBody(body); got != "ok" {
+		t.Fatalf("expected the new reply only, got %d bytes %q", len(got), got[:min(len(got), 40)])
 	}
-	// A trivial body may shrink to its one line.
-	if got := CleanBody("ok\n> x\n> y"); got != "ok" {
+	// Nothing left at all: the original is kept so the message stays findable.
+	if got := CleanBody("> a\n> b"); got != "> a\n> b" {
 		t.Fatalf("got %q", got)
 	}
 }
@@ -62,5 +57,25 @@ func TestCleanBodyKeepsOriginalWhenNearlyEverythingGoes(t *testing.T) {
 func TestCleanBodyEmpty(t *testing.T) {
 	if CleanBody("  \n ") != "" {
 		t.Fatal("blank body must stay empty")
+	}
+}
+
+func TestStripC0(t *testing.T) {
+	if got := stripC0("a\x01b\x02c\td\ne\x7ff\r"); got != "abc\td\nef" {
+		t.Fatalf("got %q", got)
+	}
+}
+
+func TestRewriteBodyFilterSkipsQuotedPhrases(t *testing.T) {
+	for in, want := range map[string]string{
+		`body:foo`:               `{body_new body_full}:foo`,
+		`"body:foo"`:             `"body:foo"`,
+		`"a" OR body:x`:          `"a" OR {body_new body_full}:x`,
+		`"say ""body:"" now"`:    `"say ""body:"" now"`,
+		`subject:s AND body:"y"`: `subject:s AND {body_new body_full}:"y"`,
+	} {
+		if got := rewriteBodyFilter(in); got != want {
+			t.Errorf("%s: got %s want %s", in, got, want)
+		}
 	}
 }

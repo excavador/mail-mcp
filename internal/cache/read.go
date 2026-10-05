@@ -780,7 +780,32 @@ func SubjectShape(s string) string {
 // bodyColRE finds a "body:" column filter in a user-supplied FTS5 expression.
 var bodyColRE = regexp.MustCompile(`(?i)(^|[\s(])body\s*:`)
 
-// fts2Query builds the search over message_fts2, plus attachment text when
+// rewriteBodyFilter maps a "body:" column filter to both body columns, leaving
+// double-quoted phrases alone ("" inside a phrase is an escaped quote, which
+// toggles the state twice).
+func rewriteBodyFilter(expr string) string {
+	var out strings.Builder
+	seg := 0
+	inQuote := false
+	flush := func(end int) {
+		part := expr[seg:end]
+		if !inQuote {
+			part = bodyColRE.ReplaceAllString(part, "${1}{body_new body_full}:")
+		}
+		out.WriteString(part)
+		seg = end
+	}
+	for i := 0; i < len(expr); i++ {
+		if expr[i] == '"' {
+			flush(i)
+			inQuote = !inQuote
+		}
+	}
+	flush(len(expr))
+	return out.String()
+}
+
+// fts2Query builds the search over message_fts2, plus attachment file names when
 // the query is the quoted-phrase form (ftsSyntax false). In FTS5-syntax mode
 // the user's own column filters would break on attachment_fts, whose columns
 // differ, so attachments are left out there and "body:" is mapped to both
@@ -797,7 +822,7 @@ func fts2Query(expr string, ftsSyntax bool, and string, fa []any, limit int) (st
 		FROM (SELECT snippet(message_fts2, 4, char(1), char(2), '…', 20) AS a, snippet(message_fts2, 5, char(1), char(2), '…', 20) AS b
 		      FROM message_fts2 WHERE message_fts2.rowid = hit.rid AND message_fts2 MATCH ?))`
 	if ftsSyntax {
-		expr = bodyColRE.ReplaceAllString(expr, "${1}{body_new body_full}:")
+		expr = rewriteBodyFilter(expr)
 		query := `WITH hit AS (
 	SELECT message_fts2.rowid AS rid, m.account AS account, m.stable_id AS stable_id, ` + dateCol + ` AS d
 	FROM message_fts2 JOIN messages m ON m.rowid = message_fts2.rowid
@@ -818,21 +843,21 @@ ORDER BY hit.d DESC, hit.account, hit.stable_id`
 	SELECT MIN(attachment_fts.rowid) AS rid, m.account AS account, m.stable_id AS stable_id, ` + dateCol + ` AS d
 	FROM attachment_fts JOIN messages m ON m.account = attachment_fts.account AND m.stable_id = attachment_fts.stable_id
 	WHERE attachment_fts MATCH ?` + and + `
+	  AND NOT EXISTS (SELECT 1 FROM mh WHERE mh.account = m.account AND mh.stable_id = m.stable_id)
 	GROUP BY m.account, m.stable_id
 	ORDER BY d DESC, m.account, m.stable_id LIMIT ?
 ), hit AS (
 	SELECT rid, account, stable_id, d, 0 AS att FROM mh
 	UNION ALL
 	SELECT rid, account, stable_id, d, 1 FROM ah
-	WHERE NOT EXISTS (SELECT 1 FROM mh WHERE mh.account = ah.account AND mh.stable_id = ah.stable_id)
-	ORDER BY d DESC, account, stable_id LIMIT ?
+	ORDER BY att, d DESC, account, stable_id LIMIT ?
 )
 SELECT hit.account, hit.stable_id, hit.d, m.from_addr, m.subject,
 	CASE WHEN hit.att = 0 THEN ` + msgSnip + `
-	ELSE (SELECT '[attachment: ' || filename || '] ' || snippet(attachment_fts, 4, '[', ']', '…', 20)
+	ELSE (SELECT 'attachment: ' || snippet(attachment_fts, 3, '[', ']', '…', 20)
 	      FROM attachment_fts WHERE attachment_fts.rowid = hit.rid AND attachment_fts MATCH ?) END
 FROM hit JOIN messages m ON m.account = hit.account AND m.stable_id = hit.stable_id
-ORDER BY hit.d DESC, hit.account, hit.stable_id`
+ORDER BY hit.att, hit.d DESC, hit.account, hit.stable_id`
 	args := []any{expr}
 	args = append(args, fa...)
 	args = append(args, limit+1, expr)

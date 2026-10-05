@@ -10,14 +10,6 @@ import (
 // itself is kept.
 const ForwardedMarker = "[forwarded message]"
 
-// minTrivialBody is the size below which CleanBody never falls back on the
-// "removed nearly everything" rule: a one-line reply over a long quote is
-// legitimately short.
-const minTrivialBody = 200
-
-// keepFraction is the share of a non-trivial body that must survive stripping.
-const keepFraction = 0.05
-
 var (
 	// Reply headers. Gmail wraps the line, so the matcher is given up to
 	// three consecutive lines joined by spaces and must match all of them.
@@ -100,10 +92,11 @@ func isSigDelimiter(l string) bool {
 // signatures. A forwarded message keeps its content; only its header block is
 // replaced by ForwardedMarker.
 //
-// It is conservative. If nothing would remain, or a non-trivial body would
-// lose more than 95% of its text, the original (trimmed) is returned, since a
-// message whose only content is a forward or a bottom-posted answer must stay
-// findable.
+// It is conservative in one way only: if nothing would remain (a body that is
+// all quote, or a bottom-posted answer under a reply header) the original
+// (trimmed) is returned, so the message stays findable through body_new. A
+// short new reply over a long quote is the case body_new exists for, so it is
+// kept short; body_full still holds the quote.
 func CleanBody(text string) string {
 	orig := strings.TrimSpace(text)
 	if orig == "" {
@@ -171,9 +164,6 @@ func CleanBody(text string) string {
 	}
 	cleaned := strings.TrimSpace(collapseBlank(strings.Join(out, "\n")))
 	if cleaned == "" {
-		return orig
-	}
-	if len(orig) >= minTrivialBody && float64(len(cleaned)) < keepFraction*float64(len(orig)) {
 		return orig
 	}
 	return cleaned

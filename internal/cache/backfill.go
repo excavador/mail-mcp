@@ -23,7 +23,6 @@ const (
 	backfillSlice    = 750 * time.Millisecond
 	backfillMinYield = 50 * time.Millisecond
 	backfillLogEvery = time.Minute
-	backfillMaxHeld  = 32 << 20 // parsed text held between parse and write
 )
 
 // BackfillStatus is the progress of the message_fts2 backfill.
@@ -236,17 +235,14 @@ FROM messages WHERE rowid > ? AND rowid <= ? ORDER BY rowid LIMIT ?`, last, maxR
 			} else {
 				missing++
 			}
-			held += len(p.Body) + len(p.BodyNew)
-			for _, a := range p.Atts {
-				held += len(a.Text)
-			}
+			held += parsedSize(p)
 			items = append(items, item{r.rid, r.account, r.id, p})
 		default:
 			return false, 0, fmt.Errorf("check fts2 row: %w", err)
 		}
 		n++
 		lastDone = r.rid
-		if time.Since(began) >= backfillSlice || held >= backfillMaxHeld {
+		if time.Since(began) >= backfillSlice || held >= maxHeldParsed {
 			break
 		}
 	}
@@ -271,4 +267,17 @@ FROM messages WHERE rowid > ? AND rowid <= ? ORDER BY rowid LIMIT ?`, last, maxR
 		return false, 0, fmt.Errorf("commit: %w", err)
 	}
 	return false, missing, nil
+}
+
+// maxHeldParsed caps the parsed text held between parsing and writing, in
+// refresh batches and in the backfill alike.
+const maxHeldParsed = 32 << 20
+
+// parsedSize is the approximate memory a parsed message holds.
+func parsedSize(p parsed) int {
+	n := len(p.Body) + len(p.BodyNew) + len(p.Subject) + len(p.From) + len(p.To) + len(p.Cc)
+	for _, a := range p.Atts {
+		n += len(a.Filename) + len(a.Mime) + 128
+	}
+	return n
 }

@@ -1,8 +1,6 @@
 package cache
 
 import (
-	"bytes"
-	"compress/zlib"
 	"context"
 	"encoding/base64"
 	"fmt"
@@ -46,26 +44,18 @@ func mimeWithPDF(body string, pdf []byte) []byte {
 		base64.StdEncoding.EncodeToString(pdf) + "\r\n--XX--\r\n")
 }
 
-func TestExtractAttachmentsAndPDFText(t *testing.T) {
+func TestExtractAttachmentsMetadataOnly(t *testing.T) {
 	raw := mimeWithPDF("see attached", miniPDF("Thermostat Quotation 4711"))
 	p := parseMessage(raw)
 	if len(p.Atts) != 2 {
 		t.Fatalf("want 2 attachments, got %+v", p.Atts)
 	}
 	img, pdfa := p.Atts[0], p.Atts[1]
-	if img.Part != "2" || img.Filename != "logo.png" || img.Mime != "image/png" || !img.Inline || img.ContentID != "logo@x" || img.Size != 8 || img.SHA256 == "" || img.TextExtracted {
+	if img.Part != "2" || img.Filename != "logo.png" || img.Mime != "image/png" || !img.Inline || img.ContentID != "logo@x" || img.Size != 8 || img.SHA256 == "" {
 		t.Errorf("image meta wrong: %+v", img)
 	}
-	if pdfa.Part != "3" || pdfa.Inline || !pdfa.TextExtracted || !strings.Contains(pdfa.Text, "Thermostat") {
+	if pdfa.Part != "3" || pdfa.Inline || pdfa.Filename != "offer.pdf" || pdfa.Mime != "application/pdf" || pdfa.SHA256 == "" {
 		t.Errorf("pdf meta wrong: %+v", pdfa)
-	}
-}
-
-func TestPDFTextSurvivesGarbage(t *testing.T) {
-	for _, in := range [][]byte{nil, []byte("%PDF-1.4\ngarbage"), []byte(strings.Repeat("\x00", 4096)), miniPDF("x")[:100]} {
-		if s, ok := pdfText(in); ok && s == "" {
-			t.Errorf("ok with empty text")
-		}
 	}
 }
 
@@ -112,15 +102,15 @@ func TestBackfillIndexesExistingMessagesAndSwitchesOver(t *testing.T) {
 	if tb, ready := c.FTSTable(); tb != "message_fts2" || !ready {
 		t.Fatalf("want fts2, got %s %v", tb, ready)
 	}
-	// A PDF-only match still returns the message, marked as an attachment hit.
-	hits, _, err := c.Search(ctx, SearchQuery{Text: "Quotation"})
+	// A file-name-only match still returns the message, marked as an attachment hit.
+	hits, _, err := c.Search(ctx, SearchQuery{Text: "pdf"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(hits) != 2 {
 		t.Fatalf("want 2 hits (m0,m1; m2 has no blob), got %+v", hits)
 	}
-	if !strings.HasPrefix(hits[0].Snippet, "[attachment: offer.pdf]") || !strings.Contains(hits[0].Snippet, "[Quotation]") {
+	if hits[0].Snippet != "attachment: offer.[pdf]" {
 		t.Errorf("snippet %q", hits[0].Snippet)
 	}
 	// A body match reports a body snippet, not an attachment one.
@@ -129,7 +119,7 @@ func TestBackfillIndexesExistingMessagesAndSwitchesOver(t *testing.T) {
 		t.Fatalf("hits %+v err %v", hits, err)
 	}
 	var n int
-	if err := c.db.QueryRow(`SELECT COUNT(*) FROM attachments WHERE text_extracted = 1`).Scan(&n); err != nil || n != 2 {
+	if err := c.db.QueryRow(`SELECT COUNT(*) FROM attachments WHERE text_extracted = 0`).Scan(&n); err != nil || n != 4 {
 		t.Fatalf("extracted pdfs: %d %v", n, err)
 	}
 	// Re-running is a no-op, and the job survives a reopen as complete.
@@ -162,29 +152,5 @@ func TestBackfillResumesAfterCancel(t *testing.T) {
 	_ = c.db.QueryRow(`SELECT COUNT(*) FROM message_fts2`).Scan(&n)
 	if n != 1200 {
 		t.Fatalf("fts2 rows %d, want 1200 (no duplicates, none missed)", n)
-	}
-}
-
-func TestPDFBounded(t *testing.T) {
-	if !pdfBounded(miniPDF("hello")) {
-		t.Fatal("a normal PDF must pass")
-	}
-	if pdfBounded([]byte("%PDF-1.4\ntrailer\n<< /Size 99999999 /Root 1 0 R >>\n")) {
-		t.Fatal("huge /Size must be refused")
-	}
-	var z bytes.Buffer
-	zw := zlib.NewWriter(&z)
-	_, _ = zw.Write(make([]byte, maxPDFStreamOut+1024))
-	_ = zw.Close()
-	bomb := append([]byte("%PDF-1.4\n1 0 obj\n<< /Filter /FlateDecode /Length 1 >>\nstream\n"), z.Bytes()...)
-	bomb = append(bomb, []byte("\nendstream\nendobj\n")...)
-	if pdfBounded(bomb) {
-		t.Fatal("a decompression bomb must be refused")
-	}
-	if s, ok := pdfText(bomb); ok || s != "" {
-		t.Fatal("pdfText must not extract from a bomb")
-	}
-	if pdfBounded([]byte("1 0 obj\n<< /Filter /LZWDecode >>\nstream\nxx\nendstream\n")) {
-		t.Fatal("unboundable filters must be refused")
 	}
 }
