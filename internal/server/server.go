@@ -20,6 +20,8 @@ import (
 
 	"github.com/excavador/mail-mcp/internal/accounts"
 	"github.com/excavador/mail-mcp/internal/cache"
+	"github.com/excavador/mail-mcp/internal/history"
+	"github.com/excavador/mail-mcp/internal/organise"
 )
 
 // Mode selects which tool set a server carries.
@@ -41,8 +43,37 @@ func readOnly() *mcp.ToolAnnotations {
 	return &mcp.ToolAnnotations{ReadOnlyHint: true, IdempotentHint: true}
 }
 
+// Option supplies what the history and write tools need.
+type Option func(*options)
+
+type options struct {
+	hist          *history.Store
+	org           *organise.Organiser
+	maxUnelicited int
+}
+
+// DefaultMaxUnelicited is the largest apply a client without elicitation may run.
+const DefaultMaxUnelicited = 50
+
+// WithMaxUnelicited sets the most messages one apply_intent may change when the
+// client cannot show the owner a confirmation of its own.
+func WithMaxUnelicited(n int) Option { return func(o *options) { o.maxUnelicited = n } }
+
+// WithHistory adds list_history (both modes) and, with WithOrganiser, lets
+// Admin carry the write tools. One store is shared by every server.
+func WithHistory(h *history.Store) Option { return func(o *options) { o.hist = h } }
+
+// WithOrganiser supplies the preview and apply machinery. It is shared by
+// every server so a token and the per-account write slot mean the same
+// thing wherever they are used.
+func WithOrganiser(g *organise.Organiser) Option { return func(o *options) { o.org = g } }
+
 // New builds one MCP server carrying the tools for mode.
-func New(accts []accounts.Account, store *cache.Cache, version string, mode Mode) *mcp.Server {
+func New(accts []accounts.Account, store *cache.Cache, version string, mode Mode, opts ...Option) *mcp.Server {
+	o := options{maxUnelicited: DefaultMaxUnelicited}
+	for _, f := range opts {
+		f(&o)
+	}
 	s := mcp.NewServer(&mcp.Implementation{Name: "mail-" + mode.String(), Version: version}, nil)
 	byName := map[string]accounts.Account{}
 	for _, a := range accts {
@@ -55,8 +86,15 @@ func New(accts []accounts.Account, store *cache.Cache, version string, mode Mode
 	addFetchMessage(s, byName, store)
 	addSenderStats(s, byName, store)
 	addCacheStatus(s, store)
-	// Write tools (create_folder, apply, undo, reapply) are registered only
-	// for Admin, and arrive with the organise and history work.
+	if o.hist != nil {
+		addListHistory(s, byName, o.hist)
+	}
+	// Write tools exist only on the Admin server: create_folder, preview_intent,
+	// apply_intent, undo and reapply. The Read server cannot be handed them by
+	// any option.
+	if mode == Admin && o.hist != nil && o.org != nil {
+		addWriteTools(s, writeDeps{byName: byName, store: store, hist: o.hist, org: o.org, maxUnelicited: o.maxUnelicited})
+	}
 	return s
 }
 
