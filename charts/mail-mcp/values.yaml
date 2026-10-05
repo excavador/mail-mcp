@@ -52,6 +52,16 @@ cache:
 history:
   existingClaim: ""
 
+# How apply_intent is approved.
+#   client:      the client's own tool-approval prompt (capped at 50 messages
+#                per apply); the server never elicits.
+#   elicitation: the server asks the owner through MCP elicitation forms.
+# Default is client: the Claude Code VS Code extension advertises elicitation
+# but auto-declines it silently, so every apply would be refused. Switch to
+# elicitation once it renders forms (anthropics/claude-code#98978).
+approval:
+  mode: client
+
 resources:
   requests: {cpu: 20m, memory: 64Mi}
   limits: {memory: 128Mi}

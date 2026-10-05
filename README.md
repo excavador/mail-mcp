@@ -92,6 +92,10 @@ v1 will add organising tools and history, guarded by intent approval:
 - **`sender_stats`** — when was the last message from a person, how many have you sent to them
 - **`create_folder`**, **`apply`**, **`undo`**, **`reapply`** — move and label messages with a history of intents, so a mistake can be rolled back
 
+### Approval mode
+
+`--approval-mode` (`APPROVAL_MODE`, chart `approval.mode`) sets how `apply_intent` is approved. `client` (default) never elicits: approval is the client's own tool-approval prompt, which shows the account, action, source, target and count, and an apply of more than `--max-unelicited-apply` (50) messages is refused. `elicitation` asks the owner through MCP elicitation forms; use it once the Claude Code VS Code extension renders them ([anthropics/claude-code#98978](https://github.com/anthropics/claude-code/issues/98978)).
+
 ## What it will not do
 
 **There is no delete tool, and there will not be one.** Moves are reversible; deletes are not. The only way to throw a message away is to move it, so you can undo it later.

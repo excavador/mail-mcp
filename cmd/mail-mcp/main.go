@@ -130,6 +130,16 @@ func main() {
 				Value:   server.DefaultMaxUnelicited,
 				Sources: cli.EnvVars("MAX_UNELICITED_APPLY"),
 			},
+			&cli.StringFlag{
+				Name: "approval-mode",
+				// client: approval is the client's own tool prompt, capped by
+				// --max-unelicited-apply. elicitation: the server asks via MCP
+				// elicitation. Default client until the Claude Code VS Code
+				// extension renders forms (anthropics/claude-code#98978).
+				Usage:   "how apply approval is obtained: client (the client's tool-approval prompt) or elicitation (MCP forms)",
+				Value:   string(server.ApprovalClient),
+				Sources: cli.EnvVars("APPROVAL_MODE"),
+			},
 			&cli.DurationFlag{
 				Name:    "refresh-interval",
 				Usage:   "how often to refresh the cache from each mailbox; 0 disables refreshing",
@@ -149,6 +159,11 @@ func main() {
 func run(ctx context.Context, cmd *cli.Command) error {
 	log := slog.New(slog.NewJSONHandler(os.Stderr, nil))
 	memlimit.Set(log)
+
+	approval, err := server.ParseApprovalMode(cmd.String("approval-mode"))
+	if err != nil {
+		return err
+	}
 
 	accts, err := accounts.Load(cmd.String("accounts"))
 	if err != nil {
@@ -175,7 +190,7 @@ func run(ctx context.Context, cmd *cli.Command) error {
 		_ = store.Close()
 		return err
 	}
-	opts := []server.Option{server.WithHistory(hist), server.WithOrganiser(org), server.WithMaxUnelicited(cmd.Int("max-unelicited-apply"))}
+	opts := []server.Option{server.WithHistory(hist), server.WithOrganiser(org), server.WithMaxUnelicited(cmd.Int("max-unelicited-apply")), server.WithApprovalMode(approval)}
 	// Refreshers stop, and are waited for, before the cache closes under them.
 	ctx, cancel := context.WithCancel(ctx)
 	var wg sync.WaitGroup
@@ -192,6 +207,7 @@ func run(ctx context.Context, cmd *cli.Command) error {
 			store.Run(ctx, log, a, cmd.Duration("refresh-interval"))
 		}()
 	}
+	log.Info("approval", "mode", string(approval), "max_unelicited_apply", cmd.Int("max-unelicited-apply"))
 	log.Info("history", "dir", cmd.String("history-dir"))
 	log.Info("cache", "dir", cmd.String("cache-dir"), "refresh_interval", cmd.Duration("refresh-interval").String())
 

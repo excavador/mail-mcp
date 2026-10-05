@@ -142,6 +142,17 @@
         }
       }
     },
+    "approval": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "mode": {
+          "type": "string",
+          "enum": ["client", "elicitation"],
+          "description": "client: approval is the client's tool-approval prompt, capped per apply. elicitation: MCP forms. See anthropics/claude-code#98978."
+        }
+      }
+    },
     "resources": {
       "type": "object"
     },

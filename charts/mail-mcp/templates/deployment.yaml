@@ -45,6 +45,8 @@ spec:
               value: {{ .Values.auth.adminResourceUrl | quote }}
             - name: SCOPE
               value: {{ .Values.auth.scope | quote }}
+            - name: APPROVAL_MODE
+              value: {{ .Values.approval.mode | default "client" | quote }}
             # Mount roots are owned by root and ignored by fsGroup. Point to
             # subdirectories the app creates itself with MkdirAll; this lets the
             # app own and chmod them to 0700 as a non-root user (65532).

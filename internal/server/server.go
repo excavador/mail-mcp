@@ -15,6 +15,7 @@ package server
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
@@ -50,7 +51,33 @@ type options struct {
 	hist          *history.Store
 	org           *organise.Organiser
 	maxUnelicited int
+	approvalMode  ApprovalMode
 }
+
+// ApprovalMode says how apply_intent obtains the owner's approval.
+type ApprovalMode string
+
+const (
+	// ApprovalClient never elicits: approval is the client's own tool-approval
+	// prompt, capped at maxUnelicited messages. The default, because today's
+	// clients that advertise elicitation do not all render it.
+	ApprovalClient ApprovalMode = "client"
+	// ApprovalElicitation asks the owner through MCP elicitation when the
+	// client declares the capability.
+	ApprovalElicitation ApprovalMode = "elicitation"
+)
+
+// ParseApprovalMode validates s.
+func ParseApprovalMode(s string) (ApprovalMode, error) {
+	switch m := ApprovalMode(s); m {
+	case ApprovalClient, ApprovalElicitation:
+		return m, nil
+	}
+	return "", fmt.Errorf("unknown approval mode %q (want %q or %q)", s, ApprovalClient, ApprovalElicitation)
+}
+
+// WithApprovalMode sets how apply_intent is approved. Default: ApprovalClient.
+func WithApprovalMode(m ApprovalMode) Option { return func(o *options) { o.approvalMode = m } }
 
 // DefaultMaxUnelicited is the largest apply a client without elicitation may run.
 const DefaultMaxUnelicited = 50
@@ -70,7 +97,7 @@ func WithOrganiser(g *organise.Organiser) Option { return func(o *options) { o.o
 
 // New builds one MCP server carrying the tools for mode.
 func New(accts []accounts.Account, store *cache.Cache, version string, mode Mode, opts ...Option) *mcp.Server {
-	o := options{maxUnelicited: DefaultMaxUnelicited}
+	o := options{maxUnelicited: DefaultMaxUnelicited, approvalMode: ApprovalClient}
 	for _, f := range opts {
 		f(&o)
 	}
@@ -93,7 +120,7 @@ func New(accts []accounts.Account, store *cache.Cache, version string, mode Mode
 	// apply_intent, undo and reapply. The Read server cannot be handed them by
 	// any option.
 	if mode == Admin && o.hist != nil && o.org != nil {
-		addWriteTools(s, writeDeps{byName: byName, store: store, hist: o.hist, org: o.org, maxUnelicited: o.maxUnelicited})
+		addWriteTools(s, writeDeps{byName: byName, store: store, hist: o.hist, org: o.org, maxUnelicited: o.maxUnelicited, approvalMode: o.approvalMode})
 	}
 	return s
 }
