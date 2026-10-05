@@ -58,13 +58,20 @@ func (c *Cache) Run(ctx context.Context, log *slog.Logger, a accounts.Account, i
 	if interval <= 0 {
 		return
 	}
-	// One refresh may not outlive max(interval, 10m): a hang is bounded, and
-	// the next tick starts clean.
-	budget := max(interval, 10*time.Minute)
+	// A refresh is cancelled if no batch completes within max(interval, 10m)
+	// (a hang is bounded and the next tick starts clean), but one that keeps
+	// making progress may run on, up to refreshCeiling: the first fill of a
+	// large mailbox takes hours and must not be cut off and restarted.
+	stall := max(interval, 10*time.Minute)
 	refresh := func() {
 		start := time.Now()
-		rctx, cancel := context.WithTimeout(ctx, budget)
+		rctx, touch, cancel := withStallTimeout(ctx, stall, refreshCeiling)
 		defer cancel()
+		logProgress := progressLogger(log, a.Name, progressLogEvery)
+		rctx = WithProgress(rctx, func(p Progress) {
+			touch()
+			logProgress(p)
+		})
 		st, err := c.RefreshOnce(rctx, a)
 		attrs := []any{
 			"account", a.Name, "folders", st.Folders, "new_uids", st.NewUIDs,
@@ -72,6 +79,9 @@ func (c *Cache) Run(ctx context.Context, log *slog.Logger, a accounts.Account, i
 			"took", time.Since(start).Round(time.Millisecond).String(),
 		}
 		if err != nil {
+			if cause := context.Cause(rctx); cause != nil && rctx.Err() != nil {
+				attrs = append(attrs, "cause", cause.Error())
+			}
 			log.Error("cache refresh failed", append(attrs, "error", err.Error())...)
 			return
 		}

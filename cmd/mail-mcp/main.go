@@ -32,6 +32,7 @@ import (
 	"github.com/excavador/mail-mcp/internal/accounts"
 	"github.com/excavador/mail-mcp/internal/cache"
 	"github.com/excavador/mail-mcp/internal/history"
+	"github.com/excavador/mail-mcp/internal/memlimit"
 	"github.com/excavador/mail-mcp/internal/organise"
 	"github.com/excavador/mail-mcp/internal/server"
 )
@@ -147,6 +148,7 @@ func main() {
 
 func run(ctx context.Context, cmd *cli.Command) error {
 	log := slog.New(slog.NewJSONHandler(os.Stderr, nil))
+	memlimit.Set(log)
 
 	accts, err := accounts.Load(cmd.String("accounts"))
 	if err != nil {
