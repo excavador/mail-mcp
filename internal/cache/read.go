@@ -18,6 +18,7 @@ import (
 	"time"
 	"unicode"
 
+	"github.com/emersion/go-imap/v2"
 	"github.com/emersion/go-message"
 	gomail "github.com/emersion/go-message/mail"
 )
@@ -136,6 +137,10 @@ const (
 	maxAddrsListed  = 50
 	listedAddrsNote = "+%d more"
 )
+
+// MaxQueryBytes is the longest search query accepted, by the cache search and
+// by the server-side (X-GM-RAW) search alike.
+const MaxQueryBytes = maxQueryBytes
 
 // ErrQueryLimit is a search refused for its size. Its message is safe to show.
 var ErrQueryLimit = errors.New("query too large")
@@ -278,6 +283,79 @@ ORDER BY hit.d DESC, hit.account, hit.stable_id`
 		hits[i].Folders = fs
 	}
 	return hits, truncated, nil
+}
+
+// HitsByUID resolves UIDs of one folder (as a server-side search returned
+// them) to cached messages through membership. UIDs the cache does not hold
+// are counted in uncached, not looked up. Hits are newest first, at most
+// limit; truncated says more were found than returned.
+func (c *Cache) HitsByUID(ctx context.Context, account, folder string, uids []imap.UID, limit int) (hits []SearchHit, truncated bool, uncached int, err error) {
+	limit = clampLimit(limit)
+	byID := map[string]SearchHit{}
+	// resolved counts membership rows found, one per UID, so uncached is per
+	// UID too (several UIDs never share a stable id in one folder, but the
+	// count would be right if they did).
+	resolved := 0
+	const chunk = 500
+	for start := 0; start < len(uids); start += chunk {
+		end := min(start+chunk, len(uids))
+		args := []any{account, folder}
+		marks := make([]string, 0, end-start)
+		for _, u := range uids[start:end] {
+			marks = append(marks, "?")
+			args = append(args, uint32(u))
+		}
+		rows, qerr := c.db.QueryContext(ctx, `
+SELECT m.account, m.stable_id, `+dateCol+`, m.from_addr, m.subject
+FROM membership s JOIN messages m ON m.account = s.account AND m.stable_id = s.stable_id
+WHERE s.account = ? AND s.folder = ? AND s.uid IN (`+strings.Join(marks, ",")+`)`, args...)
+		if qerr != nil {
+			return nil, false, 0, fmt.Errorf("cache: hits by uid: %w", qerr)
+		}
+		for rows.Next() {
+			var (
+				h    SearchHit
+				unix int64
+			)
+			if serr := rows.Scan(&h.Account, &h.StableID, &unix, &h.From, &h.Subject); serr != nil {
+				_ = rows.Close()
+				return nil, false, 0, fmt.Errorf("cache: hits by uid: %w", serr)
+			}
+			if unix > 0 {
+				h.Date = time.Unix(unix, 0).UTC()
+			}
+			byID[h.StableID] = h
+			resolved++
+		}
+		if rerr := rows.Err(); rerr != nil {
+			_ = rows.Close()
+			return nil, false, 0, fmt.Errorf("cache: hits by uid: %w", rerr)
+		}
+		_ = rows.Close()
+	}
+	uncached = len(uids) - resolved
+
+	hits = make([]SearchHit, 0, len(byID))
+	for _, h := range byID {
+		hits = append(hits, h)
+	}
+	sort.Slice(hits, func(i, j int) bool {
+		if !hits[i].Date.Equal(hits[j].Date) {
+			return hits[i].Date.After(hits[j].Date)
+		}
+		return hits[i].StableID < hits[j].StableID
+	})
+	if truncated = len(hits) > limit; truncated {
+		hits = hits[:limit]
+	}
+	for i := range hits {
+		fs, ferr := c.messageFolders(ctx, hits[i].Account, hits[i].StableID)
+		if ferr != nil {
+			return nil, false, 0, ferr
+		}
+		hits[i].Folders = fs
+	}
+	return hits, truncated, uncached, nil
 }
 
 // addrsLimited renders an address header like addrs, but lists at most

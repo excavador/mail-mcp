@@ -172,13 +172,17 @@ type searchIn struct {
 	Since     string `json:"since,omitempty" jsonschema:"earliest date, RFC 3339 or YYYY-MM-DD"`
 	Until     string `json:"until,omitempty" jsonschema:"latest date, RFC 3339 or YYYY-MM-DD (a bare date includes that whole day)"`
 	Limit     int    `json:"limit,omitempty" jsonschema:"maximum results, default 50, at most 500"`
+	Server    bool   `json:"server,omitempty" jsonschema:"Gmail accounts only: send query verbatim to Gmail as an X-GM-RAW search (Gmail search syntax: from:, label:, has:attachment, ...) over [Gmail]/All Mail instead of searching the cache; needs account; folder, from, since, until and fts_syntax do not apply; matches the cache has not fetched yet are only counted in uncached_count"`
 }
 
 type searchOut struct {
 	Results   []cache.SearchHit `json:"results"`
 	Count     int               `json:"count"`
 	Truncated bool              `json:"truncated" jsonschema:"true when more messages matched than limit; narrow the search rather than raising limit"`
-	Notice    string            `json:"notice"`
+	// UncachedCount is, for server searches, how many matches the server
+	// reported that the cache does not hold yet (a refresh will fetch them).
+	UncachedCount int    `json:"uncached_count,omitempty"`
+	Notice        string `json:"notice"`
 }
 
 // syntaxHint is the part of an FTS5 error worth showing: SQLite's own words
@@ -208,9 +212,15 @@ func addSearch(s *mcp.Server, byName map[string]accounts.Account, store *cache.C
 		Description: "Full-text search over the local message cache (never the mail server), newest first. " +
 			"Returns account, stable_id, date, from, subject, the folders the message is in now, and a body snippet " +
 			"with matches in [brackets]; pass an account and stable_id to fetch_message to read one. " +
-			"The cache holds only what the last refresh fetched (see cache_status).",
+			"The cache holds only what the last refresh fetched (see cache_status). " +
+			"With server=true on a Gmail account the query is instead sent verbatim to Gmail as X-GM-RAW over " +
+			"[Gmail]/All Mail (Gmail's own search syntax); results are the matches the cache holds, with the rest " +
+			"counted in uncached_count, and snippets are empty.",
 		Annotations: readOnly(),
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, in searchIn) (*mcp.CallToolResult, searchOut, error) {
+		if in.Server {
+			return serverSearch(ctx, byName, store, in)
+		}
 		if in.Account != "" {
 			if _, err := account(byName, in.Account); err != nil {
 				return nil, searchOut{}, err
@@ -246,6 +256,77 @@ func addSearch(s *mcp.Server, byName map[string]accounts.Account, store *cache.C
 		}
 		return nil, searchOut{Results: hits, Count: len(hits), Truncated: truncated, Notice: untrustedFieldsNotice}, nil
 	})
+}
+
+// serverSearch answers search with server=true: the query goes to Gmail as
+// X-GM-RAW over All Mail, and the UIDs that come back are mapped to stable ids
+// through the cache's membership for that folder. Nothing is fetched or
+// written; UIDs the cache has not seen yet are only counted.
+func serverSearch(ctx context.Context, byName map[string]accounts.Account, store *cache.Cache, in searchIn) (*mcp.CallToolResult, searchOut, error) {
+	if in.Account == "" {
+		return nil, searchOut{}, errors.New("server search needs an account")
+	}
+	a, err := account(byName, in.Account)
+	if err != nil {
+		return nil, searchOut{}, err
+	}
+	if a.Provider != accounts.Gmail {
+		return nil, searchOut{}, errors.New("server search is available for Gmail accounts only")
+	}
+	q := strings.TrimSpace(in.Query)
+	switch {
+	case q == "":
+		return nil, searchOut{}, errors.New("server search needs a query")
+	case len(q) > cache.MaxQueryBytes:
+		return nil, searchOut{}, fmt.Errorf("%w: query is longer than %d bytes", cache.ErrQueryLimit, cache.MaxQueryBytes)
+	case strings.ContainsAny(q, "\r\n\x00"):
+		return nil, searchOut{}, errors.New("query must be a single line")
+	case in.Folder != "" || in.From != "" || in.Since != "" || in.Until != "" || in.FTSSyntax:
+		return nil, searchOut{}, errors.New("server search takes only account, query and limit")
+	}
+
+	slot := liveSlot(a.Name)
+	select {
+	case slot <- struct{}{}:
+		defer func() { <-slot }()
+	default:
+		return nil, searchOut{}, errors.New("live request already in progress for this account")
+	}
+	ctx, cancel := context.WithTimeout(ctx, liveTimeout)
+	defer cancel()
+	c, err := imapx.Dial(ctx, a)
+	if err != nil {
+		return nil, searchOut{}, imapFail("search", err, a.Name)
+	}
+	defer c.Logout()
+	folder, uids, err := imapx.GmailRawSearch(ctx, c, q)
+	switch {
+	case errors.Is(err, imapx.ErrNoGmailExt):
+		return nil, searchOut{}, errors.New("this server does not support Gmail search (X-GM-EXT-1)")
+	case err != nil:
+		return nil, searchOut{}, imapFail("search", err, a.Name)
+	}
+	// Bound the work on a very broad query: keep the newest UIDs.
+	const maxServerUIDs = 20000
+	capped := false
+	if len(uids) > maxServerUIDs {
+		uids, capped = uids[len(uids)-maxServerUIDs:], true
+	}
+	hits, truncated, uncached, err := store.HitsByUID(ctx, a.Name, folder, uids, in.Limit)
+	if err != nil {
+		return nil, searchOut{}, fail("search", "search failed", err)
+	}
+	for i := range hits {
+		h := &hits[i]
+		h.From, h.Subject, h.Snippet = field(h.From), field(h.Subject), ""
+		for j := range h.Folders {
+			h.Folders[j] = field(h.Folders[j])
+		}
+	}
+	return nil, searchOut{
+		Results: hits, Count: len(hits), Truncated: truncated || capped,
+		UncachedCount: uncached, Notice: untrustedFieldsNotice,
+	}, nil
 }
 
 const (

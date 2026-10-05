@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sort"
+	"strconv"
 	"time"
 
 	"github.com/emersion/go-imap/v2"
@@ -106,8 +107,10 @@ func hasAttr(attrs []imap.MailboxAttr, want imap.MailboxAttr) bool {
 
 type headerInfo struct {
 	stableID string
-	size     int64
-	internal time.Time
+	// gmThreadID is X-GM-THRID in decimal, "" when not fetched (non-Gmail).
+	gmThreadID string
+	size       int64
+	internal   time.Time
 }
 
 func (c *Cache) refreshFolder(ctx context.Context, a accounts.Account, client *imapclient.Client, folder string) (Stats, error) {
@@ -211,12 +214,19 @@ func (c *Cache) refreshBatch(ctx context.Context, a accounts.Account, client *im
 		HeaderFields: idHeaderFields,
 		Peek:         true,
 	}
+	// Gmail with X-GM-EXT-1: ask for X-GM-MSGID (the stable id) and
+	// X-GM-THRID (stored, not keyed on) in the same fetch. Without the
+	// capability the attributes are not requested, as a server that lacks
+	// the extension would reject them.
+	gmail := a.Provider == accounts.Gmail && client.Caps().Has(imap.CapGmailExt1)
 	set := imap.UIDSetNum(uids...)
 	msgs, err := client.Fetch(set, &imap.FetchOptions{
-		UID:          true,
-		RFC822Size:   true,
-		InternalDate: true,
-		BodySection:  []*imap.FetchItemBodySection{hdrSection},
+		UID:           true,
+		RFC822Size:    true,
+		InternalDate:  true,
+		GmailMsgID:    gmail,
+		GmailThreadID: gmail,
+		BodySection:   []*imap.FetchItemBodySection{hdrSection},
 	}).Collect()
 	if err != nil {
 		return st, fmt.Errorf("fetch headers: %w", err)
@@ -232,11 +242,15 @@ func (c *Cache) refreshBatch(ctx context.Context, a accounts.Account, client *im
 				"account", a.Name, "folder", folder, "uid", uint32(m.UID), "size", m.RFC822Size)
 			continue
 		}
-		id, err := stableID(a.Provider, m.FindBodySection(hdrSection), m.RFC822Size, m.InternalDate)
+		id, err := stableIDFor(a.Provider, m.FindBodySection(hdrSection), m.RFC822Size, m.InternalDate, m.GmailMsgID)
 		if err != nil {
 			return st, fmt.Errorf("uid %d: %w", m.UID, err)
 		}
-		infos[m.UID] = headerInfo{stableID: id, size: m.RFC822Size, internal: m.InternalDate}
+		info := headerInfo{stableID: id, size: m.RFC822Size, internal: m.InternalDate}
+		if m.GmailThreadID != 0 {
+			info.gmThreadID = strconv.FormatUint(m.GmailThreadID, 10)
+		}
+		infos[m.UID] = info
 	}
 
 	// One body per stable id, however many UIDs (or folders) carry it.
@@ -438,9 +452,9 @@ func (c *Cache) insertMessage(ctx context.Context, account string, info headerIn
 	}
 	res, err := tx.ExecContext(ctx, `
 INSERT OR IGNORE INTO messages
-	(account, stable_id, blob_sha256, from_addr, to_addr, cc_addr, subject, date_unix, list_id, gh_reason, size, internal_date)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		account, info.stableID, blobSum, p.From, p.To, p.Cc, p.Subject, dateUnix, p.ListID, p.GitHubReason, info.size, info.internal.Unix())
+	(account, stable_id, blob_sha256, from_addr, to_addr, cc_addr, subject, date_unix, list_id, gh_reason, size, internal_date, gm_thread_id)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		account, info.stableID, blobSum, p.From, p.To, p.Cc, p.Subject, dateUnix, p.ListID, p.GitHubReason, info.size, info.internal.Unix(), info.gmThreadID)
 	if err != nil {
 		return fmt.Errorf("index message: %w", err)
 	}

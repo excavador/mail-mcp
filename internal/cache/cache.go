@@ -25,6 +25,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -56,6 +57,7 @@ CREATE TABLE IF NOT EXISTS messages (
 	gh_reason     TEXT    NOT NULL DEFAULT '',
 	size          INTEGER NOT NULL DEFAULT 0,
 	internal_date INTEGER NOT NULL DEFAULT 0,
+	gm_thread_id  TEXT    NOT NULL DEFAULT '',
 	PRIMARY KEY (account, stable_id)
 );
 CREATE INDEX IF NOT EXISTS messages_by_blob ON messages (blob_sha256);
@@ -94,6 +96,55 @@ CREATE TABLE IF NOT EXISTS refreshes (
 );
 `
 
+// schemaVersion is stored in PRAGMA user_version. The index is derived data
+// (blobs are the source of truth and stay), so a different version is not
+// migrated: the index tables are dropped and recreated, and the next refresh
+// re-indexes from the server. Bump it whenever the schema or the meaning of a
+// stable id changes.
+const schemaVersion = 2
+
+// indexTables are the tables the index owns, FTS first (dropping the virtual
+// table removes its shadow tables).
+var indexTables = []string{"message_fts", "messages", "membership", "folders", "refreshes"}
+
+// ensureSchema creates the schema, first wiping the index tables when the
+// database carries a different user_version (0 for a fresh or pre-versioned
+// file). Blobs on disk are untouched.
+func ensureSchema(db *sql.DB) error {
+	var have int
+	if err := db.QueryRow(`PRAGMA user_version`).Scan(&have); err != nil {
+		return fmt.Errorf("read schema version: %w", err)
+	}
+	if have != schemaVersion {
+		existed := false
+		for _, t := range indexTables {
+			var n int
+			if err := db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE name = ?`, t).Scan(&n); err != nil {
+				return fmt.Errorf("inspect schema: %w", err)
+			}
+			if n > 0 {
+				existed = true
+			}
+			if _, err := db.Exec(`DROP TABLE IF EXISTS ` + t); err != nil {
+				return fmt.Errorf("drop %s: %w", t, err)
+			}
+		}
+		if existed {
+			slog.Warn("cache: schema version changed, index discarded; it will be rebuilt by the next refresh (blobs kept)",
+				"have", have, "want", schemaVersion)
+		}
+	}
+	if _, err := db.Exec(schema); err != nil {
+		return fmt.Errorf("create schema: %w", err)
+	}
+	if have != schemaVersion {
+		if _, err := db.Exec(fmt.Sprintf(`PRAGMA user_version = %d`, schemaVersion)); err != nil {
+			return fmt.Errorf("set schema version: %w", err)
+		}
+	}
+	return nil
+}
+
 // Open creates dir if needed and opens (or initialises) the cache in it.
 func Open(dir string) (*Cache, error) {
 	if dir == "" {
@@ -125,7 +176,7 @@ func Open(dir string) (*Cache, error) {
 	if err != nil {
 		return nil, fmt.Errorf("cache: open index: %w", err)
 	}
-	if _, err := db.Exec(schema); err != nil {
+	if err := ensureSchema(db); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("cache: initialise index: %w", err)
 	}

@@ -166,3 +166,52 @@ func ListFolders(ctx context.Context, c *imapclient.Client) ([]Folder, error) {
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
 	return out, nil
 }
+
+// ErrNoGmailExt means the server does not advertise X-GM-EXT-1.
+var ErrNoGmailExt = errors.New("server does not support the Gmail extensions (X-GM-EXT-1)")
+
+// gmailAllMailFallback is the folder searched when LIST marks none \All.
+const gmailAllMailFallback = "[Gmail]/All Mail"
+
+// GmailAllMail returns the name of the folder holding every message: the one
+// LIST marks with the \All special-use attribute, else "[Gmail]/All Mail".
+func GmailAllMail(c *imapclient.Client) (string, error) {
+	list, err := c.List("", "*", nil).Collect()
+	if err != nil {
+		return "", fmt.Errorf("list: %w", err)
+	}
+	for _, m := range list {
+		for _, at := range m.Attrs {
+			if at == imap.MailboxAttrAll {
+				return m.Mailbox, nil
+			}
+		}
+	}
+	return gmailAllMailFallback, nil
+}
+
+// GmailRawSearch runs query verbatim as X-GM-RAW (Gmail's own search syntax)
+// with UID SEARCH in the All Mail folder, opened read-only (EXAMINE). It
+// returns the folder name and the matching UIDs, ascending. c must be logged in.
+func GmailRawSearch(ctx context.Context, c *imapclient.Client, query string) (string, []imap.UID, error) {
+	if !c.Caps().Has(imap.CapGmailExt1) {
+		return "", nil, ErrNoGmailExt
+	}
+	folder, err := GmailAllMail(c)
+	if err != nil {
+		return "", nil, err
+	}
+	if err := ctx.Err(); err != nil {
+		return "", nil, err
+	}
+	if _, err := c.Select(folder, &imap.SelectOptions{ReadOnly: true}).Wait(); err != nil {
+		return "", nil, fmt.Errorf("examine: %w", err)
+	}
+	data, err := c.UIDSearch(&imap.SearchCriteria{GmailRaw: query}, nil).Wait()
+	if err != nil {
+		return "", nil, fmt.Errorf("search: %w", err)
+	}
+	uids := data.AllUIDs()
+	sort.Slice(uids, func(i, j int) bool { return uids[i] < uids[j] })
+	return folder, uids, nil
+}

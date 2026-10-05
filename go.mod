@@ -49,3 +49,8 @@ require (
 	modernc.org/mathutil v1.7.1 // indirect
 	modernc.org/memory v1.12.1 // indirect
 )
+
+// go-imap v2.0.0-beta.8 cannot fetch X-GM-MSGID or send X-GM-RAW. The fork
+// (github.com/excavador/go-imap, tag v2.0.0-beta.8.gmext.1) adds the Gmail
+// extension (X-GM-EXT-1) and tolerant FETCH parsing; the module path is unchanged.
+replace github.com/emersion/go-imap/v2 => github.com/excavador/go-imap/v2 v2.0.0-beta.8.gmext.1
