@@ -15,6 +15,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/emersion/go-imap/v2"
+	"github.com/emersion/go-imap/v2/imapclient"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/excavador/mail-mcp/internal/accounts"
@@ -49,6 +51,9 @@ func fail(tool, msg string, err error, attrs ...any) error {
 func imapFail(tool string, err error, account string) error {
 	if errors.Is(err, imapx.ErrLogin) {
 		return fail(tool, "login failed", err, "account", account)
+	}
+	if errors.Is(err, imapx.ErrTimeout) {
+		return fail(tool, "mail server did not answer in time", err, "account", account)
 	}
 	return fail(tool, "mail server unavailable", err, "account", account)
 }
@@ -94,6 +99,11 @@ type listFoldersOut struct {
 	Count   int          `json:"count"`
 }
 
+// liveTimeout is the IMAP budget of one live call (dial, login, commands),
+// enforced by imapx.Do whatever the server does. The database part of a
+// server search has its own cache.HitsByUIDTimeout (10s), so the longest a
+// server search can take is liveTimeout + imapx's 3s grace + HitsByUIDTimeout,
+// about 33s, under the gateway's timeout.
 const liveTimeout = 20 * time.Second
 
 // liveBusy holds one slot per account, shared by every server in the process:
@@ -138,14 +148,12 @@ func addListFolders(s *mcp.Server, byName map[string]accounts.Account, store *ca
 		default:
 			return nil, listFoldersOut{}, errors.New("live listing already in progress")
 		}
-		ctx, cancel := context.WithTimeout(ctx, liveTimeout)
-		defer cancel()
-		c, err := imapx.Dial(ctx, a)
-		if err != nil {
-			return nil, listFoldersOut{}, imapFail("list_folders", err, a.Name)
-		}
-		defer c.Logout()
-		folders, err := imapx.ListFolders(ctx, c)
+		var folders []imapx.Folder
+		err = imapx.Do(ctx, a, "list_folders", liveTimeout, func(ctx context.Context, c *imapclient.Client) error {
+			var lerr error
+			folders, lerr = imapx.ListFolders(ctx, c)
+			return lerr
+		})
 		if err != nil {
 			return nil, listFoldersOut{}, imapFail("list_folders", err, a.Name)
 		}
@@ -292,18 +300,18 @@ func serverSearch(ctx context.Context, byName map[string]accounts.Account, store
 	default:
 		return nil, searchOut{}, errors.New("live request already in progress for this account")
 	}
-	// The IMAP part has liveTimeout; the database part gets its own budget
-	// (cache.HitsByUIDTimeout) from the request context, not from what is left
-	// of this one.
-	reqCtx := ctx
-	ctx, cancel := context.WithTimeout(ctx, liveTimeout)
-	defer cancel()
-	c, err := imapx.Dial(ctx, a)
-	if err != nil {
-		return nil, searchOut{}, imapFail("search", err, a.Name)
-	}
-	defer c.Logout()
-	folder, uids, err := imapx.GmailRawSearch(ctx, c, q)
+	// The IMAP part has liveTimeout, enforced by imapx.Do; the database part
+	// gets its own budget (cache.HitsByUIDTimeout) from the request context,
+	// not from what is left of this one.
+	var (
+		folder string
+		uids   []imap.UID
+	)
+	err = imapx.Do(ctx, a, "search", liveTimeout, func(ctx context.Context, c *imapclient.Client) error {
+		var serr error
+		folder, uids, serr = imapx.GmailRawSearch(ctx, c, q)
+		return serr
+	})
 	switch {
 	case errors.Is(err, imapx.ErrNoGmailExt):
 		return nil, searchOut{}, errors.New("this server does not support Gmail search (X-GM-EXT-1)")
@@ -316,10 +324,13 @@ func serverSearch(ctx context.Context, byName map[string]accounts.Account, store
 	if len(uids) > maxServerUIDs {
 		uids, capped = uids[len(uids)-maxServerUIDs:], true
 	}
-	hits, truncated, uncached, err := store.HitsByUID(reqCtx, a.Name, folder, uids, in.Limit)
+	dbStart := time.Now()
+	hits, truncated, uncached, err := store.HitsByUID(ctx, a.Name, folder, uids, in.Limit)
 	if err != nil {
-		return nil, searchOut{}, fail("search", "search failed", err)
+		return nil, searchOut{}, fail("search", "search failed", err, "account", a.Name, "phase", "db", "uids", len(uids), "duration", time.Since(dbStart).Round(time.Millisecond).String())
 	}
+	slog.Info("server search", "account", a.Name, "phase", "db", "uids", len(uids), "hits", len(hits),
+		"uncached", uncached, "duration", time.Since(dbStart).Round(time.Millisecond).String())
 	for i := range hits {
 		h := &hits[i]
 		h.From, h.Subject, h.Snippet = field(h.From), field(h.Subject), ""

@@ -12,8 +12,10 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"sort"
+	"sync/atomic"
 	"time"
 
 	"github.com/emersion/go-imap/v2"
@@ -68,11 +70,15 @@ const connectTimeout = 30 * time.Second
 // Cancelling ctx later also closes the returned client.
 //
 // The connection is dialled here, not by imapclient.Dial*, because those take
-// no context: a deadline on the raw connection covers the handshake and the
-// login, and a watcher closes the client if ctx ends mid-way.
+// no context: a watcher closes the raw connection the moment ctx ends, from
+// the TCP connect on, so the TLS handshake, the STARTTLS exchange, the login
+// and every later command are all unblocked by ctx. (go-imap clears the read
+// deadline between responses, so a server that goes quiet is bounded by ctx
+// and by nothing else.)
 func Dial(ctx context.Context, a accounts.Account) (*imapclient.Client, error) {
 	opts := &imapclient.Options{TLSConfig: tlsConfig(a)}
 
+	SetPhase(ctx, "connect")
 	d := &net.Dialer{Timeout: connectTimeout}
 	conn, err := d.DialContext(ctx, "tcp", a.Addr())
 	if err != nil {
@@ -80,47 +86,169 @@ func Dial(ctx context.Context, a accounts.Account) (*imapclient.Client, error) {
 	}
 	_ = conn.SetDeadline(time.Now().Add(connectTimeout))
 
+	// Stage one of the watcher: until Dial returns, ctx ending closes conn.
+	handoff := make(chan struct{})
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = conn.Close()
+		case <-handoff:
+		}
+	}()
+
 	var c *imapclient.Client
 	switch a.TLS {
 	case accounts.Implicit:
+		SetPhase(ctx, "tls")
 		tc := tls.Client(conn, opts.TLSConfig)
 		if err := tc.HandshakeContext(ctx); err != nil {
+			close(handoff)
 			_ = conn.Close()
 			return nil, fmt.Errorf("%s: connect: %w", a.Name, err)
 		}
 		c = imapclient.New(tc, opts)
 	case accounts.StartTLS:
+		SetPhase(ctx, "starttls")
 		c, err = imapclient.NewStartTLS(conn, opts)
 		if err != nil {
+			close(handoff)
 			_ = conn.Close()
 			return nil, fmt.Errorf("%s: connect: %w", a.Name, err)
 		}
 	default:
+		close(handoff)
 		_ = conn.Close()
 		return nil, fmt.Errorf("unknown tls mode %q", a.TLS)
 	}
 
-	// The watcher lives as long as the client, not just the login: a ctx
-	// that ends mid-session (a listing that overruns its deadline) closes
-	// the connection and unblocks whatever command is waiting on it.
+	// Stage two lives as long as the client, not just the login: a ctx that
+	// ends mid-session closes the raw connection, which fails the read loop
+	// and completes every pending command with an error. The raw connection
+	// is closed (not c.Close): that call waits for the read loop to finish.
+	close(handoff)
 	go func() {
 		select {
 		case <-ctx.Done():
-			_ = c.Close()
+			_ = conn.Close()
 		case <-c.Closed():
 		}
 	}()
 
+	SetPhase(ctx, "login")
 	if err := c.Login(a.Username, a.Password()).Wait(); err != nil {
-		_ = c.Close()
+		_ = conn.Close()
+		go func() { _ = c.Close() }()
 		// Never include the password, and keep the message generic: a wrong
 		// password and a disabled app password look identical from here.
+		if ctx.Err() != nil {
+			return nil, fmt.Errorf("%s: login: %w", a.Name, ctx.Err())
+		}
 		return nil, loginError{fmt.Sprintf("%s: login refused for %s", a.Name, a.Username)}
 	}
 	// Past login the deadline would kill a healthy long session; from here
 	// the caller's context is the bound.
 	_ = conn.SetDeadline(time.Time{})
 	return c, nil
+}
+
+// ErrTimeout is what errors.Is matches when Do's budget ran out before the
+// mail server answered.
+var ErrTimeout = errors.New("mail server did not answer in time")
+
+// Phase records how far a session got, for the log of one that did not finish.
+type Phase struct{ v atomic.Value }
+
+// Get returns the last phase reported ("" before any).
+func (p *Phase) Get() string {
+	s, _ := p.v.Load().(string)
+	return s
+}
+
+type phaseKey struct{}
+
+// WithPhase returns a context whose SetPhase calls land in the returned Phase.
+func WithPhase(ctx context.Context) (context.Context, *Phase) {
+	p := &Phase{}
+	return context.WithValue(ctx, phaseKey{}, p), p
+}
+
+// SetPhase reports the step about to run (connect, tls, login, list,
+// examine, search, ...). It does nothing on a context without WithPhase.
+func SetPhase(ctx context.Context, name string) {
+	if p, ok := ctx.Value(phaseKey{}).(*Phase); ok {
+		p.v.Store(name)
+	}
+}
+
+// graceAfterTimeout is how long Do waits, once the budget is spent and the
+// connection closed, for fn to come back and report what it had done.
+const graceAfterTimeout = 3 * time.Second
+
+// Do runs fn on a logged-in client under a hard budget: Do returns within
+// budget plus graceAfterTimeout whatever the server does. The dial and fn run
+// in their own goroutine; when the budget ends the connection is closed (which
+// unblocks every pending command) and Do returns ErrTimeout without waiting
+// longer than the grace period, so a caller holding a slot always gets it back.
+//
+// fn must not touch state the caller reads after a timeout without its own
+// lock: it may still be winding down. Every call logs account, tool, the phase
+// reached, the duration and the outcome.
+func Do(ctx context.Context, a accounts.Account, tool string, budget time.Duration, fn func(ctx context.Context, c *imapclient.Client) error) error {
+	start := time.Now()
+	pctx, ph := WithPhase(ctx)
+	cctx, cancel := context.WithTimeout(pctx, budget)
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				done <- fmt.Errorf("imap session panic: %v", r)
+			}
+		}()
+		c, err := Dial(cctx, a)
+		if err != nil {
+			done <- err
+			return
+		}
+		err = fn(cctx, c)
+		done <- err
+		// Off the caller's path: say goodbye, then drop the connection.
+		_ = c.Logout()
+		cancel()
+		_ = c.Close()
+	}()
+
+	var err error
+	select {
+	case err = <-done:
+	case <-cctx.Done():
+		// The watcher has closed (or is closing) the connection; give fn a
+		// moment to return so work it finished is reported.
+		select {
+		case err = <-done:
+		case <-time.After(graceAfterTimeout):
+			err = cctx.Err()
+		}
+	}
+	outcome := "ok"
+	switch {
+	case err == nil:
+	case errors.Is(cctx.Err(), context.DeadlineExceeded) && ctx.Err() == nil:
+		outcome = "timeout"
+		err = fmt.Errorf("%w (phase %s, after %s): %v", ErrTimeout, ph.Get(), time.Since(start).Round(time.Millisecond), err)
+	case ctx.Err() != nil:
+		outcome = "canceled"
+	default:
+		outcome = "error"
+	}
+	attrs := []any{"account", a.Name, "tool", tool, "phase", ph.Get(), "outcome", outcome, "duration", time.Since(start).Round(time.Millisecond).String()}
+	if outcome == "ok" {
+		slog.Info("imap session", attrs...)
+	} else {
+		slog.Warn("imap session", append(attrs, "err", err)...)
+	}
+	return err
 }
 
 // Folder is one mailbox and how many messages it holds.
@@ -137,10 +265,12 @@ type Folder struct {
 // MOVE STARTTLS UIDPLUS UNSELECT), and one code path for both providers is
 // worth a round trip per folder.
 func ListFolders(ctx context.Context, c *imapclient.Client) ([]Folder, error) {
+	SetPhase(ctx, "list")
 	list, err := c.List("", "*", nil).Collect()
 	if err != nil {
 		return nil, fmt.Errorf("list: %w", err)
 	}
+	SetPhase(ctx, "status")
 	var out []Folder
 	for _, m := range list {
 		if err := ctx.Err(); err != nil {
@@ -194,9 +324,14 @@ func GmailAllMail(c *imapclient.Client) (string, error) {
 // with UID SEARCH in the All Mail folder, opened read-only (EXAMINE). It
 // returns the folder name and the matching UIDs, ascending. c must be logged in.
 func GmailRawSearch(ctx context.Context, c *imapclient.Client, query string) (string, []imap.UID, error) {
+	SetPhase(ctx, "caps")
 	if !c.Caps().Has(imap.CapGmailExt1) {
+		if err := ctx.Err(); err != nil {
+			return "", nil, err // the connection was closed under us, not a missing extension
+		}
 		return "", nil, ErrNoGmailExt
 	}
+	SetPhase(ctx, "list")
 	folder, err := GmailAllMail(c)
 	if err != nil {
 		return "", nil, err
@@ -204,9 +339,11 @@ func GmailRawSearch(ctx context.Context, c *imapclient.Client, query string) (st
 	if err := ctx.Err(); err != nil {
 		return "", nil, err
 	}
+	SetPhase(ctx, "examine")
 	if _, err := c.Select(folder, &imap.SelectOptions{ReadOnly: true}).Wait(); err != nil {
 		return "", nil, fmt.Errorf("examine: %w", err)
 	}
+	SetPhase(ctx, "search")
 	data, err := c.UIDSearch(&imap.SearchCriteria{GmailRaw: query}, nil).Wait()
 	if err != nil {
 		return "", nil, fmt.Errorf("search: %w", err)

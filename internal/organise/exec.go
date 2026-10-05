@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sync"
 	"time"
 
 	"github.com/emersion/go-imap/v2"
@@ -17,12 +18,19 @@ import (
 const (
 	// chunkUIDs UIDs per MOVE or COPY: one command, bounded size.
 	chunkUIDs = 500
-	// applyBudget bounds one apply end to end (dial, moves, re-reading).
-	applyBudget = 10 * time.Minute
+	// applyBudget bounds the IMAP part of one apply (dial, moves). It is
+	// enforced by imapx.Do, and stays under the gateway's request timeout:
+	// an apply that runs out of time keeps what it moved, records it in the
+	// history, and says so; the owner previews the rest again.
+	applyBudget = 30 * time.Second
 	// createBudget bounds create_folder.
-	createBudget = 30 * time.Second
+	createBudget = 20 * time.Second
 	// undoRefreshBudget bounds the refresh undo does before it looks.
-	undoRefreshBudget = 2 * time.Minute
+	undoRefreshBudget = 30 * time.Second
+	// afterApplyRefreshBudget bounds the re-read that follows an apply. A
+	// folder it cannot refresh in time stays stale until the next scheduled
+	// refresh; the apply's own result does not depend on it.
+	afterApplyRefreshBudget = 15 * time.Second
 )
 
 // Touched is one message an apply acted on, by stable id so that it can be
@@ -112,48 +120,40 @@ func folderInfo(c *imapclient.Client, name string) (attrs []imap.MailboxAttr, ok
 // CreateFolder sends CREATE for name, which ValidateNewFolder has accepted.
 // It is idempotent: a folder that already exists is success.
 func (o *Organiser) CreateFolder(ctx context.Context, a accounts.Account, name string) error {
-	ctx, cancel := context.WithTimeout(ctx, createBudget)
-	defer cancel()
-	c, err := imapx.Dial(ctx, a)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = c.Close() }()
-	if attrs, ok, err := folderInfo(c, name); err != nil {
-		return err
-	} else if ok {
-		if isSpecialUse(attrs) {
-			return ErrSpecialUse
-		}
-		return o.store.NoteFolder(ctx, a.Name, name)
-	}
-	if err := c.Create(name, nil).Wait(); err != nil {
-		// Lost a race with another client: fine if it is there now.
-		if _, ok, lerr := folderInfo(c, name); lerr == nil && ok {
+	return imapx.Do(ctx, a, "create_folder", createBudget, func(ctx context.Context, c *imapclient.Client) error {
+		imapx.SetPhase(ctx, "list")
+		if attrs, ok, err := folderInfo(c, name); err != nil {
+			return err
+		} else if ok {
+			if isSpecialUse(attrs) {
+				return ErrSpecialUse
+			}
 			return o.store.NoteFolder(ctx, a.Name, name)
 		}
-		return err
-	}
-	// Make previews see the folder now, without waiting for a refresh.
-	if err := o.store.NoteFolder(ctx, a.Name, name); err != nil {
-		return err
-	}
-	_ = c.Logout().Wait()
-	return nil
+		imapx.SetPhase(ctx, "create")
+		if err := c.Create(name, nil).Wait(); err != nil {
+			// Lost a race with another client: fine if it is there now.
+			if _, ok, lerr := folderInfo(c, name); lerr == nil && ok {
+				return o.store.NoteFolder(ctx, a.Name, name)
+			}
+			return err
+		}
+		// Make previews see the folder now, without waiting for a refresh.
+		if err := o.store.NoteFolder(ctx, a.Name, name); err != nil {
+			return err
+		}
+		return nil
+	})
 }
 
 // RefreshFolder refreshes one folder of the cache (undo does this to the
 // folder it is about to read memberships from).
 func (o *Organiser) RefreshFolder(ctx context.Context, a accounts.Account, folder string) error {
-	ctx, cancel := context.WithTimeout(ctx, undoRefreshBudget)
-	defer cancel()
-	c, err := imapx.Dial(ctx, a)
-	if err != nil {
+	return imapx.Do(ctx, a, "refresh_folder", undoRefreshBudget, func(ctx context.Context, c *imapclient.Client) error {
+		imapx.SetPhase(ctx, "refresh")
+		_, err := o.store.RefreshFolders(ctx, c, a, []string{folder})
 		return err
-	}
-	defer func() { _ = c.Close() }()
-	_, err = o.store.RefreshFolders(ctx, c, a, []string{folder})
-	return err
+	})
 }
 
 // Apply executes an approved preview. The approval itself is the caller's
@@ -231,138 +231,148 @@ func (o *Organiser) Apply(ctx context.Context, a accounts.Account, p *Preview) (
 		already[m.StableID] = true
 	}
 
-	ctx, cancel := context.WithTimeout(ctx, applyBudget)
-	defer cancel()
-	c, err := imapx.Dial(ctx, a)
-	if err != nil {
-		return out, err
-	}
-	defer func() { _ = c.Close() }()
+	// The IMAP part runs under imapx.Do: a server that stops answering costs
+	// applyBudget, not the request. What the moves reported is kept under mu,
+	// because on a timeout Do returns while the session may still be winding
+	// down; the snapshot taken after it is what the history records.
+	var (
+		mu                              sync.Mutex
+		touched, alreadyDone, copiedOut []Touched
+		sessionStarted                  bool // past the checks: a refresh is due
+	)
+	actErr := imapx.Do(ctx, a, "apply_intent", applyBudget, func(ctx context.Context, c *imapclient.Client) error {
+		imapx.SetPhase(ctx, "checks")
+		if in.Action == ActionMove && !c.Caps().Has(imap.CapMove) {
+			// go-imap would fall back to COPY, STORE \Deleted and EXPUNGE; this
+			// server never expunges, so it refuses instead.
+			return ErrNoMoveCap
+		}
+		srcAttrs, ok, err := folderInfo(c, in.Criterion.Folder)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return ErrSourceMissing
+		}
+		if in.Action == ActionMove && (hasAttr(srcAttrs, imap.MailboxAttrAll) || hasAttr(srcAttrs, imap.MailboxAttrNoSelect)) {
+			return SafeError("cannot move out of a folder that holds every message (\\All) or cannot be selected")
+		}
+		dstAttrs, ok, err := folderInfo(c, in.Target)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return ErrTargetMissing
+		}
+		if isSpecialUse(dstAttrs) {
+			return ErrSpecialUse
+		}
 
-	if in.Action == ActionMove && !c.Caps().Has(imap.CapMove) {
-		// go-imap would fall back to COPY, STORE \Deleted and EXPUNGE; this
-		// server never expunges, so it refuses instead.
-		return out, ErrNoMoveCap
-	}
-	srcAttrs, ok, err := folderInfo(c, in.Criterion.Folder)
-	if err != nil {
-		return out, err
-	}
-	if !ok {
-		return out, ErrSourceMissing
-	}
-	if in.Action == ActionMove && (hasAttr(srcAttrs, imap.MailboxAttrAll) || hasAttr(srcAttrs, imap.MailboxAttrNoSelect)) {
-		return out, SafeError("cannot move out of a folder that holds every message (\\All) or cannot be selected")
-	}
-	dstAttrs, ok, err := folderInfo(c, in.Target)
-	if err != nil {
-		return out, err
-	}
-	if !ok {
-		return out, ErrTargetMissing
-	}
-	if isSpecialUse(dstAttrs) {
-		return out, ErrSpecialUse
-	}
+		// SELECT, not EXAMINE: this is the one place the server writes.
+		imapx.SetPhase(ctx, "select")
+		sel, err := c.Select(in.Criterion.Folder, nil).Wait()
+		if err != nil {
+			return err
+		}
+		if sel.UIDValidity != validity {
+			return ErrUIDValidity
+		}
+		mu.Lock()
+		sessionStarted = true
+		mu.Unlock()
 
-	// SELECT, not EXAMINE: this is the one place the server writes.
-	sel, err := c.Select(in.Criterion.Folder, nil).Wait()
-	if err != nil {
-		return out, err
-	}
-	if sel.UIDValidity != validity {
-		return out, ErrUIDValidity
-	}
-
-	// run acts on ms in chunks. Each chunk is one MOVE or COPY; with UIDPLUS the
-	// server says which UIDs it acted on and only those count, without it the
-	// whole chunk is assumed (a UID that had vanished would be counted; undo
-	// copes, it just finds nothing). Ids that were already in the target go to
-	// already instead of touched.
-	run := func(ms []uidMember, action string, touched, already *[]Touched, inTarget map[string]bool) error {
-		for start := 0; start < len(ms); start += chunkUIDs {
-			if err := ctx.Err(); err != nil {
-				return err
-			}
-			chunk := ms[start:min(start+chunkUIDs, len(ms))]
-			uids := make([]imap.UID, len(chunk))
-			for i, m := range chunk {
-				uids[i] = m.uid
-			}
-			set := imap.UIDSetNum(uids...)
-			var done map[imap.UID]bool
-			var have bool
-			var err error
-			if action == ActionMove {
-				var md *imapclient.MoveData
-				md, err = c.Move(set, in.Target).Wait()
-				if err == nil && md != nil {
-					done, have = returnedUIDs(md.SourceUIDs)
+		// run acts on ms in chunks. Each chunk is one MOVE or COPY; with UIDPLUS the
+		// server says which UIDs it acted on and only those count, without it the
+		// whole chunk is assumed (a UID that had vanished would be counted; undo
+		// copes, it just finds nothing). Ids that were already in the target go to
+		// already instead of touched.
+		run := func(ms []uidMember, action string, touched, already *[]Touched, inTarget map[string]bool) error {
+			for start := 0; start < len(ms); start += chunkUIDs {
+				if err := ctx.Err(); err != nil {
+					return err
 				}
-			} else {
-				var cd *imap.CopyData
-				cd, err = c.Copy(set, in.Target).Wait()
-				if err == nil && cd != nil {
-					done, have = returnedUIDs(cd.SourceUIDs)
+				chunk := ms[start:min(start+chunkUIDs, len(ms))]
+				uids := make([]imap.UID, len(chunk))
+				for i, m := range chunk {
+					uids[i] = m.uid
 				}
-			}
-			if err != nil {
-				return err
-			}
-			for _, m := range chunk {
-				if have && !done[m.uid] {
-					continue
-				}
-				t := Touched{StableID: m.id, FromFolder: in.Criterion.Folder}
-				if inTarget[m.id] {
-					*already = append(*already, t)
+				set := imap.UIDSetNum(uids...)
+				var done map[imap.UID]bool
+				var have bool
+				var err error
+				imapx.SetPhase(ctx, action)
+				if action == ActionMove {
+					var md *imapclient.MoveData
+					md, err = c.Move(set, in.Target).Wait()
+					if err == nil && md != nil {
+						done, have = returnedUIDs(md.SourceUIDs)
+					}
 				} else {
-					*touched = append(*touched, t)
+					var cd *imap.CopyData
+					cd, err = c.Copy(set, in.Target).Wait()
+					if err == nil && cd != nil {
+						done, have = returnedUIDs(cd.SourceUIDs)
+					}
 				}
+				if err != nil {
+					return err
+				}
+				mu.Lock()
+				for _, m := range chunk {
+					if have && !done[m.uid] {
+						continue
+					}
+					t := Touched{StableID: m.id, FromFolder: in.Criterion.Folder}
+					if inTarget[m.id] {
+						*already = append(*already, t)
+					} else {
+						*touched = append(*touched, t)
+					}
+				}
+				mu.Unlock()
+			}
+			return nil
+		}
+
+		if len(members) > 0 {
+			if err := run(members, in.Action, &touched, &alreadyDone, already); err != nil {
+				return err
+			}
+		}
+		if len(copyBack) > 0 {
+			// COPY, not MOVE: these were in the target before the apply, and a
+			// move would strip that label. The copy adds the source back.
+			var none []Touched
+			if err := run(copyBack, ActionLabel, &copiedOut, &none, nil); err != nil {
+				return err
 			}
 		}
 		return nil
-	}
-
-	var actErr error
-	if len(members) > 0 {
-		actErr = run(members, in.Action, &out.Touched, &out.AlreadyInTarget, already)
-	}
-	if actErr == nil && len(copyBack) > 0 {
-		// COPY, not MOVE: these were in the target before the apply, and a
-		// move would strip that label. The copy adds the source back.
-		var none []Touched
-		actErr = run(copyBack, ActionLabel, &out.CopiedBack, &none, nil)
+	})
+	mu.Lock()
+	out.Touched, out.AlreadyInTarget, out.CopiedBack = touched, alreadyDone, copiedOut
+	started := sessionStarted
+	mu.Unlock()
+	if !started && actErr != nil {
+		// Refused or failed before anything was changed: nothing to re-read.
+		return out, actErr
 	}
 
 	// Re-read the folders so membership says where things are now, whether or
-	// not every chunk went through. A fresh context: the apply's may be what
-	// ended.
-	rctx, rcancel := context.WithTimeout(context.WithoutCancel(ctx), undoRefreshBudget)
-	defer rcancel()
-	rc := c
-	if actErr != nil {
-		// The connection that just failed may be dead (or mid-command); read
-		// the folders over a fresh one, or membership stays stale.
-		_ = c.Close()
-		fresh, derr := imapx.Dial(rctx, a)
-		if derr != nil {
-			slog.Warn("organise: refresh after failed apply could not reconnect", "account", a.Name, "err", derr)
-			rc = nil
-		} else {
-			defer func() { _ = fresh.Close() }()
-			rc = fresh
-		}
-	}
-	if rc == nil {
-		// already logged
-	} else if _, rerr := o.store.RefreshFolders(rctx, rc, a, []string{in.Criterion.Folder, in.Target}); rerr != nil {
+	// not every chunk went through, over a fresh connection (the one that
+	// just failed may be dead or mid-command) and a fresh context (the
+	// apply's may be what ended). Its failure is logged, not returned: the
+	// apply's own result stands, and the next scheduled refresh catches up.
+	if rerr := imapx.Do(context.WithoutCancel(ctx), a, "apply_refresh", afterApplyRefreshBudget, func(ctx context.Context, c *imapclient.Client) error {
+		imapx.SetPhase(ctx, "refresh")
+		_, err := o.store.RefreshFolders(ctx, c, a, []string{in.Criterion.Folder, in.Target})
+		return err
+	}); rerr != nil {
 		slog.Warn("organise: refresh after apply failed", "account", a.Name, "err", rerr)
 	}
 	if actErr != nil {
 		return out, fmt.Errorf("%w (after %d of %d messages)", actErr, len(out.Touched)+len(out.AlreadyInTarget)+len(out.CopiedBack), len(members)+len(copyBack))
 	}
-	_ = c.Logout().Wait()
 	return out, nil
 }
 
