@@ -33,7 +33,7 @@ var (
 	undoRefreshBudget = 45 * time.Second
 	// afterApplyRefreshBudget bounds the re-read after an apply; a folder it
 	// cannot refresh in time stays stale until the next scheduled refresh.
-	afterApplyRefreshBudget = 15 * time.Second
+	afterApplyRefreshBudget = 45 * time.Second
 )
 
 // Budgets are the IMAP time budgets of this package.
