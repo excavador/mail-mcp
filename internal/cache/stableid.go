@@ -28,21 +28,23 @@ var idHeaderFields = []string{"X-Pm-Internal-Id", "Message-Id", "Date", "Subject
 // X-Pm-Internal-Id, which is Proton's own message id and does not change when
 // the message changes folder. It is the key.
 //
-// Gmail: the right key is X-GM-MSGID (IMAP extension X-GM-EXT-1), a 64-bit id
-// Gmail assigns once per message regardless of how many labels carry it.
-// go-imap v2.0.0-beta.8 cannot fetch it: FetchOptions has no field for it,
-// the item list the client writes is fixed, and a server reply carrying an
-// attribute the library does not know makes the fetch fail with "unsupported
-// msg-att name". Using it would mean forking the library, which we do not do.
-// So Gmail falls back to the Message-ID header, disambiguated with the
+// Gmail: the key is X-GM-MSGID (IMAP extension X-GM-EXT-1), a 64-bit id
+// Gmail assigns once per message regardless of how many labels carry it, so
+// the same message under INBOX, a label and [Gmail]/All Mail has one id. It is
+// used, as "gm:<decimal>", when the account is Gmail, the server advertises
+// X-GM-EXT-1 and the fetch returned a non-zero value (see stableIDFor).
+// go-imap v2.0.0-beta.8 could not fetch it; the excavador/go-imap fork
+// (v2.0.0-beta.8.gmext.1, see go.mod) can.
+//
+// Without it Gmail falls back to the Message-ID header, disambiguated with the
 // message's RFC822.SIZE and INTERNALDATE: Message-ID alone is not unique
 // (senders reuse and omit it), but a different message with the same
 // Message-ID, the same size and the same arrival second is, for a mailbox,
 // the same message. Gmail reports identical size and internal date for a
 // message under every label, so [Gmail]/All Mail and a label folder agree.
-// If go-imap gains X-GM-MSGID support, switch to it: it is exact where this
-// is a heuristic. Changing the key later means one full re-index, because
-// ids are namespaced by scheme and the two schemes never collide.
+// That scheme is a heuristic where X-GM-MSGID is exact. Ids are namespaced by
+// scheme ("gm:", "mid:") and the schemes never collide; a mailbox cached
+// under "mid:" and later refreshed under "gm:" is indexed again in full.
 //
 // Any provider that lacks its preferred key (a Bridge version that does not
 // stamp the header) uses the same Message-ID scheme rather than failing.
@@ -72,4 +74,14 @@ func stableID(p accounts.Provider, header []byte, size int64, internal time.Time
 	}
 	sum := sha256.Sum256([]byte(mid + "\x00" + strconv.FormatInt(size, 10) + "\x00" + strconv.FormatInt(internal.Unix(), 10)))
 	return "mid:" + hex.EncodeToString(sum[:]), nil
+}
+
+// stableIDFor is stableID with the Gmail extension in front: when the account
+// is Gmail and gmMsgID (X-GM-MSGID, 0 when not fetched or not supported) is
+// non-zero, the id is "gm:<decimal>". Anything else is stableID.
+func stableIDFor(p accounts.Provider, header []byte, size int64, internal time.Time, gmMsgID uint64) (string, error) {
+	if p == accounts.Gmail && gmMsgID != 0 {
+		return "gm:" + strconv.FormatUint(gmMsgID, 10), nil
+	}
+	return stableID(p, header, size, internal)
 }
