@@ -54,6 +54,10 @@ func addWriteTools(s *mcp.Server, d writeDeps) {
 	addApplyIntent(s, d)
 	addUndo(s, d)
 	addReapply(s, d)
+	addSetSenderKind(s, d)
+	addTagMessages(s, d)
+	addUntagMessages(s, d)
+	addSaveQuery(s, d)
 }
 
 // --- create_folder ----------------------------------------------------------
@@ -545,6 +549,8 @@ type historyView struct {
 	Kind            string              `json:"kind"`
 	Action          string              `json:"action,omitempty"`
 	Preview         history.PreviewInfo `json:"preview"`
+	OldKind         string              `json:"old_kind,omitempty"`
+	NewKind         string              `json:"new_kind,omitempty"`
 	TouchedCount    int                 `json:"touched_count"`
 	AlreadyInTarget int                 `json:"already_in_target,omitempty"`
 	CopiedBack      int                 `json:"copied_back,omitempty"`
@@ -626,6 +632,7 @@ func addListHistory(s *mcp.Server, byName map[string]accounts.Account, hist *his
 				Preview: history.PreviewInfo{
 					Matched: r.Preview.Matched, Sampled: r.Preview.Sampled, ApprovedBy: field(r.Preview.ApprovedBy),
 				},
+				OldKind: field(r.OldKind), NewKind: field(r.NewKind),
 				TouchedCount: touchedCount(r), AlreadyInTarget: countIDs(r.AlreadyInTarget), CopiedBack: countIDs(r.CopiedBack), Skipped: r.Skipped, NotPreviewed: r.NotPreviewed,
 				Error: field(r.Error), Undoes: field(r.Undoes), Reapplies: field(r.Reapplies),
 				Untrusted: historyUntrusted{Intent: cleanIntent(r.Intent), Target: field(r.Target)},
@@ -647,26 +654,45 @@ func addUndo(s *mcp.Server, d writeDeps) {
 		Name: "undo",
 		Description: "Preview reversing an applied move: the messages it moved go back to where they came from, found " +
 			"by stable id so it works after UIDs changed. Returns a preview token; apply_intent executes it, with " +
-			"the owner's approval. Undo of a label action is not supported yet.",
-		// Only previews (and re-reads the target folder); apply_intent writes.
-		Annotations: readOnly(),
-	}, func(ctx context.Context, _ *mcp.CallToolRequest, in historyIDIn) (*mcp.CallToolResult, previewOut, error) {
+			"the owner's approval. Undo of a label action is not supported yet. Local changes are different: " +
+			"undo of tag_messages, untag_messages or set_sender_kind takes effect at once (no preview token, no mailbox " +
+			"access) and the result says what was restored.",
+		// Only previews (and re-reads the target folder) for an intent;
+		// apply_intent writes. A local kind is reversed here, in the cache only.
+		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: false, DestructiveHint: ptr(false), IdempotentHint: false, OpenWorldHint: ptr(false)},
+	}, func(ctx context.Context, _ *mcp.CallToolRequest, in historyIDIn) (*mcp.CallToolResult, any, error) {
 		rec, ok := d.hist.Get(in.HistoryID)
 		if !ok {
-			return nil, previewOut{}, errors.New("no such history record")
+			return nil, nil, errors.New("no such history record")
 		}
+		switch rec.Kind {
+		case history.KindSetSenderKind, history.KindTagMessages, history.KindUntagMessages:
+			out, err := undoLocal(ctx, d, rec)
+			return nil, out, err
+		}
+		p, err := undoIntent(ctx, d, rec)
+		if err != nil {
+			return nil, nil, err
+		}
+		return nil, p, nil
+	})
+}
+
+// undoIntent previews reversing an applied move.
+func undoIntent(ctx context.Context, d writeDeps, rec history.Record) (previewOut, error) {
+	{
 		if (rec.Kind != organise.KindApply && rec.Kind != organise.KindReapply) || rec.Intent == nil {
-			return nil, previewOut{}, errors.New("only an applied intent can be undone")
+			return previewOut{}, errors.New("only an applied intent can be undone")
 		}
 		if rec.Action != organise.ActionMove {
-			return nil, previewOut{}, errors.New("undo of label not supported yet")
+			return previewOut{}, errors.New("undo of label not supported yet")
 		}
 		a, err := account(d.byName, rec.Account)
 		if err != nil {
-			return nil, previewOut{}, err
+			return previewOut{}, err
 		}
 		if d.hist.Undone(rec.ID) {
-			return nil, previewOut{}, errors.New("that record was already undone")
+			return previewOut{}, errors.New("that record was already undone")
 		}
 		folders := map[string]bool{}
 		for f := range rec.Touched {
@@ -676,7 +702,7 @@ func addUndo(s *mcp.Server, d writeDeps) {
 			folders[f] = true
 		}
 		if len(folders) > 1 {
-			return nil, previewOut{}, errors.New("record touched several source folders; cannot undo it as one step")
+			return previewOut{}, errors.New("record touched several source folders; cannot undo it as one step")
 		}
 		from := ""
 		for f := range folders {
@@ -697,12 +723,12 @@ func addUndo(s *mcp.Server, d writeDeps) {
 		}
 		ids, copyIDs := uniq(rec.Touched), uniq(rec.AlreadyInTarget)
 		if len(ids)+len(copyIDs) == 0 {
-			return nil, previewOut{}, errors.New("that record changed nothing; there is nothing to undo")
+			return previewOut{}, errors.New("that record changed nothing; there is nothing to undo")
 		}
 		// Refresh the folder the messages went to, so membership (and so the
 		// UIDs to move) is what the server has now.
 		if err := d.org.RefreshFolder(ctx, a, rec.Intent.Target); err != nil {
-			return nil, previewOut{}, writeFail("undo", err, a.Name)
+			return previewOut{}, writeFail("undo", err, a.Name)
 		}
 		present := func(want []string) ([]string, error) {
 			ms, err := d.store.MembersByID(ctx, a.Name, rec.Intent.Target, want)
@@ -721,14 +747,14 @@ func addUndo(s *mcp.Server, d writeDeps) {
 		}
 		found, err := present(ids)
 		if err != nil {
-			return nil, previewOut{}, fail("undo", "preview failed", err, "account", a.Name)
+			return previewOut{}, fail("undo", "preview failed", err, "account", a.Name)
 		}
 		copyFound, err := present(copyIDs)
 		if err != nil {
-			return nil, previewOut{}, fail("undo", "preview failed", err, "account", a.Name)
+			return previewOut{}, fail("undo", "preview failed", err, "account", a.Name)
 		}
 		if len(found)+len(copyFound) == 0 {
-			return nil, previewOut{}, errors.New("none of those messages are in the target folder any more")
+			return previewOut{}, errors.New("none of those messages are in the target folder any more")
 		}
 		rev := organise.Intent{
 			Account:   a.Name,
@@ -738,10 +764,10 @@ func addUndo(s *mcp.Server, d writeDeps) {
 		}
 		p, err := d.org.PreviewIDs(ctx, a, rev, found, copyFound, len(ids)+len(copyIDs)-len(found)-len(copyFound), rec.ID)
 		if err != nil {
-			return nil, previewOut{}, previewFail("undo", err, a.Name)
+			return previewOut{}, previewFail("undo", err, a.Name)
 		}
-		return nil, previewResult(p), nil
-	})
+		return previewResult(p), nil
+	}
 }
 
 func addReapply(s *mcp.Server, d writeDeps) {

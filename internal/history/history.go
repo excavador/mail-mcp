@@ -26,8 +26,20 @@ import (
 	"github.com/excavador/mail-mcp/internal/organise"
 )
 
-// Kinds.
-const KindCreateFolder = "create_folder"
+// Kinds. The apply kinds are in package organise; these are the local ones:
+// they change only the cache's own tables, never a mailbox, and undo reverses
+// them without IMAP.
+const (
+	KindCreateFolder  = "create_folder"
+	KindSetSenderKind = "set_sender_kind" // Target: the address; OldKind, OldKindSource, NewKind
+	KindTagMessages   = "tag_messages"    // Target: the tag; Touched["tag"]: ids newly tagged
+	KindUntagMessages = "untag_messages"  // Target: the tag; Touched["tag"]: ids the tag was removed from
+	KindUndoLocal     = "undo_local"      // Undoes: the record reversed
+)
+
+// NewID returns a fresh record id, for a caller that must know the id before
+// the record is written (Append keeps an id that is already set).
+func NewID() string { return newID() }
 
 const (
 	// maxLineBytes bounds one line when loading; a line beyond it is skipped
@@ -66,8 +78,13 @@ type Record struct {
 	Kind    string           `json:"kind"` // create_folder, apply, undo or reapply
 	Intent  *organise.Intent `json:"intent,omitempty"`
 	Action  string           `json:"action,omitempty"`
-	Target  string           `json:"target,omitempty"` // create_folder: the new folder
-	Preview PreviewInfo      `json:"preview"`
+	Target  string           `json:"target,omitempty"` // create_folder: the new folder; tag kinds: the tag; set_sender_kind: the address
+	// OldKind, OldKindSource and NewKind (set_sender_kind): what the sender
+	// was before and what the owner made it.
+	OldKind       string      `json:"old_kind,omitempty"`
+	OldKindSource string      `json:"old_kind_source,omitempty"`
+	NewKind       string      `json:"new_kind,omitempty"`
+	Preview       PreviewInfo `json:"preview"`
 	// Touched is the stable ids acted on, grouped by the folder they came from.
 	Touched map[string][]string `json:"touched,omitempty"`
 	// AlreadyInTarget lists, by source folder, acted-on ids that were in the

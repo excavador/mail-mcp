@@ -113,6 +113,10 @@ func (c *Cache) matchSQL(q SearchQuery) (matchPlan, error) {
 		filt = append(filt, `lower(m.from_addr) LIKE ? ESCAPE '\'`)
 		fa = append(fa, "%"+likeEscaper.Replace(strings.ToLower(q.From))+"%")
 	}
+	if q.Tag != "" {
+		filt = append(filt, `EXISTS (SELECT 1 FROM tags tg WHERE tg.account = m.account AND tg.stable_id = m.stable_id AND tg.tag = ?)`)
+		fa = append(fa, q.Tag)
+	}
 	if !q.Since.IsZero() {
 		filt = append(filt, dateCol+` >= ?`)
 		fa = append(fa, q.Since.Unix())

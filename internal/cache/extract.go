@@ -39,6 +39,7 @@ type parsed struct {
 	From, To, Cc, Subject string
 	Date                  time.Time
 	ListID, GitHubReason  string
+	ListUnsub             bool   // a List-Unsubscribe header is present
 	Body                  string // whole text, quotes included (message_fts)
 	BodyNew               string // CleanBody(Body) (message_fts2.body_new)
 	Atts                  []AttachmentMeta
@@ -79,6 +80,7 @@ func parseMessage(raw []byte) (out parsed) {
 	out.Thr = headersFromTextproto(e.Header.Header)
 	out.ListID = capField(strings.TrimSpace(e.Header.Get("List-Id")))
 	out.GitHubReason = capField(strings.TrimSpace(e.Header.Get("X-Github-Reason")))
+	out.ListUnsub = strings.TrimSpace(e.Header.Get("List-Unsubscribe")) != ""
 
 	var plain, htm strings.Builder
 	collectText(e, &plain, &htm, 0)
