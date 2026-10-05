@@ -118,12 +118,17 @@ WHERE t.tid IS NULL OR t.n_msgs <> g.n ORDER BY g.account, g.tid`)
 	}
 	byAcct := map[string][]string{}
 	var accts []string
+	seen := map[gmailTid]bool{} // each thread is refreshed at most once per run
 	for rs.Next() {
 		var a, t string
 		if err := rs.Scan(&a, &t); err != nil {
 			_ = rs.Close()
 			return 0, fmt.Errorf("gmail bulk: stale threads: %w", err)
 		}
+		if seen[gmailTid{a, t}] {
+			continue
+		}
+		seen[gmailTid{a, t}] = true
 		if _, ok := byAcct[a]; !ok {
 			accts = append(accts, a)
 		}
@@ -158,6 +163,9 @@ WHERE t.tid IS NULL OR t.n_msgs <> g.n ORDER BY g.account, g.tid`)
 			})
 			if err != nil {
 				return done, err
+			}
+			if j <= i { // no progress: never loop
+				return done, fmt.Errorf("gmail bulk: no progress")
 			}
 			done += j - i
 			i = j

@@ -7,7 +7,7 @@
 # on their own.
 check:
     go vet ./...
-    {{ if env("CI", "") != "" { "CGO_ENABLED=1 go test -race ./..." } else { "go test ./..." } }}
+    {{ if env("CI", "") != "" { "CGO_ENABLED=1 go test -race -timeout 8m ./..." } else { "go test -timeout 8m ./..." } }}
     go build ./...
     go build -o /dev/null ./cmd/mail-mcp
     just chart

@@ -59,7 +59,7 @@ func addGmailCorpus(t *testing.T, c *Cache) []string {
 // The bulk pass must produce what the per-thread path (threadNew) produces.
 func TestBulkThreadGmailMatchesThreadNew(t *testing.T) {
 	ctx := context.Background()
-	backfillPause = 0
+	qaSetPause(t, 0)
 	ref := thrOpen(t)
 	ref.SetOwners(map[string][]string{"g": {"me@example.com"}})
 	ids := addGmailCorpus(t, ref)
@@ -107,7 +107,7 @@ func TestBulkThreadGmailMatchesThreadNew(t *testing.T) {
 // With the threads job already under way, the bulk pass keeps done/total true.
 func TestBulkThreadGmailKeepsProgressMeaningful(t *testing.T) {
 	ctx := context.Background()
-	backfillPause = 0
+	qaSetPause(t, 0)
 	c := thrOpen(t)
 	addGmailCorpus(t, c)
 	if err := c.startThreadBackfill(ctx); err != nil {
@@ -154,7 +154,7 @@ VALUES (?, ?, 'x', ?, 'me@example.com', ?, ?, ?, ?)`, acct, fmt.Sprintf("gm:%08x
 	if err := tx.Commit(); err != nil {
 		t.Fatal(err)
 	}
-	backfillPause = 100 * time.Millisecond
+	qaSetPause(t, 100*time.Millisecond)
 	t0 := time.Now()
 	got, err := c.BulkThreadGmail(ctx, nil)
 	if err != nil {
@@ -162,7 +162,7 @@ VALUES (?, ?, 'x', ?, 'me@example.com', ?, ?, ?, ?)`, acct, fmt.Sprintf("gm:%08x
 	}
 	t.Logf("messages=%d threaded=%d took=%s max_write_hold=%s threads=%d", n, got, time.Since(t0).Round(time.Millisecond), c.MaxBackfillHold(),
 		thrCount(t, c, `SELECT COUNT(*) FROM threads`))
-	backfillPause = 0
+	backfillPause = 0 // restored by qaSetPause's cleanup
 	t0 = time.Now()
 	c.ws.maxHold.Store(0)
 	got, _ = c.BulkThreadGmail(ctx, nil)
