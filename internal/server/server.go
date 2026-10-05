@@ -170,6 +170,10 @@ func addCacheStatus(s *mcp.Server, store *cache.Cache) {
 		if err != nil {
 			return nil, nil, fail("cache_status", "cache status failed", err)
 		}
-		return nil, map[string]any{"accounts": st}, nil
+		out := map[string]any{"accounts": st}
+		if bf, err := store.BackfillStatus(ctx); err == nil {
+			out["fts2_backfill"] = bf
+		}
+		return nil, out, nil
 	})
 }

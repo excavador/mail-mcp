@@ -39,28 +39,39 @@ type parsed struct {
 	From, To, Cc, Subject string
 	Date                  time.Time
 	ListID, GitHubReason  string
-	Body                  string
+	Body                  string // whole text, quotes included (message_fts)
+	BodyNew               string // CleanBody(Body) (message_fts2.body_new)
+	Atts                  []AttachmentMeta
 }
 
 // parseMessage extracts headers and searchable text from raw RFC 822. It is
 // forgiving: a message that does not parse cleanly is still cached as a blob,
 // and gets whatever headers could be read, because losing the message from
 // search is worse than indexing it thinly.
-func parseMessage(raw []byte) parsed {
-	var out parsed
+//
+// A panic in the MIME or charset code must not take the process down (the blob
+// is already stored, so a poison message would crash-loop the pod): it is
+// recovered, and what was parsed so far (at least nothing, at most the
+// headers) is returned.
+func parseMessage(raw []byte) (out parsed) {
+	defer func() {
+		if recover() != nil {
+			out.Atts = nil
+		}
+	}()
 	e, err := message.Read(bytes.NewReader(raw))
 	if e == nil || (err != nil && !message.IsUnknownCharset(err) && !message.IsUnknownEncoding(err)) {
 		return out
 	}
 	h := mail.Header{Header: e.Header}
-	out.From = capField(addrs(h, "From"))
-	out.To = capField(addrs(h, "To"))
-	out.Cc = capField(addrs(h, "Cc"))
+	out.From = capField(stripC0(addrs(h, "From")))
+	out.To = capField(stripC0(addrs(h, "To")))
+	out.Cc = capField(stripC0(addrs(h, "Cc")))
 	out.Subject, _ = h.Subject()
 	if out.Subject == "" {
 		out.Subject = e.Header.Get("Subject")
 	}
-	out.Subject = capField(out.Subject)
+	out.Subject = capField(stripC0(out.Subject))
 	if d, err := h.Date(); err == nil {
 		out.Date = d
 	}
@@ -76,7 +87,10 @@ func parseMessage(raw []byte) parsed {
 	if len(body) > maxIndexedText {
 		body = strings.ToValidUTF8(body[:maxIndexedText], "")
 	}
+	body = stripC0(body)
 	out.Body = body
+	out.BodyNew = CleanBody(body)
+	out.Atts = extractAttachments(raw)
 	return out
 }
 
@@ -162,4 +176,26 @@ func stripHTML(s string) string {
 	s = spaces.ReplaceAllString(s, " ")
 	s = blank.ReplaceAllString(s, "\n")
 	return strings.TrimSpace(s)
+}
+
+// stripC0 removes C0 control characters (and DEL) other than tab and newline
+// from text headed for the index, so a stray \x01 or \x02 in a message cannot
+// be mistaken for the snippet markers search uses.
+func stripC0(s string) string {
+	clean := true
+	for i := 0; i < len(s); i++ {
+		if c := s[i]; (c < 0x20 && c != '\t' && c != '\n') || c == 0x7f {
+			clean = false
+			break
+		}
+	}
+	if clean {
+		return s
+	}
+	return strings.Map(func(r rune) rune {
+		if (r < 0x20 && r != '\t' && r != '\n') || r == 0x7f {
+			return -1
+		}
+		return r
+	}, s)
 }
