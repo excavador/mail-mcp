@@ -112,6 +112,8 @@ func New(accts []accounts.Account, store *cache.Cache, version string, mode Mode
 	addListFolders(s, byName, store)
 	addSearch(s, byName, store)
 	addFetchMessage(s, byName, store)
+	addGetThread(s, byName, store)
+	addSearchStats(s, store)
 	addSenderStats(s, byName, store)
 	addCacheStatus(s, store)
 	if o.hist != nil {
@@ -173,6 +175,9 @@ func addCacheStatus(s *mcp.Server, store *cache.Cache) {
 		out := map[string]any{"accounts": st}
 		if bf, err := store.BackfillStatus(ctx); err == nil {
 			out["fts2_backfill"] = bf
+		}
+		if tb, err := store.ThreadsBackfillStatus(ctx); err == nil {
+			out["threads_backfill"] = tb
 		}
 		return nil, out, nil
 	})

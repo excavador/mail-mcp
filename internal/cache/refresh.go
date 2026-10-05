@@ -548,8 +548,10 @@ func (c *Cache) fetchBodies(ctx context.Context, a accounts.Account, client *ima
 			return fmt.Errorf("begin: %w", err)
 		}
 		defer func() { _ = tx.Rollback() }()
+		ids := make([]string, 0, len(items))
 		for i := range items {
 			it := &items[i]
+			ids = append(ids, it.info.stableID)
 			if err := insertMessageTx(ctx, tx, a.Name, it.info, it.sum, it.p); err != nil {
 				return err
 			}
@@ -562,7 +564,14 @@ func (c *Cache) fetchBodies(ctx context.Context, a accounts.Account, client *ima
 			}
 		}
 		items, held = nil, 0
-		return tx.Commit()
+		if err := tx.Commit(); err != nil {
+			return err
+		}
+		// Threading is a second step, after the messages are safely indexed
+		// (once per flushed batch): its failure leaves them unthreaded for the
+		// backfill, never unindexed.
+		c.threadNew(ctx, a.Name, ids)
+		return nil
 	}
 	for i := range msgs {
 		m := msgs[i]
@@ -710,9 +719,11 @@ func insertMessageTx(ctx context.Context, tx *sql.Tx, account string, info heade
 	}
 	res, err := tx.ExecContext(ctx, `
 INSERT OR IGNORE INTO messages
-	(account, stable_id, blob_sha256, from_addr, to_addr, cc_addr, subject, date_unix, list_id, gh_reason, size, internal_date, gm_thread_id)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		account, info.stableID, blobSum, p.From, p.To, p.Cc, p.Subject, dateUnix, p.ListID, p.GitHubReason, info.size, info.internal.Unix(), info.gmThreadID)
+	(account, stable_id, blob_sha256, from_addr, to_addr, cc_addr, subject, date_unix, list_id, gh_reason, size, internal_date, gm_thread_id,
+	 message_id, in_reply_to, references_json)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		account, info.stableID, blobSum, p.From, p.To, p.Cc, p.Subject, dateUnix, p.ListID, p.GitHubReason, info.size, info.internal.Unix(), info.gmThreadID,
+		p.Thr.MessageID, p.Thr.InReplyTo, p.Thr.refsJSON())
 	if err != nil {
 		return fmt.Errorf("index message: %w", err)
 	}
@@ -727,6 +738,9 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			return fmt.Errorf("index text: %w", err)
 		}
 		if err := indexText2Tx(ctx, tx, rid, account, info.stableID, p); err != nil {
+			return err
+		}
+		if err := addRefsTx(ctx, tx, account, info.stableID, p.Subject, p.Thr); err != nil {
 			return err
 		}
 	}

@@ -13,6 +13,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"math/big"
 	"net"
 	"os"
@@ -224,6 +225,19 @@ func call(t *testing.T, cs *mcp.ClientSession, tool string, args map[string]any)
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
+	// The search tests below predate thread grouping and assert on messages:
+	// they ask for group_by=message unless they say otherwise.
+	// "_default" says "send the search exactly as given" (group_by default).
+	if _, raw := args["_default"]; raw {
+		args = maps.Clone(args)
+		delete(args, "_default")
+	} else if _, has := args["group_by"]; tool == "search" && !has {
+		args = maps.Clone(args)
+		if args == nil {
+			args = map[string]any{}
+		}
+		args["group_by"] = "message"
+	}
 	res, err := cs.CallTool(ctx, &mcp.CallToolParams{Name: tool, Arguments: args})
 	if err != nil {
 		t.Fatalf("CallTool %s: protocol error: %v", tool, err)
@@ -277,10 +291,9 @@ type searchOutT struct {
 		Date     string   `json:"date"`
 		Subject  string   `json:"subject"`
 		Folders  []string `json:"folders"`
-	} `json:"results"`
-	Count     int    `json:"count"`
-	Truncated bool   `json:"truncated"`
-	Notice    string `json:"notice"`
+	} `json:"hits"`
+	NextCursor string `json:"next_cursor"`
+	Notice     string `json:"notice"`
 }
 
 func (s searchOutT) subjects() []string {
@@ -481,8 +494,8 @@ func TestSearchToolFiltersEndToEnd(t *testing.T) {
 
 	// Empty account searches every account: each message exists in both.
 	all, _ := ok[searchOutT](t, cs, "search", map[string]any{})
-	if all.Count != 6 || all.Notice == "" {
-		t.Errorf("all accounts: count %d notice %q", all.Count, all.Notice)
+	if len(all.Results) != 6 || all.Notice == "" {
+		t.Errorf("all accounts: count %d notice %q", len(all.Results), all.Notice)
 	}
 	// Date descending.
 	if got := subjectsOf(t, cs, map[string]any{"account": "acct"}); !eq(got, []string{"both mail", "archived mail", "inbox mail"}) {
@@ -502,20 +515,20 @@ func TestSearchToolFiltersEndToEnd(t *testing.T) {
 	}
 	// Truncated and limit.
 	out, _ = ok[searchOutT](t, cs, "search", map[string]any{"account": "acct", "limit": 2})
-	if out.Count != 2 || !out.Truncated {
+	if len(out.Results) != 2 || !(out.NextCursor != "") {
 		t.Errorf("limit 2 of 3: %+v", out)
 	}
 	out, _ = ok[searchOutT](t, cs, "search", map[string]any{"account": "acct", "limit": 3})
-	if out.Count != 3 || out.Truncated {
+	if len(out.Results) != 3 || (out.NextCursor != "") {
 		t.Errorf("limit == hits must not be truncated: %+v", out)
 	}
 	out, _ = ok[searchOutT](t, cs, "search", map[string]any{"account": "acct", "limit": 0})
-	if out.Count != 3 {
-		t.Errorf("limit 0 = %d", out.Count)
+	if len(out.Results) != 3 {
+		t.Errorf("limit 0 = %d", len(out.Results))
 	}
 	out, _ = ok[searchOutT](t, cs, "search", map[string]any{"account": "acct", "limit": 100000})
-	if out.Count != 3 {
-		t.Errorf("limit clamped = %d", out.Count)
+	if len(out.Results) != 3 {
+		t.Errorf("limit clamped = %d", len(out.Results))
 	}
 }
 

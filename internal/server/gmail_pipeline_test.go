@@ -57,7 +57,7 @@ func TestServerSearchWithCachedAllMailSendsNoListAndPipelines(t *testing.T) {
 	off := len(e.fake.log.raw())
 
 	out, _ := ok[gmSearchOut](t, e.cs, "search", map[string]any{"server": true, "account": e.g.Name, "query": "from:a"})
-	if out.Count+out.UncachedCount != 4 {
+	if len(out.Results)+out.UncachedCount != 4 {
 		t.Errorf("results = %+v, want the 4 UIDs the fake answers", out)
 	}
 

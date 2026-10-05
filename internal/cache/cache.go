@@ -29,6 +29,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -47,29 +48,80 @@ type Cache struct {
 
 	folderQueries atomic.Int64 // membership lookups for folders of messages
 
+	searches searchTracker // recent search results, for the search log
+
+	ownerMu sync.RWMutex
+	owners  map[string][]string // account -> the owner's own addresses
+
 	// now is the clock; tests replace it to exercise the full-scan interval.
 	now func() time.Time
 }
 
-// folderColumns are columns of folders added after the first release. They
-// are added to an existing database with ALTER TABLE, not by bumping
-// schemaVersion: a bump drops the index and re-fetches every mailbox, and
-// these columns are only an optimisation hint (0 means "never completed", so
-// the folder is scanned once and the hint fills in).
-var folderColumns = []struct{ name, def string }{
-	{"uidnext", "INTEGER NOT NULL DEFAULT 0"},
-	{"messages", "INTEGER NOT NULL DEFAULT 0"},
-	{"scanned_at", "INTEGER NOT NULL DEFAULT 0"},
-	{"attrs", "TEXT NOT NULL DEFAULT ''"},
+// columnSet is a table's columns added after the first release. They are
+// added to an existing database with ALTER TABLE, not by bumping
+// schemaVersion: a bump drops the index and re-fetches every mailbox.
+type columnSet struct {
+	table string
+	cols  []struct{ name, def string }
 }
 
-// addMissingColumns adds, to a folders table created by an earlier version,
-// the columns it lacks. Guarded by PRAGMA table_info so it is idempotent.
+var addedColumns = []columnSet{
+	// folders: only an optimisation hint (0 means "never completed", so the
+	// folder is scanned once and the hint fills in).
+	{"folders", []struct{ name, def string }{
+		{"uidnext", "INTEGER NOT NULL DEFAULT 0"},
+		{"messages", "INTEGER NOT NULL DEFAULT 0"},
+		{"scanned_at", "INTEGER NOT NULL DEFAULT 0"},
+		{"attrs", "TEXT NOT NULL DEFAULT ''"},
+	}},
+	// backfill: the full column list main created it with, as defence for a
+	// database whose row was made by a narrower definition.
+	{"backfill", []struct{ name, def string }{
+		{"max_rowid", "INTEGER NOT NULL DEFAULT 0"},
+		{"total", "INTEGER NOT NULL DEFAULT 0"},
+		{"processed", "INTEGER NOT NULL DEFAULT 0"},
+	}},
+	{"message_thread", []struct{ name, def string }{
+		{"outsider", "INTEGER NOT NULL DEFAULT 0"},
+	}},
+	// messages: the threading headers. NULL means "not read from the blob
+	// yet" (the thread backfill fills it); '' means "read, there is none".
+	{"messages", []struct{ name, def string }{
+		{"message_id", "TEXT"},
+		{"in_reply_to", "TEXT"},
+		{"references_json", "TEXT"},
+	}},
+}
+
+// addMissingColumns adds, to tables created by an earlier version, the
+// columns they lack. Guarded by PRAGMA table_info so it is idempotent.
 func addMissingColumns(db *sql.DB) error {
-	rows, err := db.Query(`PRAGMA table_info(folders)`)
-	if err != nil {
-		return fmt.Errorf("inspect folders: %w", err)
+	for _, set := range addedColumns {
+		have, err := tableColumns(db, set.table)
+		if err != nil {
+			return err
+		}
+		for _, c := range set.cols {
+			if have[c.name] {
+				continue
+			}
+			if _, err := db.Exec(`ALTER TABLE ` + set.table + ` ADD COLUMN ` + c.name + ` ` + c.def); err != nil {
+				return fmt.Errorf("add %s.%s: %w", set.table, c.name, err)
+			}
+		}
 	}
+	return nil
+}
+
+// tableColumns returns the column names of a table.
+func tableColumns(db interface {
+	Query(string, ...any) (*sql.Rows, error)
+}, table string) (map[string]bool, error) {
+	rows, err := db.Query(`PRAGMA table_info(` + table + `)`)
+	if err != nil {
+		return nil, fmt.Errorf("inspect %s: %w", table, err)
+	}
+	defer rows.Close()
 	have := map[string]bool{}
 	for rows.Next() {
 		var (
@@ -78,25 +130,11 @@ func addMissingColumns(db *sql.DB) error {
 			dflt             sql.NullString
 		)
 		if err := rows.Scan(&cid, &name, &typ, &notnull, &dflt, &pk); err != nil {
-			_ = rows.Close()
-			return fmt.Errorf("inspect folders: %w", err)
+			return nil, fmt.Errorf("inspect %s: %w", table, err)
 		}
 		have[name] = true
 	}
-	if err := rows.Err(); err != nil {
-		_ = rows.Close()
-		return fmt.Errorf("inspect folders: %w", err)
-	}
-	_ = rows.Close()
-	for _, c := range folderColumns {
-		if have[c.name] {
-			continue
-		}
-		if _, err := db.Exec(`ALTER TABLE folders ADD COLUMN ` + c.name + ` ` + c.def); err != nil {
-			return fmt.Errorf("add folders.%s: %w", c.name, err)
-		}
-	}
-	return nil
+	return have, rows.Err()
 }
 
 const schema = `
@@ -192,6 +230,58 @@ CREATE TABLE IF NOT EXISTS folders (
 	PRIMARY KEY (account, folder)
 );
 
+-- Threads. message_thread is derived data (rebuilt from the header columns of
+-- messages); message_ref indexes every id a message mentions (its own
+-- Message-ID, In-Reply-To, References, and a "subj:" key for header-less
+-- replies) so that a late parent finds its children.
+CREATE TABLE IF NOT EXISTS threads (
+	account           TEXT    NOT NULL,
+	tid               TEXT    NOT NULL,
+	root_stable_id    TEXT    NOT NULL,
+	subject_norm      TEXT    NOT NULL DEFAULT '',
+	first_at          INTEGER NOT NULL DEFAULT 0,
+	last_at           INTEGER NOT NULL DEFAULT 0,
+	n_msgs            INTEGER NOT NULL DEFAULT 0,
+	participants_json TEXT    NOT NULL DEFAULT '[]',
+	PRIMARY KEY (account, tid)
+);
+CREATE INDEX IF NOT EXISTS threads_by_subject ON threads (account, subject_norm, first_at);
+
+CREATE TABLE IF NOT EXISTS message_thread (
+	account          TEXT    NOT NULL,
+	stable_id        TEXT    NOT NULL,
+	tid              TEXT    NOT NULL,
+	parent_stable_id TEXT    NOT NULL DEFAULT '',
+	depth            INTEGER NOT NULL DEFAULT 0,
+	outsider         INTEGER NOT NULL DEFAULT 0,
+	PRIMARY KEY (account, stable_id)
+) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS message_thread_by_tid ON message_thread (account, tid);
+
+CREATE TABLE IF NOT EXISTS message_ref (
+	account   TEXT NOT NULL,
+	ref_id    TEXT NOT NULL,
+	stable_id TEXT NOT NULL,
+	PRIMARY KEY (account, ref_id, stable_id)
+) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS message_ref_by_msg ON message_ref (account, stable_id);
+
+-- One row per search call; see searchlog.go. Not derived from messages, so it
+-- is not dropped with the index.
+CREATE TABLE IF NOT EXISTS search_log (
+	id              INTEGER PRIMARY KEY AUTOINCREMENT,
+	at              INTEGER NOT NULL,
+	account         TEXT    NOT NULL DEFAULT '',
+	query_hash      TEXT    NOT NULL DEFAULT '',
+	query           TEXT    NOT NULL DEFAULT '',
+	mode            TEXT    NOT NULL DEFAULT '',
+	hits            INTEGER NOT NULL DEFAULT 0,
+	total           INTEGER NOT NULL DEFAULT 0,
+	fetched         INTEGER NOT NULL DEFAULT 0,
+	reformulated_of INTEGER
+);
+CREATE INDEX IF NOT EXISTS search_log_by_at ON search_log (at);
+
 CREATE TABLE IF NOT EXISTS refreshes (
 	account    TEXT PRIMARY KEY,
 	at         INTEGER NOT NULL,
@@ -213,7 +303,7 @@ const schemaVersion = 2
 
 // indexTables are the tables the index owns, FTS first (dropping the virtual
 // table removes its shadow tables).
-var indexTables = []string{"message_fts", "message_fts2", "attachment_fts", "attachments", "backfill", "messages", "membership", "folders", "refreshes"}
+var indexTables = []string{"message_fts", "message_fts2", "attachment_fts", "attachments", "backfill", "messages", "membership", "folders", "refreshes", "threads", "message_thread", "message_ref"}
 
 // ensureSchema creates the schema, first wiping the index tables when the
 // database carries a different user_version (0 for a fresh or pre-versioned
