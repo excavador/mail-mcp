@@ -142,7 +142,28 @@ func collectText(e *message.Entity, plain, htm *strings.Builder, depth int) {
 	if dst.Len() > 0 {
 		dst.WriteByte('\n')
 	}
-	dst.WriteString(strings.ToValidUTF8(string(b), ""))
+	text := strings.ToValidUTF8(string(b), "")
+	if mt == "text/plain" {
+		text = decodeEntities(text)
+	}
+	dst.WriteString(text)
+}
+
+// entityRE matches a complete, semicolon-terminated character reference.
+var entityRE = regexp.MustCompile(`&(?:#[0-9]{1,7}|#[xX][0-9a-fA-F]{1,6}|[A-Za-z][A-Za-z0-9]{1,31});`)
+
+// decodeEntities decodes HTML character references in a text/plain part.
+// Some senders (GitHub notifications, for one) HTML-escape plain text, which
+// would otherwise index and show "&lt;ul&gt;" and "&amp;". Only complete
+// references are decoded, in one pass (so "&amp;lt;" becomes "&lt;", not "<"),
+// and "?a=1&copy=2" in a URL is left alone, which html.UnescapeString on the
+// whole text would turn into a (c). The result is plain text that is never
+// run through the tag stripper, so a decoded "<" cannot form a tag.
+func decodeEntities(s string) string {
+	if !strings.Contains(s, "&") || !entityRE.MatchString(s) {
+		return s
+	}
+	return entityRE.ReplaceAllStringFunc(s, html.UnescapeString)
 }
 
 func walkParts(mr message.MultipartReader, plain, htm *strings.Builder, depth int) {
@@ -174,6 +195,8 @@ func stripHTML(s string) string {
 	// every other tag separates words.
 	s = inline.ReplaceAllString(s, "")
 	s = tags.ReplaceAllString(s, " ")
+	// Entities are decoded after the tags are gone: a decoded "<" must not
+	// become a tag that is then stripped (or one that survives as markup).
 	s = html.UnescapeString(s)
 	s = spaces.ReplaceAllString(s, " ")
 	s = blank.ReplaceAllString(s, "\n")

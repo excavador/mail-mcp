@@ -167,7 +167,7 @@ func (r *rateLog) tick(done, total int) {
 }
 
 // RunBackfills is the one backfill scheduler: the fts2 index first (search
-// quality depends on it), then threads, each to completion and resumable. It
+// quality depends on it), then Gmail bulk threading and the per-message threads job, each to completion and resumable. It
 // returns when both are done or ctx ends. Writers other than these jobs
 // (refresh, apply) are not queued behind it; the jobs yield to them.
 func (c *Cache) RunBackfills(ctx context.Context, log *slog.Logger) {
@@ -191,6 +191,12 @@ func (c *Cache) RunBackfills(ctx context.Context, log *slog.Logger) {
 				log.Error("thread backfill panicked", "panic", fmt.Sprint(r))
 			}
 		}()
+		if _, err := c.BulkThreadGmail(ctx, log); err != nil && ctx.Err() == nil {
+			log.Error("gmail bulk threading failed; the per-message backfill covers the rest", "error", err.Error())
+		}
+		if ctx.Err() != nil {
+			return
+		}
 		if err := c.BackfillThreads(ctx, log); err != nil && ctx.Err() == nil {
 			log.Error("thread backfill failed", "error", err.Error())
 		}

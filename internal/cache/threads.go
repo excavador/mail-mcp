@@ -248,7 +248,7 @@ func threadTxOpts(ctx context.Context, tx *sql.Tx, account string, seeds []strin
 		case r.gm != "":
 			if !gmSeen[r.gm] {
 				gmSeen[r.gm] = true
-				if err := threadGmail(ctx, tx, account, r.gm); err != nil {
+				if err := threadGmail(ctx, tx, account, r.gm, opts.Owners); err != nil {
 					return err
 				}
 			}
@@ -325,7 +325,7 @@ func safeComponent(ctx context.Context, tx *sql.Tx, fn func() error, onPanic fun
 }
 
 // threadGmail puts every message of a Gmail thread under "g:<id>".
-func threadGmail(ctx context.Context, tx *sql.Tx, account, gm string) error {
+func threadGmail(ctx context.Context, tx *sql.Tx, account, gm string, owners []string) error {
 	old, err := distinctTids(ctx, tx, `SELECT DISTINCT tid FROM message_thread WHERE account = ? AND stable_id IN
 		(SELECT stable_id FROM messages WHERE account = ? AND gm_thread_id = ?)`, account, account, gm)
 	if err != nil {
@@ -337,7 +337,16 @@ INSERT OR REPLACE INTO message_thread (account, stable_id, tid, parent_stable_id
 SELECT account, stable_id, ?, '', 0 FROM messages WHERE account = ? AND gm_thread_id = ?`, tid, account, gm); err != nil {
 		return fmt.Errorf("thread gmail: %w", err)
 	}
-	return refreshAggregates(ctx, tx, account, append(old, tid))
+	var others []string
+	for _, o := range old {
+		if o != tid {
+			others = append(others, o)
+		}
+	}
+	if err := refreshAggregates(ctx, tx, account, others); err != nil {
+		return err
+	}
+	return refreshGmailThreads(ctx, tx, account, []string{tid}, owners)
 }
 
 func distinctTids(ctx context.Context, tx *sql.Tx, q string, args ...any) ([]string, error) {
@@ -646,7 +655,7 @@ func planThreads(ctx context.Context, q dbq, account string, seeds []string, opt
 // and the component is planned again inside tx, where nothing can move.
 func applyPlan(ctx context.Context, tx *sql.Tx, p threadPlan) error {
 	if p.gm != "" {
-		return threadGmail(ctx, tx, p.account, p.gm)
+		return threadGmail(ctx, tx, p.account, p.gm, p.opts.Owners)
 	}
 	cur, err := loadHave(ctx, tx, p.account, p.ids)
 	if err != nil {
@@ -673,7 +682,7 @@ func applyPlan(ctx context.Context, tx *sql.Tx, p threadPlan) error {
 			return err
 		}
 		if q.gm != "" {
-			if err := threadGmail(ctx, tx, q.account, q.gm); err != nil {
+			if err := threadGmail(ctx, tx, q.account, q.gm, q.opts.Owners); err != nil {
 				return err
 			}
 		}
@@ -865,12 +874,21 @@ ON CONFLICT(name) DO UPDATE SET last_rowid = excluded.last_rowid, done = exclude
 	return err
 }
 
+// notBulkThreaded selects the messages the per-message backfill still has to
+// visit: everything except a Gmail message BulkThreadGmail already placed
+// (its thread is its gm_thread_id, nothing else is needed).
+const notBulkThreaded = `NOT (gm_thread_id <> '' AND EXISTS
+	(SELECT 1 FROM message_thread t WHERE t.account = messages.account AND t.stable_id = messages.stable_id))`
+
 // startThreadBackfill (re)starts the threads job from the beginning: position
-// 0, not done, total = the messages there are now, processed = 0.
+// 0, not done, total = the messages there are now, processed = those the
+// Gmail bulk pass has already threaded (the loop skips them, so they count as
+// done from the start).
 func (c *Cache) startThreadBackfill(ctx context.Context) error {
 	_, err := c.db.ExecContext(ctx, `INSERT INTO backfill (name, last_rowid, done, updated_at, total, processed)
-VALUES (?, 0, 0, ?, (SELECT COUNT(*) FROM messages), 0)
-ON CONFLICT(name) DO UPDATE SET last_rowid = 0, done = 0, updated_at = excluded.updated_at, total = excluded.total, processed = 0`,
+VALUES (?, 0, 0, ?, (SELECT COUNT(*) FROM messages),
+	(SELECT COUNT(*) FROM messages WHERE NOT `+notBulkThreaded+`))
+ON CONFLICT(name) DO UPDATE SET last_rowid = 0, done = 0, updated_at = excluded.updated_at, total = excluded.total, processed = excluded.processed`,
 		threadBackfillName, c.now().Unix())
 	return err
 }
@@ -990,7 +1008,7 @@ func (c *Cache) backfillThreadBatch(ctx context.Context, last int64) (int, int64
 		batchHook()
 	}
 	rs, err := c.db.QueryContext(ctx, `SELECT rowid, account, stable_id, blob_sha256, subject, message_id IS NULL
-FROM messages WHERE rowid > ? ORDER BY rowid LIMIT ?`, last, threadBackfillBatch)
+FROM messages WHERE rowid > ? AND `+notBulkThreaded+` ORDER BY rowid LIMIT ?`, last, threadBackfillBatch)
 	if err != nil {
 		return 0, last, false, fmt.Errorf("backfill scan: %w", err)
 	}
@@ -1310,7 +1328,7 @@ func (c *Cache) safeThreadBatch(ctx context.Context, last int64, log *slog.Logge
 }
 
 func (c *Cache) skipThreadBatch(ctx context.Context, last int64) (int, int64, bool, error) {
-	rs, err := c.db.QueryContext(ctx, `SELECT rowid, account, stable_id FROM messages WHERE rowid > ? ORDER BY rowid LIMIT ?`, last, threadBackfillBatch)
+	rs, err := c.db.QueryContext(ctx, `SELECT rowid, account, stable_id FROM messages WHERE rowid > ? AND `+notBulkThreaded+` ORDER BY rowid LIMIT ?`, last, threadBackfillBatch)
 	if err != nil {
 		return 0, last, false, fmt.Errorf("skip batch: %w", err)
 	}
