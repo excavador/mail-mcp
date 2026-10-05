@@ -39,6 +39,9 @@ type Outcome struct {
 	Touched []Touched
 	// Skipped is approved ids not acted on: no longer matching, or gone.
 	Skipped int
+	// NotPreviewed counts current matches that were not in the previewed set
+	// (mail that arrived since). They were left alone.
+	NotPreviewed int
 	// AlreadyInTarget lists acted-on ids the cache showed in the target folder
 	// before the apply, with the folder each came from. They are not in
 	// Touched: undo restores their source by COPY, never by moving them.
@@ -172,9 +175,11 @@ func (o *Organiser) Apply(ctx context.Context, a accounts.Account, p *Preview) (
 	}
 	var members []uidMember
 	acting := map[string]bool{}
+	notPreviewed := map[string]bool{}
 	var validity uint32
 	for _, m := range now {
 		if !approved[m.StableID] {
+			notPreviewed[m.StableID] = true
 			continue // arrived or started matching after the preview
 		}
 		acting[m.StableID] = true
@@ -182,6 +187,7 @@ func (o *Organiser) Apply(ctx context.Context, a accounts.Account, p *Preview) (
 		validity = m.UIDValidity
 	}
 	out.Skipped = len(p.IDs) - len(acting)
+	out.NotPreviewed = len(notPreviewed)
 	// Undo of a move: the ids that were already in the target are COPYed back.
 	var copyBack []uidMember
 	if len(p.CopyBack) > 0 {
@@ -330,7 +336,23 @@ func (o *Organiser) Apply(ctx context.Context, a accounts.Account, p *Preview) (
 	// ended.
 	rctx, rcancel := context.WithTimeout(context.WithoutCancel(ctx), undoRefreshBudget)
 	defer rcancel()
-	if _, rerr := o.store.RefreshFolders(rctx, c, a, []string{in.Criterion.Folder, in.Target}); rerr != nil {
+	rc := c
+	if actErr != nil {
+		// The connection that just failed may be dead (or mid-command); read
+		// the folders over a fresh one, or membership stays stale.
+		_ = c.Close()
+		fresh, derr := imapx.Dial(rctx, a)
+		if derr != nil {
+			slog.Warn("organise: refresh after failed apply could not reconnect", "account", a.Name, "err", derr)
+			rc = nil
+		} else {
+			defer func() { _ = fresh.Close() }()
+			rc = fresh
+		}
+	}
+	if rc == nil {
+		// already logged
+	} else if _, rerr := o.store.RefreshFolders(rctx, rc, a, []string{in.Criterion.Folder, in.Target}); rerr != nil {
 		slog.Warn("organise: refresh after apply failed", "account", a.Name, "err", rerr)
 	}
 	if actErr != nil {

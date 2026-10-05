@@ -38,7 +38,10 @@ type Preview struct {
 	Intent  Intent
 	// Nonce makes every token unique, even for an identical preview.
 	Nonce [16]byte
-	Kind  string // KindApply, KindUndo or KindReapply
+	// question is the nonce of the one outstanding approval question (zero:
+	// none). It is single-use and guarded by Organiser.mu.
+	question [16]byte
+	Kind     string // KindApply, KindUndo or KindReapply
 	// IDs is the sorted, de-duplicated set the owner is shown and approves.
 	IDs []string
 	// IDsOnly means the set is explicit (undo) and the criterion carries only
@@ -263,4 +266,60 @@ func (o *Organiser) Consume(token string) bool {
 		}
 	}
 	return live
+}
+
+// QuestionKey names the input request that asks the owner about p: derived
+// from the token and the preview's nonce, so it differs for every preview.
+func (o *Organiser) QuestionKey(p *Preview) string {
+	sum := sha256.Sum256([]byte(p.Token + hex.EncodeToString(p.Nonce[:])))
+	return "approve-" + hex.EncodeToString(sum[:])[:16]
+}
+
+func (o *Organiser) questionMAC(token string, nonce []byte) []byte {
+	m := hmac.New(sha256.New, o.key)
+	m.Write([]byte("question|" + token + "|"))
+	m.Write(nonce)
+	return m.Sum(nil)
+}
+
+// NewQuestion arms a fresh question for the token's preview and returns the
+// RequestState that must come back with its answer. A question asked earlier
+// for the same preview stops being valid.
+func (o *Organiser) NewQuestion(token string) (string, error) {
+	var nonce [16]byte
+	if _, err := rand.Read(nonce[:]); err != nil {
+		return "", err
+	}
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	p, ok := o.previews[token]
+	if !ok {
+		return "", ErrExpired
+	}
+	p.question = nonce
+	return base64.RawURLEncoding.EncodeToString(nonce[:]) + "." +
+		base64.RawURLEncoding.EncodeToString(o.questionMAC(token, nonce[:])), nil
+}
+
+// TakeQuestion checks a RequestState against the token's outstanding question
+// and, if it is that question, uses it up: a state is good for one answer.
+func (o *Organiser) TakeQuestion(token, state string) bool {
+	n, mac, ok := strings.Cut(state, ".")
+	if !ok {
+		return false
+	}
+	nonce, err1 := base64.RawURLEncoding.DecodeString(n)
+	got, err2 := base64.RawURLEncoding.DecodeString(mac)
+	if err1 != nil || err2 != nil || len(nonce) != 16 || !hmac.Equal(got, o.questionMAC(token, nonce)) {
+		return false
+	}
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	p, ok := o.previews[token]
+	var zero [16]byte
+	if !ok || p.question == zero || !hmac.Equal(p.question[:], nonce) {
+		return false
+	}
+	p.question = zero
+	return true
 }

@@ -245,29 +245,35 @@ func checkEcho(in applyIn, p *organise.Preview) error {
 }
 
 type applyOut struct {
-	Account    string `json:"account"`
-	Kind       string `json:"kind"`
-	Action     string `json:"action"`
-	Source     string `json:"source"`
-	Target     string `json:"target"`
-	Matched    int    `json:"matched" jsonschema:"messages in the approved preview"`
-	Done       int    `json:"done" jsonschema:"messages acted on"`
-	Skipped    int    `json:"skipped" jsonschema:"approved messages no longer matching, or gone"`
-	ApprovedBy string `json:"approved_by"`
-	HistoryID  string `json:"history_id"`
+	Account      string `json:"account"`
+	Kind         string `json:"kind"`
+	Action       string `json:"action"`
+	Source       string `json:"source"`
+	Target       string `json:"target"`
+	Matched      int    `json:"matched" jsonschema:"messages in the approved preview"`
+	Done         int    `json:"done" jsonschema:"messages acted on"`
+	CopiedBack   int    `json:"copied_back,omitempty" jsonschema:"undo: messages copied back to their source (already in the target before the apply); done counts the messages moved back"`
+	Skipped      int    `json:"skipped" jsonschema:"approved messages no longer matching, or gone"`
+	NotPreviewed int    `json:"not_previewed" jsonschema:"messages matching now that were not in the preview (mail that arrived since); left alone"`
+	ApprovedBy   string `json:"approved_by"`
+	HistoryID    string `json:"history_id"`
 }
 
-// supportsElicitation reports whether the client declared the elicitation
-// capability when it initialised the session: ServerSession.InitializeParams
-// (go-sdk v1.7.0 mcp/server.go:1959) carries the client's capabilities, and
-// ServerSession.Elicit (mcp/server.go:1654) makes the same check before it
-// sends, refusing with "client does not support elicitation" otherwise.
-func supportsElicitation(ss *mcp.ServerSession) bool {
-	if ss == nil {
+// protocol20260728 is the first MCP protocol version in which a server may not
+// send elicitation/create in the middle of a tool call.
+const protocol20260728 = "2026-07-28"
+
+// clientElicits reports whether the client declared the elicitation capability.
+// CallToolRequest.ClientCapabilities (go-sdk v1.7.0 mcp/shared.go:684) answers
+// for both protocols: from the per-request _meta on >= 2026-07-28, where there
+// is no initialize handshake to read it from, and from the session's
+// InitializeParams (mcp/server.go:1959) before that.
+func clientElicits(req *mcp.CallToolRequest) bool {
+	if req == nil {
 		return false
 	}
-	ip := ss.InitializeParams()
-	return ip != nil && ip.Capabilities != nil && ip.Capabilities.Elicitation != nil
+	caps := req.ClientCapabilities()
+	return caps != nil && caps.Elicitation != nil
 }
 
 // approve obtains the owner's approval of p and says through which channel.
@@ -277,19 +283,35 @@ func supportsElicitation(ss *mcp.ServerSession) bool {
 // proceeds without an explicit accept. That approval cannot be given by the
 // model, whatever it was told to do.
 //
-// Where it does not, the only gate is the client's own tool-approval prompt:
-// apply_intent is not read-only, so a client that asks before running such
-// tools asks here. That is weaker (the model fills in "approved"), and is
-// recorded as "client-tool-approval" so the history shows which it was.
-func approve(ctx context.Context, ss *mcp.ServerSession, d writeDeps, p *organise.Preview) (string, error) {
-	if !supportsElicitation(ss) {
+// How the question travels depends on the protocol the client negotiated:
+//
+//   - Before 2026-07-28 the handler calls ServerSession.Elicit mid-call
+//     (mcp/server.go:1654).
+//   - From 2026-07-28 the SDK refuses that (mcp/server.go:1544-1551: "cannot be
+//     sent while serving a request on protocol version ...", SEP-2322). The
+//     handler instead returns a CallToolResult carrying InputRequests
+//     (mcp/protocol.go:311); the SDK marks it input_required (mcp/mrtr.go:57)
+//     and the client retries the same call with the answer in
+//     CallToolParamsRaw.InputResponses (mcp/protocol.go:255), echoing
+//     RequestState (mcp/protocol.go:316). So on that
+//     protocol approve returns pending the first time, and the handler runs
+//     again, every check included, when the answer comes back. The token is
+//     consumed only after the answer is accepted, so a retry is the same apply.
+//
+// Where the client cannot elicit, the only gate is the client's own
+// tool-approval prompt: apply_intent is not read-only, so a client that asks
+// before running such tools asks here, and the echo fields make that prompt
+// readable. That is weaker (the model fills in "approved"), so it is capped at
+// maxUnelicited messages and recorded as "client-tool-approval".
+func approve(ctx context.Context, req *mcp.CallToolRequest, d writeDeps, p *organise.Preview) (by string, pending *mcp.CallToolResult, err error) {
+	if !clientElicits(req) {
 		if p.Matched > d.maxUnelicited {
-			return "", organise.SafeError(fmt.Sprintf(
+			return "", nil, organise.SafeError(fmt.Sprintf(
 				"more than %d messages needs a client that supports confirmation (elicitation)", d.maxUnelicited))
 		}
-		return history.ApprovedClientTool, nil
+		return history.ApprovedClientTool, nil, nil
 	}
-	res, err := ss.Elicit(ctx, &mcp.ElicitParams{
+	params := &mcp.ElicitParams{
 		Mode:    "form",
 		Message: elicitMessage(d, p),
 		RequestedSchema: map[string]any{
@@ -299,18 +321,45 @@ func approve(ctx context.Context, ss *mcp.ServerSession, d writeDeps, p *organis
 			},
 			"required": []string{"confirm"},
 		},
-	})
-	if err != nil {
-		slog.Warn("apply_intent: elicitation failed", "err", err)
-		return "", errors.New("approval could not be obtained; nothing was changed")
+	}
+	var res *mcp.ElicitResult
+	if req.ProtocolVersion() >= protocol20260728 {
+		// The question is bound to this preview twice over: it is keyed by a
+		// value derived from the token, and RequestState carries an HMAC over
+		// the token and a single-use nonce. An answer is accepted only under
+		// the key, with a state that verifies for this token and has not been
+		// used. Anything else (an answer given for another token, a forged or
+		// replayed one, none) is not an answer: a new question is asked, and
+		// nothing is applied on it.
+		key := d.org.QuestionKey(p)
+		got, answered := req.Params.InputResponses[key]
+		if !answered || !d.org.TakeQuestion(p.Token, req.Params.RequestState) {
+			state, err := d.org.NewQuestion(p.Token)
+			if err != nil {
+				return "", nil, organise.ErrExpired
+			}
+			return "", &mcp.CallToolResult{InputRequests: mcp.InputRequestMap{key: params}, RequestState: state}, nil
+		}
+		er, ok := got.(*mcp.ElicitResult)
+		if !ok || er == nil {
+			return "", nil, errors.New("approval could not be obtained; nothing was changed")
+		}
+		res = er
+	} else {
+		ss := req.Session
+		res, err = ss.Elicit(ctx, params)
+		if err != nil {
+			slog.Warn("apply_intent: elicitation failed", "err", err)
+			return "", nil, errors.New("approval could not be obtained; nothing was changed")
+		}
 	}
 	if res.Action != "accept" {
-		return "", errors.New("the owner did not approve; nothing was changed")
+		return "", nil, errors.New("the owner did not approve; nothing was changed")
 	}
 	if ok, _ := res.Content["confirm"].(bool); !ok {
-		return "", errors.New("the owner did not approve; nothing was changed")
+		return "", nil, errors.New("the owner did not approve; nothing was changed")
 	}
-	return history.ApprovedElicitation, nil
+	return history.ApprovedElicitation, nil, nil
 }
 
 // newTargetWindow is how long a folder made by create_folder still counts as new.
@@ -402,13 +451,12 @@ func addApplyIntent(s *mcp.Server, d writeDeps) {
 			return nil, applyOut{}, err
 		}
 
-		var ss *mcp.ServerSession
-		if req != nil {
-			ss = req.Session
-		}
-		approvedBy, err := approve(ctx, ss, d, p)
+		approvedBy, pending, err := approve(ctx, req, d, p)
 		if err != nil {
 			return nil, applyOut{}, err
+		}
+		if pending != nil {
+			return pending, applyOut{}, nil // input_required: the client retries with the answer
 		}
 		if !d.org.Consume(in.PreviewToken) { // expired while waiting, or already used
 			return nil, applyOut{}, organise.ErrExpired
@@ -422,7 +470,7 @@ func addApplyIntent(s *mcp.Server, d writeDeps) {
 			Preview: history.PreviewInfo{Matched: p.Matched, Sampled: len(p.Samples), ApprovedBy: approvedBy},
 			Touched: history.Group(outcome.Touched), AlreadyInTarget: history.Group(outcome.AlreadyInTarget),
 			CopiedBack: history.Group(outcome.CopiedBack),
-			Skipped:    outcome.Skipped, Undoes: p.Undoes, Reapplies: p.Reapplies,
+			Skipped:    outcome.Skipped, NotPreviewed: outcome.NotPreviewed, Undoes: p.Undoes, Reapplies: p.Reapplies,
 		}
 		if aerr != nil {
 			rec.Error = applyErrorText(aerr)
@@ -440,15 +488,15 @@ func addApplyIntent(s *mcp.Server, d writeDeps) {
 		if aerr != nil {
 			slog.Warn("tool failed", "tool", "apply_intent", "account", a.Name, "err", aerr)
 			return nil, applyOut{}, fmt.Errorf("%s; %d of %d messages were changed (history %s)",
-				applyErrorText(aerr), len(outcome.Touched), p.Matched-outcome.Skipped, saved.ID)
+				applyErrorText(aerr), distinct(outcome.Touched), p.Matched-outcome.Skipped, saved.ID)
 		}
 		if herr != nil {
-			return nil, applyOut{}, fmt.Errorf("%d messages were changed but the history could not be written", len(outcome.Touched))
+			return nil, applyOut{}, fmt.Errorf("%d messages were changed but the history could not be written", distinct(outcome.Touched))
 		}
 		return nil, applyOut{
 			Account: a.Name, Kind: p.Kind, Action: intent.Action,
 			Source: field(intent.Criterion.Folder), Target: field(intent.Target),
-			Matched: p.Matched, Done: len(outcome.Touched), Skipped: outcome.Skipped,
+			Matched: p.Matched, Done: distinct(outcome.Touched), CopiedBack: distinct(outcome.CopiedBack), Skipped: outcome.Skipped, NotPreviewed: outcome.NotPreviewed,
 			ApprovedBy: approvedBy, HistoryID: saved.ID,
 		}, nil
 	})
@@ -486,6 +534,7 @@ type historyView struct {
 	AlreadyInTarget int                 `json:"already_in_target,omitempty"`
 	CopiedBack      int                 `json:"copied_back,omitempty"`
 	Skipped         int                 `json:"skipped,omitempty"`
+	NotPreviewed    int                 `json:"not_previewed,omitempty"`
 	Error           string              `json:"error,omitempty"`
 	Undoes          string              `json:"undoes,omitempty"`
 	Reapplies       string              `json:"reapplies,omitempty"`
@@ -498,12 +547,25 @@ type listHistoryOut struct {
 	Count   int           `json:"count"`
 }
 
+// countIDs counts distinct stable ids: a message in two folders, or with two
+// UIDs, is one message.
 func countIDs(m map[string][]string) int {
-	n := 0
+	seen := map[string]bool{}
 	for _, ids := range m {
-		n += len(ids)
+		for _, id := range ids {
+			seen[id] = true
+		}
 	}
-	return n
+	return len(seen)
+}
+
+// distinct counts the distinct stable ids in an outcome's list.
+func distinct(ts []organise.Touched) int {
+	seen := map[string]bool{}
+	for _, t := range ts {
+		seen[t.StableID] = true
+	}
+	return len(seen)
 }
 
 func touchedCount(r history.Record) int { return countIDs(r.Touched) }
@@ -549,7 +611,7 @@ func addListHistory(s *mcp.Server, byName map[string]accounts.Account, hist *his
 				Preview: history.PreviewInfo{
 					Matched: r.Preview.Matched, Sampled: r.Preview.Sampled, ApprovedBy: field(r.Preview.ApprovedBy),
 				},
-				TouchedCount: touchedCount(r), AlreadyInTarget: countIDs(r.AlreadyInTarget), CopiedBack: countIDs(r.CopiedBack), Skipped: r.Skipped,
+				TouchedCount: touchedCount(r), AlreadyInTarget: countIDs(r.AlreadyInTarget), CopiedBack: countIDs(r.CopiedBack), Skipped: r.Skipped, NotPreviewed: r.NotPreviewed,
 				Error: field(r.Error), Undoes: field(r.Undoes), Reapplies: field(r.Reapplies),
 				Untrusted: historyUntrusted{Intent: cleanIntent(r.Intent), Target: field(r.Target)},
 			})

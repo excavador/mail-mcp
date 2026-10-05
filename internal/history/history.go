@@ -78,6 +78,9 @@ type Record struct {
 	// had been moved out of, by folder.
 	CopiedBack map[string][]string `json:"copied_back,omitempty"`
 	Skipped    int                 `json:"skipped,omitempty"`
+	// NotPreviewed counts messages that matched at apply time but were not in
+	// the preview (mail that arrived since); they were left alone.
+	NotPreviewed int `json:"not_previewed,omitempty"`
 	// Group, Part and Parts tie together the records of one apply too large
 	// for a single line. Group is the id of part 1; both are zero otherwise.
 	Group string `json:"group,omitempty"`
@@ -227,7 +230,13 @@ func Group(ts []organise.Touched) map[string][]string {
 		return nil
 	}
 	m := map[string][]string{}
+	seen := map[[2]string]bool{}
 	for _, t := range ts {
+		k := [2]string{t.FromFolder, t.StableID}
+		if seen[k] {
+			continue // one entry per message and folder, however many UIDs
+		}
+		seen[k] = true
 		m[t.FromFolder] = append(m[t.FromFolder], t.StableID)
 	}
 	return m
