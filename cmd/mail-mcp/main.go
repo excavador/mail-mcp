@@ -31,6 +31,8 @@ import (
 
 	"github.com/excavador/mail-mcp/internal/accounts"
 	"github.com/excavador/mail-mcp/internal/cache"
+	"github.com/excavador/mail-mcp/internal/history"
+	"github.com/excavador/mail-mcp/internal/organise"
 	"github.com/excavador/mail-mcp/internal/server"
 )
 
@@ -109,6 +111,15 @@ func main() {
 				Value:   "/var/cache/mail-mcp",
 				Sources: cli.EnvVars("CACHE_DIR"),
 			},
+			&cli.StringFlag{
+				Name: "history-dir",
+				// What mail-mcp changed, append-only. Unlike the cache it
+				// cannot be rebuilt (undo needs it), so it belongs on a volume
+				// that is backed up.
+				Usage:   "directory for the append-only history of changes (history.jsonl)",
+				Value:   "/var/lib/mail-mcp/history",
+				Sources: cli.EnvVars("HISTORY_DIR"),
+			},
 			&cli.DurationFlag{
 				Name:    "refresh-interval",
 				Usage:   "how often to refresh the cache from each mailbox; 0 disables refreshing",
@@ -142,6 +153,18 @@ func run(ctx context.Context, cmd *cli.Command) error {
 	if err != nil {
 		return err
 	}
+	hist, err := history.Open(cmd.String("history-dir"))
+	if err != nil {
+		_ = store.Close()
+		return err
+	}
+	org, err := organise.New(store)
+	if err != nil {
+		_ = hist.Close()
+		_ = store.Close()
+		return err
+	}
+	opts := []server.Option{server.WithHistory(hist), server.WithOrganiser(org)}
 	// Refreshers stop, and are waited for, before the cache closes under them.
 	ctx, cancel := context.WithCancel(ctx)
 	var wg sync.WaitGroup
@@ -149,6 +172,7 @@ func run(ctx context.Context, cmd *cli.Command) error {
 		cancel()
 		wg.Wait()
 		_ = store.Close()
+		_ = hist.Close()
 	}()
 	for _, a := range accts {
 		wg.Add(1)
@@ -157,10 +181,11 @@ func run(ctx context.Context, cmd *cli.Command) error {
 			store.Run(ctx, log, a, cmd.Duration("refresh-interval"))
 		}()
 	}
+	log.Info("history", "dir", cmd.String("history-dir"))
 	log.Info("cache", "dir", cmd.String("cache-dir"), "refresh_interval", cmd.Duration("refresh-interval").String())
 
 	if cmd.String("transport") != "http" {
-		return server.New(accts, store, version, server.Admin).Run(ctx, &mcp.StdioTransport{})
+		return server.New(accts, store, version, server.Admin, opts...).Run(ctx, &mcp.StdioTransport{})
 	}
 
 	issuer := cmd.String("issuer-url")
@@ -190,7 +215,7 @@ func run(ctx context.Context, cmd *cli.Command) error {
 		if err != nil {
 			return fmt.Errorf("auth for %s: %w", ep.path, err)
 		}
-		s := server.New(accts, store, version, ep.mode)
+		s := server.New(accts, store, version, ep.mode, opts...)
 		h := mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return s }, nil)
 
 		mux.Handle(ep.path, auth.Protect(h))

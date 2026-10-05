@@ -1,0 +1,230 @@
+package organise
+
+import (
+	"context"
+	"crypto/hmac"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/excavador/mail-mcp/internal/accounts"
+	"github.com/excavador/mail-mcp/internal/cache"
+)
+
+const (
+	// PreviewTTL is how long an approval-pending preview stays valid.
+	PreviewTTL = 15 * time.Minute
+	// maxPreviews bounds the in-memory previews; the oldest is evicted.
+	maxPreviews = 32
+	// SampleCount is how many matching messages a preview shows.
+	SampleCount = 20
+)
+
+// Preview is a resolved intent awaiting approval: a fixed set of stable ids.
+type Preview struct {
+	Token   string
+	Expires time.Time
+
+	Account string
+	Intent  Intent
+	Kind    string // KindApply, KindUndo or KindReapply
+	// IDs is the sorted, de-duplicated set the owner is shown and approves.
+	IDs []string
+	// IDsOnly means the set is explicit (undo) and the criterion carries only
+	// its folder; otherwise the criterion is re-resolved at apply.
+	IDsOnly bool
+	// After restricts a re-resolve to mail the server received after it
+	// (reapply).
+	After time.Time
+
+	Undoes, Reapplies string // history id this preview reverses or repeats
+	Missing           int    // undo: recorded messages not found in the folder
+
+	Matched int
+	Samples []cache.SearchHit
+}
+
+// Organiser holds the previews and the per-account write slots. One Organiser
+// is shared by every server in the process.
+type Organiser struct {
+	store *cache.Cache
+	key   []byte // HMAC key; in memory, so a restart invalidates every token
+
+	mu       sync.Mutex
+	previews map[string]*Preview
+	order    []string // tokens, oldest first
+
+	slots sync.Map // account -> chan struct{} (capacity 1)
+}
+
+// New returns an Organiser over store with a fresh random signing key.
+func New(store *cache.Cache) (*Organiser, error) {
+	key := make([]byte, 32)
+	if _, err := rand.Read(key); err != nil {
+		return nil, fmt.Errorf("organise: signing key: %w", err)
+	}
+	return &Organiser{store: store, key: key, previews: map[string]*Preview{}}, nil
+}
+
+// Acquire takes the account's write slot. A second caller does not wait: it is
+// refused, so two applies can never interleave on one mailbox.
+func (o *Organiser) Acquire(account string) (release func(), err error) {
+	v, _ := o.slots.LoadOrStore(account, make(chan struct{}, 1))
+	slot := v.(chan struct{})
+	select {
+	case slot <- struct{}{}:
+		return func() { <-slot }, nil
+	default:
+		return nil, ErrBusy
+	}
+}
+
+func (o *Organiser) query(in Intent, after time.Time) cache.MemberQuery {
+	c := in.Criterion
+	return cache.MemberQuery{
+		Folder: c.Folder, From: c.From, To: c.To, SubjectContains: c.SubjectContains,
+		ListID: c.ListID, GitHubReason: c.GitHubReason, Since: c.Since, Before: c.Before,
+		ReceivedAfter: after,
+	}
+}
+
+// resolve returns the cached members the preview's criterion (or explicit id
+// set) covers right now.
+func (o *Organiser) resolve(ctx context.Context, p *Preview) ([]cache.Member, error) {
+	if p.IDsOnly {
+		return o.store.MembersByID(ctx, p.Account, p.Intent.Criterion.Folder, p.IDs)
+	}
+	ms, err := o.store.ResolveMembers(ctx, p.Account, o.query(p.Intent, p.After), maxIntentMessages)
+	if errors.Is(err, cache.ErrTooMany) {
+		return nil, ErrTooManyMatched
+	}
+	return ms, err
+}
+
+func uniqueIDs(ms []cache.Member) []string {
+	seen := make(map[string]bool, len(ms))
+	var ids []string
+	for _, m := range ms {
+		if !seen[m.StableID] {
+			seen[m.StableID] = true
+			ids = append(ids, m.StableID)
+		}
+	}
+	return ids // already in resolve order (newest first); callers sort a copy
+}
+
+// PreviewIntent resolves a criterion intent against the cache and issues a
+// token for it. kind is KindApply or KindReapply; after, for a reapply, is
+// the original apply time.
+func (o *Organiser) PreviewIntent(ctx context.Context, a accounts.Account, in Intent, kind string, after time.Time, reapplies string) (*Preview, error) {
+	in.Account = a.Name
+	if err := in.Validate(a.Provider); err != nil {
+		return nil, err
+	}
+	p := &Preview{Account: a.Name, Intent: in, Kind: kind, After: after, Reapplies: reapplies}
+	ms, err := o.resolve(ctx, p)
+	if err != nil {
+		return nil, err
+	}
+	return o.issue(ctx, p, uniqueIDs(ms))
+}
+
+// PreviewIDs issues a token for an explicit set of ids in in.Criterion.Folder
+// (undo). The caller has already found them; missing counts the ones it could
+// not.
+func (o *Organiser) PreviewIDs(ctx context.Context, a accounts.Account, in Intent, ids []string, missing int, undoes string) (*Preview, error) {
+	in.Account = a.Name
+	if err := in.CheckMove(a.Provider); err != nil {
+		return nil, err
+	}
+	if len(ids) > maxIntentMessages {
+		return nil, ErrTooManyMatched
+	}
+	p := &Preview{Account: a.Name, Intent: in, Kind: KindUndo, IDsOnly: true, Undoes: undoes, Missing: missing}
+	return o.issue(ctx, p, ids)
+}
+
+func (o *Organiser) issue(ctx context.Context, p *Preview, ids []string) (*Preview, error) {
+	p.Matched = len(ids)
+	sample := ids[:min(len(ids), SampleCount)] // resolve order is newest first
+	hits, err := o.store.Summaries(ctx, p.Account, sample)
+	if err != nil {
+		return nil, err
+	}
+	p.Samples = hits
+	p.IDs = append([]string(nil), ids...)
+	sort.Strings(p.IDs)
+	p.Expires = time.Now().Add(PreviewTTL).UTC().Truncate(time.Second)
+	p.Token = o.sign(p)
+
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.previews[p.Token] = p
+	o.order = append(o.order, p.Token)
+	for len(o.order) > maxPreviews {
+		delete(o.previews, o.order[0])
+		o.order = o.order[1:]
+	}
+	return p, nil
+}
+
+// canonical is what the token's HMAC covers. Struct field order is fixed, so
+// the JSON is deterministic.
+type canonical struct {
+	Account   string    `json:"account"`
+	Kind      string    `json:"kind"`
+	Intent    Intent    `json:"intent"`
+	IDsOnly   bool      `json:"ids_only"`
+	After     time.Time `json:"after"`
+	IDDigest  string    `json:"ids_sha256"`
+	ExpiresAt int64     `json:"expires_at"`
+}
+
+func (o *Organiser) sign(p *Preview) string {
+	sum := sha256.Sum256([]byte(strings.Join(p.IDs, "\n")))
+	raw, _ := json.Marshal(canonical{
+		Account: p.Account, Kind: p.Kind, Intent: p.Intent, IDsOnly: p.IDsOnly, After: p.After.UTC(),
+		IDDigest: hex.EncodeToString(sum[:]), ExpiresAt: p.Expires.Unix(),
+	})
+	m := hmac.New(sha256.New, o.key)
+	m.Write(raw)
+	// The expiry rides in the token, ahead of the MAC it is covered by.
+	return strconv.FormatInt(p.Expires.Unix(), 10) + "." + base64.RawURLEncoding.EncodeToString(m.Sum(nil))
+}
+
+// Lookup returns the preview a token names, or ErrExpired: unknown, evicted,
+// expired and tampered tokens are not told apart.
+func (o *Organiser) Lookup(token string) (*Preview, error) {
+	o.mu.Lock()
+	p, ok := o.previews[token]
+	o.mu.Unlock()
+	if !ok || !time.Now().Before(p.Expires) {
+		return nil, ErrExpired
+	}
+	if !hmac.Equal([]byte(o.sign(p)), []byte(token)) {
+		return nil, ErrExpired
+	}
+	return p, nil
+}
+
+// Consume forgets a preview: a token approves one apply.
+func (o *Organiser) Consume(token string) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	delete(o.previews, token)
+	for i, t := range o.order {
+		if t == token {
+			o.order = append(o.order[:i], o.order[i+1:]...)
+			break
+		}
+	}
+}
