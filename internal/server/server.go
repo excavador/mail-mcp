@@ -16,6 +16,7 @@ package server
 import (
 	"context"
 	"fmt"
+	"log/slog"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
@@ -101,7 +102,7 @@ func New(accts []accounts.Account, store *cache.Cache, version string, mode Mode
 	for _, f := range opts {
 		f(&o)
 	}
-	s := mcp.NewServer(&mcp.Implementation{Name: "mail-" + mode.String(), Version: version}, nil)
+	s := mcp.NewServer(&mcp.Implementation{Name: "mail-" + mode.String(), Version: version}, &mcp.ServerOptions{Logger: slog.Default()})
 	byName := map[string]accounts.Account{}
 	for _, a := range accts {
 		byName[a.Name] = a

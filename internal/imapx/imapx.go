@@ -288,7 +288,11 @@ func ListFolders(ctx context.Context, c *imapclient.Client) ([]Folder, error) {
 			continue
 		}
 		st, err := c.Status(m.Mailbox, &imap.StatusOptions{NumMessages: true}).Wait()
-		if err == nil && st.NumMessages != nil {
+		if err != nil {
+			if cerr := ctx.Err(); cerr != nil {
+				return nil, fmt.Errorf("status: %w", cerr) // the session ended, not a folder that refuses STATUS
+			}
+		} else if st.NumMessages != nil {
 			f.Messages = *st.NumMessages
 		}
 		out = append(out, f)

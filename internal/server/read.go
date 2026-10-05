@@ -104,7 +104,7 @@ type listFoldersOut struct {
 // server search has its own cache.HitsByUIDTimeout (10s), so the longest a
 // server search can take is liveTimeout + imapx's 3s grace + HitsByUIDTimeout,
 // about 33s, under the gateway's timeout.
-const liveTimeout = 20 * time.Second
+var liveTimeout = 20 * time.Second
 
 // liveBusy holds one slot per account, shared by every server in the process:
 // a live listing opens a connection and one STATUS per folder, so only one

@@ -18,20 +18,46 @@ import (
 const (
 	// chunkUIDs UIDs per MOVE or COPY: one command, bounded size.
 	chunkUIDs = 500
-	// applyBudget bounds the IMAP part of one apply (dial, moves). It is
-	// enforced by imapx.Do, and stays under the gateway's request timeout:
-	// an apply that runs out of time keeps what it moved, records it in the
-	// history, and says so; the owner previews the rest again.
-	applyBudget = 30 * time.Second
+)
+
+// Budgets of the IMAP sessions, vars so tests can shorten them. Each is
+// enforced by imapx.Do and sized for Gmail answering in ~9s per command, under
+// the ~100s cut of the Cloudflare in front.
+var (
+	// applyBudget bounds the IMAP part of one apply (dial, moves). An apply
+	// that runs out keeps what it moved, records it in the history and says so.
+	applyBudget = 75 * time.Second
 	// createBudget bounds create_folder.
-	createBudget = 20 * time.Second
+	createBudget = 45 * time.Second
 	// undoRefreshBudget bounds the refresh undo does before it looks.
-	undoRefreshBudget = 30 * time.Second
-	// afterApplyRefreshBudget bounds the re-read that follows an apply. A
-	// folder it cannot refresh in time stays stale until the next scheduled
-	// refresh; the apply's own result does not depend on it.
+	undoRefreshBudget = 45 * time.Second
+	// afterApplyRefreshBudget bounds the re-read after an apply; a folder it
+	// cannot refresh in time stays stale until the next scheduled refresh.
 	afterApplyRefreshBudget = 15 * time.Second
 )
+
+// Budgets are the IMAP time budgets of this package.
+type Budgets struct{ Apply, Create, UndoRefresh, AfterApplyRefresh time.Duration }
+
+// SetBudgets replaces the budgets for tests that need a stalled server to
+// time out quickly; a zero field is left as it is. It returns a func that
+// puts the previous values back. For tests only: it changes package state
+// and is not safe to call while sessions are running.
+func SetBudgets(b Budgets) (restore func()) {
+	prev := Budgets{applyBudget, createBudget, undoRefreshBudget, afterApplyRefreshBudget}
+	set := func(dst *time.Duration, v time.Duration) {
+		if v > 0 {
+			*dst = v
+		}
+	}
+	set(&applyBudget, b.Apply)
+	set(&createBudget, b.Create)
+	set(&undoRefreshBudget, b.UndoRefresh)
+	set(&afterApplyRefreshBudget, b.AfterApplyRefresh)
+	return func() {
+		applyBudget, createBudget, undoRefreshBudget, afterApplyRefreshBudget = prev.Apply, prev.Create, prev.UndoRefresh, prev.AfterApplyRefresh
+	}
+}
 
 // Touched is one message an apply acted on, by stable id so that it can be
 // found again after UIDs change, and the folder it came from.
