@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -27,6 +28,9 @@ type writeDeps struct {
 	store  *cache.Cache
 	hist   *history.Store
 	org    *organise.Organiser
+	// maxUnelicited is the most messages apply_intent will change when the
+	// client cannot show the owner a confirmation of its own.
+	maxUnelicited int
 }
 
 func ptr[T any](v T) *T { return &v }
@@ -127,6 +131,8 @@ type previewOut struct {
 	Source       string           `json:"source"`
 	Target       string           `json:"target"`
 	Matched      int              `json:"matched"`
+	MoveBack     int              `json:"move_back,omitempty" jsonschema:"undo: messages moved back to their source"`
+	CopyBack     int              `json:"copy_back,omitempty" jsonschema:"undo: messages copied back to their source because they were already in the target before the apply, so they keep it"`
 	NotFound     int              `json:"not_found,omitempty" jsonschema:"undo: recorded messages no longer in the folder"`
 	Sampled      int              `json:"sampled"`
 	Untrusted    previewUntrusted `json:"untrusted"`
@@ -137,8 +143,11 @@ func previewResult(p *organise.Preview) previewOut {
 		Notice:       untrustedFieldsNotice + " Nothing has changed yet: apply_intent with this token, once the owner approves, executes it.",
 		PreviewToken: p.Token, ExpiresAt: p.Expires, Account: p.Account, Kind: p.Kind,
 		Action: p.Intent.Action, Source: field(p.Intent.Criterion.Folder), Target: field(p.Intent.Target),
-		Matched: p.Matched, NotFound: p.Missing, Sampled: len(p.Samples),
+		Matched: p.Matched, NotFound: p.Missing, CopyBack: len(p.CopyBack), Sampled: len(p.Samples),
 		Untrusted: previewUntrusted{Samples: []sampleOut{}},
+	}
+	if p.Kind == organise.KindUndo {
+		out.MoveBack = len(p.IDs)
 	}
 	for _, h := range p.Samples {
 		out.Untrusted.Samples = append(out.Untrusted.Samples, sampleOut{
@@ -208,6 +217,31 @@ func previewFail(tool string, err error, account string) error {
 type applyIn struct {
 	PreviewToken string `json:"preview_token" jsonschema:"the token preview_intent, undo or reapply returned"`
 	Approved     bool   `json:"approved" jsonschema:"must be true, and only after the owner has seen the preview and agreed"`
+	// The echo fields restate the preview. They exist so that the client's
+	// approval prompt, which shows a tool call's arguments, shows the owner
+	// what is about to happen and not just an opaque token.
+	ExpectAccount string `json:"expect_account" jsonschema:"the account, as the preview shows it"`
+	ExpectAction  string `json:"expect_action" jsonschema:"move or label, as the preview shows it"`
+	ExpectSource  string `json:"expect_source" jsonschema:"the source folder, as the preview shows it"`
+	ExpectTarget  string `json:"expect_target" jsonschema:"the target folder, as the preview shows it"`
+	ExpectMatched int    `json:"expect_matched" jsonschema:"the matched count, as the preview shows it"`
+}
+
+// checkEcho refuses an apply whose echo fields do not restate the preview.
+func checkEcho(in applyIn, p *organise.Preview) error {
+	switch {
+	case in.ExpectAccount != p.Account:
+		return organise.SafeError("expect_account does not match the preview")
+	case in.ExpectAction != p.Intent.Action:
+		return organise.SafeError("expect_action does not match the preview")
+	case in.ExpectSource != p.Intent.Criterion.Folder:
+		return organise.SafeError("expect_source does not match the preview")
+	case in.ExpectTarget != p.Intent.Target:
+		return organise.SafeError("expect_target does not match the preview")
+	case in.ExpectMatched != p.Matched:
+		return organise.SafeError("expect_matched does not match the preview")
+	}
+	return nil
 }
 
 type applyOut struct {
@@ -247,16 +281,17 @@ func supportsElicitation(ss *mcp.ServerSession) bool {
 // apply_intent is not read-only, so a client that asks before running such
 // tools asks here. That is weaker (the model fills in "approved"), and is
 // recorded as "client-tool-approval" so the history shows which it was.
-func approve(ctx context.Context, ss *mcp.ServerSession, p *organise.Preview) (string, error) {
+func approve(ctx context.Context, ss *mcp.ServerSession, d writeDeps, p *organise.Preview) (string, error) {
 	if !supportsElicitation(ss) {
+		if p.Matched > d.maxUnelicited {
+			return "", organise.SafeError(fmt.Sprintf(
+				"more than %d messages needs a client that supports confirmation (elicitation)", d.maxUnelicited))
+		}
 		return history.ApprovedClientTool, nil
 	}
-	msg := fmt.Sprintf("Apply %s of %d message(s) in account %s: %s -> %s? "+
-		"(%s; undo is available from the history.)",
-		p.Intent.Action, p.Matched, p.Account, field(p.Intent.Criterion.Folder), field(p.Intent.Target), p.Kind)
 	res, err := ss.Elicit(ctx, &mcp.ElicitParams{
 		Mode:    "form",
-		Message: msg,
+		Message: elicitMessage(d, p),
 		RequestedSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
@@ -278,6 +313,59 @@ func approve(ctx context.Context, ss *mcp.ServerSession, p *organise.Preview) (s
 	return history.ApprovedElicitation, nil
 }
 
+// newTargetWindow is how long a folder made by create_folder still counts as new.
+const newTargetWindow = 24 * time.Hour
+
+// warnings are the things the owner should weigh first: a move that takes mail
+// out of the inbox, and a target nothing has been put in before (a fresh,
+// possibly hidden, destination is how mail gets buried).
+func warnings(d writeDeps, p *organise.Preview) []string {
+	var w []string
+	if p.Intent.Action == organise.ActionMove && strings.EqualFold(p.Intent.Criterion.Folder, "INBOX") {
+		w = append(w, "moves mail OUT OF INBOX")
+	}
+	applied, created := d.hist.TargetHistory(p.Account, p.Intent.Target)
+	if !applied || (!created.IsZero() && time.Since(created) < newTargetWindow) {
+		w = append(w, "target folder is new")
+	}
+	return w
+}
+
+// elicitMessage is what the owner reads: warnings first, then what, where, how
+// many, by which criterion, and a few of the messages. Every third-party or
+// caller-supplied string is sanitised and capped.
+func elicitMessage(d writeDeps, p *organise.Preview) string {
+	var b strings.Builder
+	for _, w := range warnings(d, p) {
+		fmt.Fprintf(&b, "WARNING: %s\n", w)
+	}
+	in := p.Intent
+	fmt.Fprintf(&b, "Apply %s of %d message(s) in account %s: %s -> %s (%s; undo is available from the history).\n",
+		field(in.Action), p.Matched, field(p.Account), field(in.Criterion.Folder), field(in.Target), field(p.Kind))
+	c := in.Criterion
+	for _, kv := range [][2]string{
+		{"from", c.From}, {"to", c.To}, {"subject contains", c.SubjectContains},
+		{"list-id", c.ListID}, {"github reason", c.GitHubReason},
+	} {
+		if kv[1] != "" {
+			fmt.Fprintf(&b, "Criterion %s: %s\n", kv[0], field(kv[1]))
+		}
+	}
+	if !c.Since.IsZero() {
+		fmt.Fprintf(&b, "Criterion since: %s\n", c.Since.UTC().Format(time.RFC3339))
+	}
+	if !c.Before.IsZero() {
+		fmt.Fprintf(&b, "Criterion before: %s\n", c.Before.UTC().Format(time.RFC3339))
+	}
+	for i, h := range p.Samples {
+		if i == 5 {
+			break
+		}
+		fmt.Fprintf(&b, "Sample: %s | %s\n", field(h.From), field(h.Subject))
+	}
+	return b.String()
+}
+
 func addApplyIntent(s *mcp.Server, d writeDeps) {
 	mcp.AddTool(s, &mcp.Tool{
 		Name: "apply_intent",
@@ -289,11 +377,15 @@ func addApplyIntent(s *mcp.Server, d writeDeps) {
 		if !in.Approved {
 			return nil, applyOut{}, errors.New("approved must be true, after the owner has seen the preview")
 		}
-		p, err := d.org.Lookup(in.PreviewToken)
+		// Order matters. The slot comes first, so two applies of one token
+		// cannot both get past the checks; the token is looked up again after
+		// approval (the owner may have taken minutes) and consumed before
+		// anything is changed, so it approves exactly one apply.
+		first, err := d.org.Lookup(in.PreviewToken)
 		if err != nil {
 			return nil, applyOut{}, err
 		}
-		a, err := account(d.byName, p.Account)
+		a, err := account(d.byName, first.Account)
 		if err != nil {
 			return nil, applyOut{}, err
 		}
@@ -302,16 +394,25 @@ func addApplyIntent(s *mcp.Server, d writeDeps) {
 			return nil, applyOut{}, err
 		}
 		defer release()
+		p, err := d.org.Lookup(in.PreviewToken)
+		if err != nil {
+			return nil, applyOut{}, err
+		}
+		if err := checkEcho(in, p); err != nil {
+			return nil, applyOut{}, err
+		}
 
 		var ss *mcp.ServerSession
 		if req != nil {
 			ss = req.Session
 		}
-		approvedBy, err := approve(ctx, ss, p)
+		approvedBy, err := approve(ctx, ss, d, p)
 		if err != nil {
 			return nil, applyOut{}, err
 		}
-		d.org.Consume(in.PreviewToken) // one token, one apply
+		if !d.org.Consume(in.PreviewToken) { // expired while waiting, or already used
+			return nil, applyOut{}, organise.ErrExpired
+		}
 
 		outcome, aerr := d.org.Apply(ctx, a, p)
 
@@ -319,14 +420,20 @@ func addApplyIntent(s *mcp.Server, d writeDeps) {
 		rec := history.Record{
 			Account: a.Name, Kind: p.Kind, Intent: &intent, Action: intent.Action, Target: intent.Target,
 			Preview: history.PreviewInfo{Matched: p.Matched, Sampled: len(p.Samples), ApprovedBy: approvedBy},
-			Touched: outcome.Touched, Skipped: outcome.Skipped, Undoes: p.Undoes, Reapplies: p.Reapplies,
+			Touched: history.Group(outcome.Touched), AlreadyInTarget: history.Group(outcome.AlreadyInTarget),
+			CopiedBack: history.Group(outcome.CopiedBack),
+			Skipped:    outcome.Skipped, Undoes: p.Undoes, Reapplies: p.Reapplies,
 		}
 		if aerr != nil {
 			rec.Error = applyErrorText(aerr)
 		}
 		// The record is written before anything is returned, partial progress
 		// included: it is the only way to undo what was done.
-		saved, herr := d.hist.Append(rec)
+		parts, herr := d.hist.AppendGroup(rec)
+		saved := history.Record{}
+		if len(parts) > 0 {
+			saved = parts[0]
+		}
 		if herr != nil {
 			slog.Error("apply_intent: history write failed", "account", a.Name, "touched", len(outcome.Touched), "err", herr)
 		}
@@ -369,18 +476,20 @@ type historyUntrusted struct {
 }
 
 type historyView struct {
-	ID           string              `json:"id"`
-	At           time.Time           `json:"at"`
-	Account      string              `json:"account"`
-	Kind         string              `json:"kind"`
-	Action       string              `json:"action,omitempty"`
-	Preview      history.PreviewInfo `json:"preview"`
-	TouchedCount int                 `json:"touched_count"`
-	Skipped      int                 `json:"skipped,omitempty"`
-	Error        string              `json:"error,omitempty"`
-	Undoes       string              `json:"undoes,omitempty"`
-	Reapplies    string              `json:"reapplies,omitempty"`
-	Untrusted    historyUntrusted    `json:"untrusted"`
+	ID              string              `json:"id"`
+	At              time.Time           `json:"at"`
+	Account         string              `json:"account"`
+	Kind            string              `json:"kind"`
+	Action          string              `json:"action,omitempty"`
+	Preview         history.PreviewInfo `json:"preview"`
+	TouchedCount    int                 `json:"touched_count"`
+	AlreadyInTarget int                 `json:"already_in_target,omitempty"`
+	CopiedBack      int                 `json:"copied_back,omitempty"`
+	Skipped         int                 `json:"skipped,omitempty"`
+	Error           string              `json:"error,omitempty"`
+	Undoes          string              `json:"undoes,omitempty"`
+	Reapplies       string              `json:"reapplies,omitempty"`
+	Untrusted       historyUntrusted    `json:"untrusted"`
 }
 
 type listHistoryOut struct {
@@ -388,6 +497,16 @@ type listHistoryOut struct {
 	Records []historyView `json:"records"`
 	Count   int           `json:"count"`
 }
+
+func countIDs(m map[string][]string) int {
+	n := 0
+	for _, ids := range m {
+		n += len(ids)
+	}
+	return n
+}
+
+func touchedCount(r history.Record) int { return countIDs(r.Touched) }
 
 func cleanIntent(in *organise.Intent) *organise.Intent {
 	if in == nil {
@@ -424,10 +543,14 @@ func addListHistory(s *mcp.Server, byName map[string]accounts.Account, hist *his
 			limit = 500
 		}
 		out := listHistoryOut{Notice: untrustedFieldsNotice, Records: []historyView{}}
-		for _, r := range hist.List(in.Account, limit) {
+		for _, r := range hist.Grouped(in.Account, limit) {
 			out.Records = append(out.Records, historyView{
-				ID: r.ID, At: r.At, Account: r.Account, Kind: r.Kind, Action: r.Action, Preview: r.Preview,
-				TouchedCount: len(r.Touched), Skipped: r.Skipped, Error: r.Error, Undoes: r.Undoes, Reapplies: r.Reapplies,
+				ID: field(r.ID), At: r.At, Account: field(r.Account), Kind: field(r.Kind), Action: field(r.Action),
+				Preview: history.PreviewInfo{
+					Matched: r.Preview.Matched, Sampled: r.Preview.Sampled, ApprovedBy: field(r.Preview.ApprovedBy),
+				},
+				TouchedCount: touchedCount(r), AlreadyInTarget: countIDs(r.AlreadyInTarget), CopiedBack: countIDs(r.CopiedBack), Skipped: r.Skipped,
+				Error: field(r.Error), Undoes: field(r.Undoes), Reapplies: field(r.Reapplies),
 				Untrusted: historyUntrusted{Intent: cleanIntent(r.Intent), Target: field(r.Target)},
 			})
 		}
@@ -465,20 +588,38 @@ func addUndo(s *mcp.Server, d writeDeps) {
 		if err != nil {
 			return nil, previewOut{}, err
 		}
-		var ids []string
-		from := ""
-		seen := map[string]bool{}
-		for _, t := range rec.Touched {
-			if from != "" && t.FromFolder != from {
-				return nil, previewOut{}, errors.New("record touched several source folders; cannot undo it as one step")
-			}
-			from = t.FromFolder
-			if !seen[t.StableID] {
-				seen[t.StableID] = true
-				ids = append(ids, t.StableID)
-			}
+		if d.hist.Undone(rec.ID) {
+			return nil, previewOut{}, errors.New("that record was already undone")
 		}
-		if len(ids) == 0 {
+		folders := map[string]bool{}
+		for f := range rec.Touched {
+			folders[f] = true
+		}
+		for f := range rec.AlreadyInTarget {
+			folders[f] = true
+		}
+		if len(folders) > 1 {
+			return nil, previewOut{}, errors.New("record touched several source folders; cannot undo it as one step")
+		}
+		from := ""
+		for f := range folders {
+			from = f
+		}
+		uniq := func(m map[string][]string) []string {
+			var out []string
+			seen := map[string]bool{}
+			for _, ids := range m {
+				for _, id := range ids {
+					if !seen[id] {
+						seen[id] = true
+						out = append(out, id)
+					}
+				}
+			}
+			return out
+		}
+		ids, copyIDs := uniq(rec.Touched), uniq(rec.AlreadyInTarget)
+		if len(ids)+len(copyIDs) == 0 {
 			return nil, previewOut{}, errors.New("that record changed nothing; there is nothing to undo")
 		}
 		// Refresh the folder the messages went to, so membership (and so the
@@ -486,19 +627,30 @@ func addUndo(s *mcp.Server, d writeDeps) {
 		if err := d.org.RefreshFolder(ctx, a, rec.Intent.Target); err != nil {
 			return nil, previewOut{}, writeFail("undo", err, a.Name)
 		}
-		ms, err := d.store.MembersByID(ctx, a.Name, rec.Intent.Target, ids)
+		present := func(want []string) ([]string, error) {
+			ms, err := d.store.MembersByID(ctx, a.Name, rec.Intent.Target, want)
+			if err != nil {
+				return nil, err
+			}
+			var found []string
+			got := map[string]bool{}
+			for _, m := range ms {
+				if !got[m.StableID] {
+					got[m.StableID] = true
+					found = append(found, m.StableID)
+				}
+			}
+			return found, nil
+		}
+		found, err := present(ids)
 		if err != nil {
 			return nil, previewOut{}, fail("undo", "preview failed", err, "account", a.Name)
 		}
-		var found []string
-		got := map[string]bool{}
-		for _, m := range ms {
-			if !got[m.StableID] {
-				got[m.StableID] = true
-				found = append(found, m.StableID)
-			}
+		copyFound, err := present(copyIDs)
+		if err != nil {
+			return nil, previewOut{}, fail("undo", "preview failed", err, "account", a.Name)
 		}
-		if len(found) == 0 {
+		if len(found)+len(copyFound) == 0 {
 			return nil, previewOut{}, errors.New("none of those messages are in the target folder any more")
 		}
 		rev := organise.Intent{
@@ -507,7 +659,7 @@ func addUndo(s *mcp.Server, d writeDeps) {
 			Target:    from,
 			Action:    organise.ActionMove,
 		}
-		p, err := d.org.PreviewIDs(ctx, a, rev, found, len(ids)-len(found), rec.ID)
+		p, err := d.org.PreviewIDs(ctx, a, rev, found, copyFound, len(ids)+len(copyIDs)-len(found)-len(copyFound), rec.ID)
 		if err != nil {
 			return nil, previewOut{}, previewFail("undo", err, a.Name)
 		}

@@ -36,7 +36,9 @@ type Preview struct {
 
 	Account string
 	Intent  Intent
-	Kind    string // KindApply, KindUndo or KindReapply
+	// Nonce makes every token unique, even for an identical preview.
+	Nonce [16]byte
+	Kind  string // KindApply, KindUndo or KindReapply
 	// IDs is the sorted, de-duplicated set the owner is shown and approves.
 	IDs []string
 	// IDsOnly means the set is explicit (undo) and the criterion carries only
@@ -45,6 +47,12 @@ type Preview struct {
 	// After restricts a re-resolve to mail the server received after it
 	// (reapply).
 	After time.Time
+
+	// CopyBack (undo of a move) lists ids that were already in the move's
+	// target before it. Undo cannot MOVE them back without stripping the
+	// target they had, so apply COPYs them into Intent.Target and leaves them
+	// in the folder they are in. Sorted; counted in Matched.
+	CopyBack []string
 
 	Undoes, Reapplies string // history id this preview reverses or repeats
 	Missing           int    // undo: recorded messages not found in the folder
@@ -141,21 +149,24 @@ func (o *Organiser) PreviewIntent(ctx context.Context, a accounts.Account, in In
 // PreviewIDs issues a token for an explicit set of ids in in.Criterion.Folder
 // (undo). The caller has already found them; missing counts the ones it could
 // not.
-func (o *Organiser) PreviewIDs(ctx context.Context, a accounts.Account, in Intent, ids []string, missing int, undoes string) (*Preview, error) {
+func (o *Organiser) PreviewIDs(ctx context.Context, a accounts.Account, in Intent, ids, copyBack []string, missing int, undoes string) (*Preview, error) {
 	in.Account = a.Name
 	if err := in.CheckMove(a.Provider); err != nil {
 		return nil, err
 	}
-	if len(ids) > maxIntentMessages {
+	if len(ids)+len(copyBack) > maxIntentMessages {
 		return nil, ErrTooManyMatched
 	}
 	p := &Preview{Account: a.Name, Intent: in, Kind: KindUndo, IDsOnly: true, Undoes: undoes, Missing: missing}
+	p.CopyBack = append([]string(nil), copyBack...)
+	sort.Strings(p.CopyBack)
 	return o.issue(ctx, p, ids)
 }
 
 func (o *Organiser) issue(ctx context.Context, p *Preview, ids []string) (*Preview, error) {
-	p.Matched = len(ids)
-	sample := ids[:min(len(ids), SampleCount)] // resolve order is newest first
+	p.Matched = len(ids) + len(p.CopyBack)
+	sample := append(append([]string(nil), ids...), p.CopyBack...)
+	sample = sample[:min(len(sample), SampleCount)] // resolve order is newest first
 	hits, err := o.store.Summaries(ctx, p.Account, sample)
 	if err != nil {
 		return nil, err
@@ -164,10 +175,23 @@ func (o *Organiser) issue(ctx context.Context, p *Preview, ids []string) (*Previ
 	p.IDs = append([]string(nil), ids...)
 	sort.Strings(p.IDs)
 	p.Expires = time.Now().Add(PreviewTTL).UTC().Truncate(time.Second)
+	if _, err := rand.Read(p.Nonce[:]); err != nil {
+		return nil, fmt.Errorf("organise: nonce: %w", err)
+	}
 	p.Token = o.sign(p)
 
 	o.mu.Lock()
 	defer o.mu.Unlock()
+	now := time.Now()
+	kept := o.order[:0]
+	for _, t := range o.order {
+		if q, ok := o.previews[t]; ok && now.Before(q.Expires) && t != p.Token {
+			kept = append(kept, t)
+		} else {
+			delete(o.previews, t) // expired (or a duplicate of the new token)
+		}
+	}
+	o.order = kept
 	o.previews[p.Token] = p
 	o.order = append(o.order, p.Token)
 	for len(o.order) > maxPreviews {
@@ -180,19 +204,23 @@ func (o *Organiser) issue(ctx context.Context, p *Preview, ids []string) (*Previ
 // canonical is what the token's HMAC covers. Struct field order is fixed, so
 // the JSON is deterministic.
 type canonical struct {
+	Nonce     string    `json:"nonce"`
 	Account   string    `json:"account"`
 	Kind      string    `json:"kind"`
 	Intent    Intent    `json:"intent"`
 	IDsOnly   bool      `json:"ids_only"`
 	After     time.Time `json:"after"`
 	IDDigest  string    `json:"ids_sha256"`
+	CopyBack  string    `json:"copy_back_sha256"`
 	ExpiresAt int64     `json:"expires_at"`
 }
 
 func (o *Organiser) sign(p *Preview) string {
 	sum := sha256.Sum256([]byte(strings.Join(p.IDs, "\n")))
+	cb := sha256.Sum256([]byte(strings.Join(p.CopyBack, "\n")))
 	raw, _ := json.Marshal(canonical{
-		Account: p.Account, Kind: p.Kind, Intent: p.Intent, IDsOnly: p.IDsOnly, After: p.After.UTC(),
+		CopyBack: hex.EncodeToString(cb[:]),
+		Nonce:    hex.EncodeToString(p.Nonce[:]), Account: p.Account, Kind: p.Kind, Intent: p.Intent, IDsOnly: p.IDsOnly, After: p.After.UTC(),
 		IDDigest: hex.EncodeToString(sum[:]), ExpiresAt: p.Expires.Unix(),
 	})
 	m := hmac.New(sha256.New, o.key)
@@ -216,10 +244,17 @@ func (o *Organiser) Lookup(token string) (*Preview, error) {
 	return p, nil
 }
 
-// Consume forgets a preview: a token approves one apply.
-func (o *Organiser) Consume(token string) {
+// Consume forgets a preview: a token approves one apply. It reports whether
+// the preview was still there and unexpired, so of two racing applies exactly
+// one gets true.
+func (o *Organiser) Consume(token string) bool {
 	o.mu.Lock()
 	defer o.mu.Unlock()
+	p, ok := o.previews[token]
+	if !ok {
+		return false
+	}
+	live := time.Now().Before(p.Expires)
 	delete(o.previews, token)
 	for i, t := range o.order {
 		if t == token {
@@ -227,4 +262,5 @@ func (o *Organiser) Consume(token string) {
 			break
 		}
 	}
+	return live
 }

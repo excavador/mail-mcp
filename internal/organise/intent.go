@@ -80,6 +80,7 @@ var (
 	ErrSourceMissing  = SafeError("source folder does not exist on the server")
 	ErrExpired        = SafeError("preview expired or unknown; preview again")
 	ErrBusy           = SafeError("another write is in progress")
+	ErrSpecialUse     = SafeError("that folder is a special-use folder (Trash, Junk, Drafts, Sent, All Mail or Flagged); not allowed")
 )
 
 // Validate checks an intent's shape and the provider's rules for it.
@@ -121,10 +122,15 @@ func (in Intent) CheckMove(p accounts.Provider) error {
 		if in.Action == ActionMove && strings.EqualFold(src, "[Gmail]/All Mail") {
 			return SafeError("cannot move out of [Gmail]/All Mail: it holds every message; use label, or pick the label or INBOX as source")
 		}
-		if hasPrefixFold(dst, "[Gmail]/") {
-			return SafeError("targets under [Gmail]/ are not supported; use a label")
+		// Allowlist: INBOX or a label whose name does not start with "[".
+		// That keeps out [Gmail]/... and its localised twins ([Google Mail]/...).
+		if dst != "INBOX" && strings.HasPrefix(dst, "[") {
+			return SafeError("targets under [Gmail]/ and other system folders starting with [ are not supported; use INBOX or a label")
 		}
 	case accounts.Proton:
+		if strings.HasPrefix(dst, "[") {
+			return SafeError("targets starting with [ are not supported")
+		}
 		if hasPrefixFold(dst, "All Mail") || hasPrefixFold(dst, "Spam") || hasPrefixFold(dst, "Trash") {
 			return SafeError("All Mail, Spam and Trash are not valid targets")
 		}
@@ -176,14 +182,13 @@ func ValidateNewFolder(p accounts.Provider, name string) error {
 	if err := checkName(name); err != nil {
 		return err
 	}
+	if strings.HasPrefix(name, "[") {
+		return SafeError("names starting with [ are reserved for system folders")
+	}
 	switch p {
 	case accounts.Proton:
 		if !strings.HasPrefix(name, "Folders/") && !strings.HasPrefix(name, "Labels/") {
 			return SafeError("on Proton a new folder must start with Folders/ or Labels/")
-		}
-	case accounts.Gmail:
-		if hasPrefixFold(name, "[Gmail]") {
-			return SafeError("names under [Gmail] are reserved")
 		}
 	}
 	return nil

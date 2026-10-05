@@ -120,6 +120,15 @@ func main() {
 				Value:   "/var/lib/mail-mcp/history",
 				Sources: cli.EnvVars("HISTORY_DIR"),
 			},
+			&cli.IntFlag{
+				Name: "max-unelicited-apply",
+				// A client that cannot ask the owner itself leaves approval to
+				// its own tool prompt, which is easy to wave through; cap what
+				// that path may move.
+				Usage:   "most messages one apply may change when the client does not support elicitation",
+				Value:   server.DefaultMaxUnelicited,
+				Sources: cli.EnvVars("MAX_UNELICITED_APPLY"),
+			},
 			&cli.DurationFlag{
 				Name:    "refresh-interval",
 				Usage:   "how often to refresh the cache from each mailbox; 0 disables refreshing",
@@ -164,7 +173,7 @@ func run(ctx context.Context, cmd *cli.Command) error {
 		_ = store.Close()
 		return err
 	}
-	opts := []server.Option{server.WithHistory(hist), server.WithOrganiser(org)}
+	opts := []server.Option{server.WithHistory(hist), server.WithOrganiser(org), server.WithMaxUnelicited(cmd.Int("max-unelicited-apply"))}
 	// Refreshers stop, and are waited for, before the cache closes under them.
 	ctx, cancel := context.WithCancel(ctx)
 	var wg sync.WaitGroup

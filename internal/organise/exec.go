@@ -39,6 +39,47 @@ type Outcome struct {
 	Touched []Touched
 	// Skipped is approved ids not acted on: no longer matching, or gone.
 	Skipped int
+	// AlreadyInTarget lists acted-on ids the cache showed in the target folder
+	// before the apply, with the folder each came from. They are not in
+	// Touched: undo restores their source by COPY, never by moving them.
+	AlreadyInTarget []Touched
+	// CopiedBack (undo only) is the already-in-target ids of the undone apply,
+	// restored to their source by COPY.
+	CopiedBack []Touched
+}
+
+// blockedAttrs are the special-use attributes a target may not carry.
+var blockedAttrs = []imap.MailboxAttr{
+	imap.MailboxAttrTrash, imap.MailboxAttrJunk, imap.MailboxAttrDrafts,
+	imap.MailboxAttrSent, imap.MailboxAttrAll, imap.MailboxAttrFlagged,
+}
+
+func isSpecialUse(attrs []imap.MailboxAttr) bool {
+	for _, b := range blockedAttrs {
+		if hasAttr(attrs, b) {
+			return true
+		}
+	}
+	return false
+}
+
+// returnedUIDs reads the source UIDs a COPYUID response named. ok is false
+// when the server returned none (no UIDPLUS), in which case the caller cannot
+// tell which UIDs were acted on.
+func returnedUIDs(src imap.NumSet) (map[imap.UID]bool, bool) {
+	set, isUID := src.(imap.UIDSet)
+	if !isUID {
+		return nil, false
+	}
+	nums, ok := set.Nums()
+	if !ok || len(nums) == 0 {
+		return nil, false
+	}
+	m := make(map[imap.UID]bool, len(nums))
+	for _, u := range nums {
+		m[u] = true
+	}
+	return m, true
 }
 
 func hasAttr(attrs []imap.MailboxAttr, want imap.MailboxAttr) bool {
@@ -75,9 +116,12 @@ func (o *Organiser) CreateFolder(ctx context.Context, a accounts.Account, name s
 		return err
 	}
 	defer func() { _ = c.Close() }()
-	if _, ok, err := folderInfo(c, name); err != nil {
+	if attrs, ok, err := folderInfo(c, name); err != nil {
 		return err
 	} else if ok {
+		if isSpecialUse(attrs) {
+			return ErrSpecialUse
+		}
 		return nil
 	}
 	if err := c.Create(name, nil).Wait(); err != nil {
@@ -112,7 +156,7 @@ func (o *Organiser) RefreshFolder(ctx context.Context, a accounts.Account, folde
 // previewed set, so mail that arrived after the preview is never touched. The
 // caller holds the account's write slot.
 func (o *Organiser) Apply(ctx context.Context, a accounts.Account, p *Preview) (out Outcome, err error) {
-	out.Matched = len(p.IDs)
+	out.Matched = len(p.IDs) + len(p.CopyBack)
 	in := p.Intent
 	if err := in.CheckMove(a.Provider); err != nil {
 		return out, err
@@ -138,8 +182,43 @@ func (o *Organiser) Apply(ctx context.Context, a accounts.Account, p *Preview) (
 		validity = m.UIDValidity
 	}
 	out.Skipped = len(p.IDs) - len(acting)
-	if len(members) == 0 {
+	// Undo of a move: the ids that were already in the target are COPYed back.
+	var copyBack []uidMember
+	if len(p.CopyBack) > 0 {
+		want := map[string]bool{}
+		for _, id := range p.CopyBack {
+			want[id] = true
+		}
+		cms, err := o.store.MembersByID(ctx, p.Account, in.Criterion.Folder, p.CopyBack)
+		if err != nil {
+			return out, err
+		}
+		got := map[string]bool{}
+		for _, m := range cms {
+			if want[m.StableID] {
+				got[m.StableID] = true
+				copyBack = append(copyBack, uidMember{id: m.StableID, uid: imap.UID(m.UID)})
+				validity = m.UIDValidity
+			}
+		}
+		out.Skipped += len(p.CopyBack) - len(got)
+	}
+	if len(members) == 0 && len(copyBack) == 0 {
 		return out, nil
+	}
+	// Messages already in the target stay out of Touched: undo would otherwise
+	// pull them out of a place they were in before this apply.
+	var actIDs []string
+	for id := range acting {
+		actIDs = append(actIDs, id)
+	}
+	inTarget, err := o.store.MembersByID(ctx, p.Account, in.Target, actIDs)
+	if err != nil {
+		return out, err
+	}
+	already := map[string]bool{}
+	for _, m := range inTarget {
+		already[m.StableID] = true
 	}
 
 	ctx, cancel := context.WithTimeout(ctx, applyBudget)
@@ -165,10 +244,15 @@ func (o *Organiser) Apply(ctx context.Context, a accounts.Account, p *Preview) (
 	if in.Action == ActionMove && (hasAttr(srcAttrs, imap.MailboxAttrAll) || hasAttr(srcAttrs, imap.MailboxAttrNoSelect)) {
 		return out, SafeError("cannot move out of a folder that holds every message (\\All) or cannot be selected")
 	}
-	if _, ok, err := folderInfo(c, in.Target); err != nil {
+	dstAttrs, ok, err := folderInfo(c, in.Target)
+	if err != nil {
 		return out, err
-	} else if !ok {
+	}
+	if !ok {
 		return out, ErrTargetMissing
+	}
+	if isSpecialUse(dstAttrs) {
+		return out, ErrSpecialUse
 	}
 
 	// SELECT, not EXAMINE: this is the one place the server writes.
@@ -180,30 +264,65 @@ func (o *Organiser) Apply(ctx context.Context, a accounts.Account, p *Preview) (
 		return out, ErrUIDValidity
 	}
 
+	// run acts on ms in chunks. Each chunk is one MOVE or COPY; with UIDPLUS the
+	// server says which UIDs it acted on and only those count, without it the
+	// whole chunk is assumed (a UID that had vanished would be counted; undo
+	// copes, it just finds nothing). Ids that were already in the target go to
+	// already instead of touched.
+	run := func(ms []uidMember, action string, touched, already *[]Touched, inTarget map[string]bool) error {
+		for start := 0; start < len(ms); start += chunkUIDs {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			chunk := ms[start:min(start+chunkUIDs, len(ms))]
+			uids := make([]imap.UID, len(chunk))
+			for i, m := range chunk {
+				uids[i] = m.uid
+			}
+			set := imap.UIDSetNum(uids...)
+			var done map[imap.UID]bool
+			var have bool
+			var err error
+			if action == ActionMove {
+				var md *imapclient.MoveData
+				md, err = c.Move(set, in.Target).Wait()
+				if err == nil && md != nil {
+					done, have = returnedUIDs(md.SourceUIDs)
+				}
+			} else {
+				var cd *imap.CopyData
+				cd, err = c.Copy(set, in.Target).Wait()
+				if err == nil && cd != nil {
+					done, have = returnedUIDs(cd.SourceUIDs)
+				}
+			}
+			if err != nil {
+				return err
+			}
+			for _, m := range chunk {
+				if have && !done[m.uid] {
+					continue
+				}
+				t := Touched{StableID: m.id, FromFolder: in.Criterion.Folder}
+				if inTarget[m.id] {
+					*already = append(*already, t)
+				} else {
+					*touched = append(*touched, t)
+				}
+			}
+		}
+		return nil
+	}
+
 	var actErr error
-	for start := 0; start < len(members); start += chunkUIDs {
-		if err := ctx.Err(); err != nil {
-			actErr = err
-			break
-		}
-		chunk := members[start:min(start+chunkUIDs, len(members))]
-		uids := make([]imap.UID, len(chunk))
-		for i, m := range chunk {
-			uids[i] = m.uid
-		}
-		set := imap.UIDSetNum(uids...)
-		if in.Action == ActionMove {
-			_, err = c.Move(set, in.Target).Wait()
-		} else {
-			_, err = c.Copy(set, in.Target).Wait()
-		}
-		if err != nil {
-			actErr = err
-			break
-		}
-		for _, m := range chunk {
-			out.Touched = append(out.Touched, Touched{StableID: m.id, FromFolder: in.Criterion.Folder})
-		}
+	if len(members) > 0 {
+		actErr = run(members, in.Action, &out.Touched, &out.AlreadyInTarget, already)
+	}
+	if actErr == nil && len(copyBack) > 0 {
+		// COPY, not MOVE: these were in the target before the apply, and a
+		// move would strip that label. The copy adds the source back.
+		var none []Touched
+		actErr = run(copyBack, ActionLabel, &out.CopiedBack, &none, nil)
 	}
 
 	// Re-read the folders so membership says where things are now, whether or
@@ -215,7 +334,7 @@ func (o *Organiser) Apply(ctx context.Context, a accounts.Account, p *Preview) (
 		slog.Warn("organise: refresh after apply failed", "account", a.Name, "err", rerr)
 	}
 	if actErr != nil {
-		return out, fmt.Errorf("%w (after %d of %d messages)", actErr, len(out.Touched), len(members))
+		return out, fmt.Errorf("%w (after %d of %d messages)", actErr, len(out.Touched)+len(out.AlreadyInTarget)+len(out.CopiedBack), len(members)+len(copyBack))
 	}
 	_ = c.Logout().Wait()
 	return out, nil

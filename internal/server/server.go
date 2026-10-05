@@ -47,9 +47,17 @@ func readOnly() *mcp.ToolAnnotations {
 type Option func(*options)
 
 type options struct {
-	hist *history.Store
-	org  *organise.Organiser
+	hist          *history.Store
+	org           *organise.Organiser
+	maxUnelicited int
 }
+
+// DefaultMaxUnelicited is the largest apply a client without elicitation may run.
+const DefaultMaxUnelicited = 50
+
+// WithMaxUnelicited sets the most messages one apply_intent may change when the
+// client cannot show the owner a confirmation of its own.
+func WithMaxUnelicited(n int) Option { return func(o *options) { o.maxUnelicited = n } }
 
 // WithHistory adds list_history (both modes) and, with WithOrganiser, lets
 // Admin carry the write tools. One store is shared by every server.
@@ -62,7 +70,7 @@ func WithOrganiser(g *organise.Organiser) Option { return func(o *options) { o.o
 
 // New builds one MCP server carrying the tools for mode.
 func New(accts []accounts.Account, store *cache.Cache, version string, mode Mode, opts ...Option) *mcp.Server {
-	var o options
+	o := options{maxUnelicited: DefaultMaxUnelicited}
 	for _, f := range opts {
 		f(&o)
 	}
@@ -85,7 +93,7 @@ func New(accts []accounts.Account, store *cache.Cache, version string, mode Mode
 	// apply_intent, undo and reapply. The Read server cannot be handed them by
 	// any option.
 	if mode == Admin && o.hist != nil && o.org != nil {
-		addWriteTools(s, writeDeps{byName: byName, store: store, hist: o.hist, org: o.org})
+		addWriteTools(s, writeDeps{byName: byName, store: store, hist: o.hist, org: o.org, maxUnelicited: o.maxUnelicited})
 	}
 	return s
 }
