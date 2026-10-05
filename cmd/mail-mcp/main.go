@@ -204,6 +204,13 @@ func run(ctx context.Context, cmd *cli.Command) error {
 		_ = store.Close()
 		_ = hist.Close()
 	}()
+	// Index existing mail into the split-body FTS table and the attachment
+	// tables from the blobs on disk (no IMAP); search switches over when done.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		store.RunBackfill(ctx, log)
+	}()
 	for _, a := range accts {
 		wg.Add(1)
 		go func() {

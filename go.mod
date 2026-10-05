@@ -5,6 +5,7 @@ go 1.27.0
 require (
 	github.com/emersion/go-imap/v2 v2.0.0-beta.8
 	github.com/emersion/go-message v0.18.2
+	github.com/ledongthuc/pdf v0.0.0-20260907135840-6c8c28e0e8a0
 	github.com/modelcontextprotocol/go-sdk v1.7.0
 	github.com/truvity/sluis v1.61.1
 	github.com/urfave/cli/v3 v3.11.0

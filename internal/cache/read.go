@@ -248,25 +248,30 @@ func (c *Cache) Search(ctx context.Context, q SearchQuery) ([]SearchHit, bool, e
 			` ORDER BY ` + dateCol + ` DESC, m.account, m.stable_id LIMIT ?`
 		args = append(append(args, fa...), limit+1)
 	} else {
-		// The FTS table is the base of the inner query so that MATCH drives
-		// the scan; starting from messages would walk every message and test
-		// MATCH per row. The inner query picks the surviving rows (by rowid,
-		// with one extra to detect truncation) and only then does the outer
-		// query pay for snippet() and the wide columns, looking each row up
-		// by rowid. One extra row tells "exactly limit" from "more than limit".
-		query = `WITH hit AS (
-	SELECT message_fts.rowid AS rid, m.account AS account, m.stable_id AS stable_id, ` + dateCol + ` AS d
-	FROM message_fts JOIN messages m ON m.account = message_fts.account AND m.stable_id = message_fts.stable_id
-	WHERE message_fts MATCH ?` + and + `
+		table, fts2 := c.FTSTable()
+		if fts2 {
+			query, args = fts2Query(expr, q.FTSSyntax, and, fa, limit)
+		} else {
+			// The FTS table is the base of the inner query so that MATCH drives
+			// the scan; starting from messages would walk every message and test
+			// MATCH per row. The inner query picks the surviving rows (by rowid,
+			// with one extra to detect truncation) and only then does the outer
+			// query pay for snippet() and the wide columns, looking each row up
+			// by rowid. One extra row tells "exactly limit" from "more than limit".
+			query = `WITH hit AS (
+	SELECT ` + table + `.rowid AS rid, m.account AS account, m.stable_id AS stable_id, ` + dateCol + ` AS d
+	FROM ` + table + ` JOIN messages m ON m.account = ` + table + `.account AND m.stable_id = ` + table + `.stable_id
+	WHERE ` + table + ` MATCH ?` + and + `
 	ORDER BY d DESC, m.account, m.stable_id LIMIT ?
 )
-SELECT hit.account, hit.stable_id, hit.d, m.from_addr, m.subject, snippet(message_fts, 4, '[', ']', '…', 20)
+SELECT hit.account, hit.stable_id, hit.d, m.from_addr, m.subject, snippet(` + table + `, 4, '[', ']', '…', 20)
 FROM hit
-JOIN message_fts ON message_fts.rowid = hit.rid
+JOIN ` + table + ` ON ` + table + `.rowid = hit.rid
 JOIN messages m ON m.account = hit.account AND m.stable_id = hit.stable_id
-WHERE message_fts MATCH ?
+WHERE ` + table + ` MATCH ?
 ORDER BY hit.d DESC, hit.account, hit.stable_id`
-		args = append(append([]any{expr}, fa...), limit+1, expr)
+			args = append(append([]any{expr}, fa...), limit+1, expr)
+		}
 	}
 
 	queryErr := func(err error) error {
@@ -770,4 +775,68 @@ func SubjectShape(s string) string {
 		s = string(r[:120]) + "…"
 	}
 	return s
+}
+
+// bodyColRE finds a "body:" column filter in a user-supplied FTS5 expression.
+var bodyColRE = regexp.MustCompile(`(?i)(^|[\s(])body\s*:`)
+
+// fts2Query builds the search over message_fts2, plus attachment text when
+// the query is the quoted-phrase form (ftsSyntax false). In FTS5-syntax mode
+// the user's own column filters would break on attachment_fts, whose columns
+// differ, so attachments are left out there and "body:" is mapped to both
+// body columns.
+//
+// body_new and body_full are both indexed, so a plain term matches either; the
+// snippet is taken from body_new, falling back to body_full only when the
+// match is solely there. A message found only through a PDF is returned with a
+// snippet of the form "[attachment: file.pdf] ...".
+//
+// The message rowid equals the message_fts2 rowid, so joins go by rowid.
+func fts2Query(expr string, ftsSyntax bool, and string, fa []any, limit int) (string, []any) {
+	const msgSnip = `(SELECT replace(replace(CASE WHEN instr(a, char(1)) > 0 OR instr(b, char(1)) = 0 THEN a ELSE b END, char(1), '['), char(2), ']')
+		FROM (SELECT snippet(message_fts2, 4, char(1), char(2), '…', 20) AS a, snippet(message_fts2, 5, char(1), char(2), '…', 20) AS b
+		      FROM message_fts2 WHERE message_fts2.rowid = hit.rid AND message_fts2 MATCH ?))`
+	if ftsSyntax {
+		expr = bodyColRE.ReplaceAllString(expr, "${1}{body_new body_full}:")
+		query := `WITH hit AS (
+	SELECT message_fts2.rowid AS rid, m.account AS account, m.stable_id AS stable_id, ` + dateCol + ` AS d
+	FROM message_fts2 JOIN messages m ON m.rowid = message_fts2.rowid
+	WHERE message_fts2 MATCH ?` + and + `
+	ORDER BY d DESC, m.account, m.stable_id LIMIT ?
+)
+SELECT hit.account, hit.stable_id, hit.d, m.from_addr, m.subject, ` + msgSnip + `
+FROM hit JOIN messages m ON m.account = hit.account AND m.stable_id = hit.stable_id
+ORDER BY hit.d DESC, hit.account, hit.stable_id`
+		return query, append(append([]any{expr}, fa...), limit+1, expr)
+	}
+	query := `WITH mh AS (
+	SELECT message_fts2.rowid AS rid, m.account AS account, m.stable_id AS stable_id, ` + dateCol + ` AS d
+	FROM message_fts2 JOIN messages m ON m.rowid = message_fts2.rowid
+	WHERE message_fts2 MATCH ?` + and + `
+	ORDER BY d DESC, m.account, m.stable_id LIMIT ?
+), ah AS (
+	SELECT MIN(attachment_fts.rowid) AS rid, m.account AS account, m.stable_id AS stable_id, ` + dateCol + ` AS d
+	FROM attachment_fts JOIN messages m ON m.account = attachment_fts.account AND m.stable_id = attachment_fts.stable_id
+	WHERE attachment_fts MATCH ?` + and + `
+	GROUP BY m.account, m.stable_id
+	ORDER BY d DESC, m.account, m.stable_id LIMIT ?
+), hit AS (
+	SELECT rid, account, stable_id, d, 0 AS att FROM mh
+	UNION ALL
+	SELECT rid, account, stable_id, d, 1 FROM ah
+	WHERE NOT EXISTS (SELECT 1 FROM mh WHERE mh.account = ah.account AND mh.stable_id = ah.stable_id)
+	ORDER BY d DESC, account, stable_id LIMIT ?
+)
+SELECT hit.account, hit.stable_id, hit.d, m.from_addr, m.subject,
+	CASE WHEN hit.att = 0 THEN ` + msgSnip + `
+	ELSE (SELECT '[attachment: ' || filename || '] ' || snippet(attachment_fts, 4, '[', ']', '…', 20)
+	      FROM attachment_fts WHERE attachment_fts.rowid = hit.rid AND attachment_fts MATCH ?) END
+FROM hit JOIN messages m ON m.account = hit.account AND m.stable_id = hit.stable_id
+ORDER BY hit.d DESC, hit.account, hit.stable_id`
+	args := []any{expr}
+	args = append(args, fa...)
+	args = append(args, limit+1, expr)
+	args = append(args, fa...)
+	args = append(args, limit+1, limit+1, expr, expr)
+	return query, args
 }

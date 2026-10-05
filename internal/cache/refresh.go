@@ -511,12 +511,16 @@ func (c *Cache) fetchBodies(ctx context.Context, a accounts.Account, client *ima
 	if err != nil {
 		return 0, 0, fmt.Errorf("fetch bodies: %w", err)
 	}
-	tx, err := c.db.BeginTx(ctx, nil)
-	if err != nil {
-		return 0, 0, fmt.Errorf("begin: %w", err)
+	// Everything slow happens before the transaction: writing blobs (fsync),
+	// parsing, and PDF text extraction (up to 5 s per PDF). The write lock is
+	// then held only for the inserts. Each raw buffer is dropped as soon as
+	// its message is parsed; parsed values are bounded copies.
+	type item struct {
+		info headerInfo
+		sum  string
+		p    parsed
 	}
-	defer func() { _ = tx.Rollback() }()
-	stored, rows := 0, 0
+	items := make([]item, 0, len(msgs))
 	for i := range msgs {
 		m := msgs[i]
 		raw := m.FindBodySection(section)
@@ -528,18 +532,25 @@ func (c *Cache) fetchBodies(ctx context.Context, a accounts.Account, client *ima
 		if err != nil {
 			return 0, 0, err
 		}
-		// parseMessage keeps no reference to raw (the indexed text is a
-		// bounded copy), so drop the buffer as soon as the message is
-		// handled instead of holding the whole batch until Collect's result
-		// goes out of scope.
 		p := parseMessage(raw)
-		raw, m.BodySection = nil, nil
-		if err := insertMessageTx(ctx, tx, a.Name, info, sum, p); err != nil {
+		raw, m.BodySection, msgs[i].BodySection = nil, nil, nil
+		items = append(items, item{info, sum, p})
+	}
+	tx, err := c.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, 0, fmt.Errorf("begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	stored, rows := 0, 0
+	for i := range items {
+		it := &items[i]
+		if err := insertMessageTx(ctx, tx, a.Name, it.info, it.sum, it.p); err != nil {
 			return 0, 0, err
 		}
+		it.p = parsed{}
 		stored++
-		for _, u := range pending[info.stableID] {
-			if err := addMembershipTx(ctx, tx, a.Name, folder, validity, memberRow{uid: u, stableID: info.stableID}); err != nil {
+		for _, u := range pending[it.info.stableID] {
+			if err := addMembershipTx(ctx, tx, a.Name, folder, validity, memberRow{uid: u, stableID: it.info.stableID}); err != nil {
 				return 0, 0, err
 			}
 			rows++
@@ -676,10 +687,17 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		return fmt.Errorf("index message: %w", err)
 	}
 	if n, _ := res.RowsAffected(); n == 1 {
+		rid, err := res.LastInsertId()
+		if err != nil {
+			return fmt.Errorf("index message: %w", err)
+		}
 		if _, err := tx.ExecContext(ctx,
 			`INSERT INTO message_fts (subject, from_addr, to_addr, cc_addr, body, account, stable_id) VALUES (?, ?, ?, ?, ?, ?, ?)`,
 			p.Subject, p.From, p.To, p.Cc, p.Body, account, info.stableID); err != nil {
 			return fmt.Errorf("index text: %w", err)
+		}
+		if err := indexText2Tx(ctx, tx, rid, account, info.stableID, p); err != nil {
+			return err
 		}
 	}
 	return nil

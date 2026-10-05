@@ -43,6 +43,8 @@ type Cache struct {
 	dir string
 	db  *sql.DB
 
+	fts2Ready atomic.Bool // the message_fts2 backfill is complete
+
 	folderQueries atomic.Int64 // membership lookups for folders of messages
 
 	// now is the clock; tests replace it to exercise the full-scan interval.
@@ -121,6 +123,54 @@ CREATE VIRTUAL TABLE IF NOT EXISTS message_fts USING fts5 (
 	account UNINDEXED, stable_id UNINDEXED
 );
 
+-- Added after v0.2.6, additively (IF NOT EXISTS, no schemaVersion bump: a bump
+-- discards the index and re-fetches every mailbox). message_fts2 splits the
+-- body: body_new is the text with quotes, reply headers and signatures
+-- stripped (CleanBody), body_full is the whole text, left empty when it equals
+-- body_new so the common case is not stored twice. Its rowid is the rowid of
+-- the messages row, so joins are O(1) and the backfill can tell what is done.
+-- message_fts stays written as the fallback until the backfill is complete and
+-- search has proven itself on fts2; TODO: drop message_fts then.
+CREATE VIRTUAL TABLE IF NOT EXISTS message_fts2 USING fts5 (
+	subject, from_addr, to_addr, cc_addr, body_new, body_full,
+	account UNINDEXED, stable_id UNINDEXED,
+	tokenize = 'unicode61 remove_diacritics 2'
+);
+
+CREATE TABLE IF NOT EXISTS attachments (
+	account        TEXT    NOT NULL,
+	stable_id      TEXT    NOT NULL,
+	part           TEXT    NOT NULL,
+	filename       TEXT    NOT NULL DEFAULT '',
+	mime           TEXT    NOT NULL DEFAULT '',
+	size           INTEGER NOT NULL DEFAULT 0,
+	sha256         TEXT    NOT NULL DEFAULT '',
+	is_inline      INTEGER NOT NULL DEFAULT 0,
+	content_id     TEXT    NOT NULL DEFAULT '',
+	text_extracted INTEGER NOT NULL DEFAULT 0,
+	PRIMARY KEY (account, stable_id, part)
+);
+CREATE INDEX IF NOT EXISTS attachments_by_cid ON attachments (account, content_id) WHERE content_id <> '';
+
+-- rowid = the attachments rowid of the part.
+CREATE VIRTUAL TABLE IF NOT EXISTS attachment_fts USING fts5 (
+	account UNINDEXED, stable_id UNINDEXED, part UNINDEXED, filename, text,
+	tokenize = 'unicode61 remove_diacritics 2'
+);
+
+-- Progress of long background jobs over existing rows, resumable across
+-- restarts. max_rowid is the highest messages rowid when the job was created:
+-- later messages are indexed by refresh itself, so the job never races it.
+CREATE TABLE IF NOT EXISTS backfill (
+	name       TEXT PRIMARY KEY,
+	last_rowid INTEGER NOT NULL DEFAULT 0,
+	done       INTEGER NOT NULL DEFAULT 0,
+	updated_at INTEGER NOT NULL DEFAULT 0,
+	max_rowid  INTEGER NOT NULL DEFAULT 0,
+	total      INTEGER NOT NULL DEFAULT 0,
+	processed  INTEGER NOT NULL DEFAULT 0
+);
+
 CREATE TABLE IF NOT EXISTS membership (
 	account     TEXT    NOT NULL,
 	stable_id   TEXT    NOT NULL,
@@ -163,7 +213,7 @@ const schemaVersion = 2
 
 // indexTables are the tables the index owns, FTS first (dropping the virtual
 // table removes its shadow tables).
-var indexTables = []string{"message_fts", "messages", "membership", "folders", "refreshes"}
+var indexTables = []string{"message_fts", "message_fts2", "attachment_fts", "attachments", "backfill", "messages", "membership", "folders", "refreshes"}
 
 // ensureSchema creates the schema, first wiping the index tables when the
 // database carries a different user_version (0 for a fresh or pre-versioned
@@ -241,7 +291,12 @@ func Open(dir string) (*Cache, error) {
 		_ = db.Close()
 		return nil, fmt.Errorf("cache: initialise index: %w", err)
 	}
-	return &Cache{dir: dir, db: db, now: time.Now}, nil
+	c := &Cache{dir: dir, db: db, now: time.Now}
+	if err := c.initBackfill(); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("cache: initialise index: %w", err)
+	}
+	return c, nil
 }
 
 // Close releases the index.

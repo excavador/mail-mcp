@@ -39,7 +39,9 @@ type parsed struct {
 	From, To, Cc, Subject string
 	Date                  time.Time
 	ListID, GitHubReason  string
-	Body                  string
+	Body                  string // whole text, quotes included (message_fts)
+	BodyNew               string // CleanBody(Body) (message_fts2.body_new)
+	Atts                  []AttachmentMeta
 }
 
 // parseMessage extracts headers and searchable text from raw RFC 822. It is
@@ -77,6 +79,8 @@ func parseMessage(raw []byte) parsed {
 		body = strings.ToValidUTF8(body[:maxIndexedText], "")
 	}
 	out.Body = body
+	out.BodyNew = CleanBody(body)
+	out.Atts = extractAttachments(raw)
 	return out
 }
 
