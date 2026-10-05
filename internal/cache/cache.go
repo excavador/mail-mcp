@@ -44,6 +44,57 @@ type Cache struct {
 	db  *sql.DB
 
 	folderQueries atomic.Int64 // membership lookups for folders of messages
+
+	// now is the clock; tests replace it to exercise the full-scan interval.
+	now func() time.Time
+}
+
+// folderColumns are columns of folders added after the first release. They
+// are added to an existing database with ALTER TABLE, not by bumping
+// schemaVersion: a bump drops the index and re-fetches every mailbox, and
+// these columns are only an optimisation hint (0 means "never completed", so
+// the folder is scanned once and the hint fills in).
+var folderColumns = []struct{ name, def string }{
+	{"uidnext", "INTEGER NOT NULL DEFAULT 0"},
+	{"messages", "INTEGER NOT NULL DEFAULT 0"},
+	{"scanned_at", "INTEGER NOT NULL DEFAULT 0"},
+	{"attrs", "TEXT NOT NULL DEFAULT ''"},
+}
+
+// addMissingColumns adds, to a folders table created by an earlier version,
+// the columns it lacks. Guarded by PRAGMA table_info so it is idempotent.
+func addMissingColumns(db *sql.DB) error {
+	rows, err := db.Query(`PRAGMA table_info(folders)`)
+	if err != nil {
+		return fmt.Errorf("inspect folders: %w", err)
+	}
+	have := map[string]bool{}
+	for rows.Next() {
+		var (
+			cid, notnull, pk int
+			name, typ        string
+			dflt             sql.NullString
+		)
+		if err := rows.Scan(&cid, &name, &typ, &notnull, &dflt, &pk); err != nil {
+			_ = rows.Close()
+			return fmt.Errorf("inspect folders: %w", err)
+		}
+		have[name] = true
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return fmt.Errorf("inspect folders: %w", err)
+	}
+	_ = rows.Close()
+	for _, c := range folderColumns {
+		if have[c.name] {
+			continue
+		}
+		if _, err := db.Exec(`ALTER TABLE folders ADD COLUMN ` + c.name + ` ` + c.def); err != nil {
+			return fmt.Errorf("add folders.%s: %w", c.name, err)
+		}
+	}
+	return nil
 }
 
 const schema = `
@@ -84,6 +135,10 @@ CREATE TABLE IF NOT EXISTS folders (
 	account     TEXT    NOT NULL,
 	folder      TEXT    NOT NULL,
 	uidvalidity INTEGER NOT NULL,
+	uidnext     INTEGER NOT NULL DEFAULT 0,
+	messages    INTEGER NOT NULL DEFAULT 0,
+	scanned_at  INTEGER NOT NULL DEFAULT 0,
+	attrs       TEXT    NOT NULL DEFAULT '',
 	PRIMARY KEY (account, folder)
 );
 
@@ -140,6 +195,9 @@ func ensureSchema(db *sql.DB) error {
 	if _, err := db.Exec(schema); err != nil {
 		return fmt.Errorf("create schema: %w", err)
 	}
+	if err := addMissingColumns(db); err != nil {
+		return err
+	}
 	if have != schemaVersion {
 		if _, err := db.Exec(fmt.Sprintf(`PRAGMA user_version = %d`, schemaVersion)); err != nil {
 			return fmt.Errorf("set schema version: %w", err)
@@ -183,7 +241,7 @@ func Open(dir string) (*Cache, error) {
 		_ = db.Close()
 		return nil, fmt.Errorf("cache: initialise index: %w", err)
 	}
-	return &Cache{dir: dir, db: db}, nil
+	return &Cache{dir: dir, db: db, now: time.Now}, nil
 }
 
 // Close releases the index.

@@ -8,12 +8,14 @@ import (
 	"log/slog"
 	"sort"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/emersion/go-imap/v2"
 	"github.com/emersion/go-imap/v2/imapclient"
 
 	"github.com/excavador/mail-mcp/internal/accounts"
+	"github.com/excavador/mail-mcp/internal/imapx"
 )
 
 const (
@@ -30,12 +32,26 @@ const (
 	// maxMessageSize is the largest message cached. Anything bigger is
 	// skipped (counted, logged, not stored) rather than held in memory.
 	maxMessageSize = 50 << 20
+	// fullScanEvery is the longest a folder may go without a full scan even
+	// when STATUS says nothing changed: a safety net under the change
+	// detection below, so a server that misreports (or a case it misses)
+	// heals within a day.
+	fullScanEvery = 24 * time.Hour
+	// statusBatch bounds how many STATUS commands are in flight at once.
+	statusBatch = 200
 )
 
 // Stats counts what one Refresh did.
 type Stats struct {
-	// Folders examined.
+	// Folders brought up to date: scanned plus skipped as unchanged.
 	Folders int `json:"folders"`
+	// FoldersTotal is the selectable folders the server listed.
+	FoldersTotal int `json:"folders_total"`
+	// FoldersSkipped is folders STATUS showed unchanged, so not opened.
+	FoldersSkipped int `json:"folders_skipped_unchanged"`
+	// FoldersScanned is folders opened and listed (changed, new, never
+	// completed, or due for the periodic full scan).
+	FoldersScanned int `json:"folders_scanned"`
 	// NewUIDs is folder entries not seen before (a message in three Gmail
 	// labels counts three times).
 	NewUIDs int `json:"new_uids"`
@@ -52,6 +68,7 @@ type Stats struct {
 }
 
 func (s *Stats) add(o Stats) {
+	// Folder counters are kept by Refresh itself, not summed from folders.
 	s.NewUIDs += o.NewUIDs
 	s.NewIDs += o.NewIDs
 	s.NewBodies += o.NewBodies
@@ -63,9 +80,37 @@ func (s *Stats) add(o Stats) {
 // client, which must already be logged in.
 //
 // It never changes the mailbox: folders are opened with EXAMINE and every
-// FETCH uses BODY.PEEK, so no message is marked read. It is cheap on repeat:
-// a second refresh with nothing new costs one LIST and, per folder, one
-// EXAMINE and one UID-only FETCH, and fetches no bodies.
+// FETCH uses BODY.PEEK, so no message is marked read.
+//
+// Round trips are what cost time (Gmail answers every command after LOGIN
+// with a fixed delay, Bridge is slow per command), so the sequence is built to
+// need few of them, and commands that do not depend on each other's answers
+// are sent together before any is waited for (go-imap writes each command as
+// it is started; only Wait blocks):
+//
+//  1. LIST.
+//  2. STATUS (MESSAGES UIDNEXT UIDVALIDITY) for every selectable folder, in
+//     one pipeline. A folder whose three numbers equal those recorded when its
+//     last scan completed is skipped entirely: no EXAMINE, no UID listing.
+//  3. For each remaining folder, EXAMINE and the UID listing in one pipeline.
+//
+// An unchanged mailbox therefore costs LIST plus one STATUS batch.
+//
+// Why equal STATUS numbers mean "nothing the cache stores has changed": the
+// cache keeps (folder, uid) -> message. New mail, a move into the folder, and
+// a copy all allocate a new UID, so UIDNEXT rises. A removal (expunge, or a
+// move out) lowers MESSAGES. A removal paired with an addition still raises
+// UIDNEXT. A UIDVALIDITY change invalidates every UID and is compared too.
+// Flag changes alter none of these, and the cache stores no flags. The
+// recorded numbers are the STATUS values from before the scan, so anything
+// arriving during a scan is seen by the next STATUS. As a safety net every
+// folder is scanned in full at least every fullScanEvery.
+//
+// A folder is marked complete (its numbers recorded) only after its scan
+// finished without error; an interrupted scan leaves uidnext 0, which is
+// never equal to a real UIDNEXT, so the folder is scanned again next time.
+// A server that does not report UIDNEXT or MESSAGES for a folder gets that
+// folder scanned every time.
 //
 // A failure in one folder does not stop the others; the errors are joined
 // and returned after every folder has been tried, and what was already
@@ -73,19 +118,52 @@ func (s *Stats) add(o Stats) {
 func (c *Cache) Refresh(ctx context.Context, a accounts.Account, client *imapclient.Client) (st Stats, err error) {
 	defer func() { c.recordRefresh(a.Name, st, err == nil) }()
 
+	imapx.SetPhase(ctx, "list")
 	list, err := client.List("", "*", nil).Collect()
 	if err != nil {
 		return st, fmt.Errorf("%s: list folders: %w", a.Name, err)
 	}
-	var errs []error
+	var folders []*imap.ListData
 	for _, m := range list {
 		if hasAttr(m.Attrs, imap.MailboxAttrNoSelect) || hasAttr(m.Attrs, imap.MailboxAttrNonExistent) {
 			continue
 		}
+		folders = append(folders, m)
+	}
+	st.FoldersTotal = len(folders)
+
+	imapx.SetPhase(ctx, "status")
+	names := make([]string, len(folders))
+	for i, m := range folders {
+		names[i] = m.Mailbox
+	}
+	statuses, err := statusAll(ctx, client, names)
+	if err != nil {
+		return st, fmt.Errorf("%s: status: %w", a.Name, err)
+	}
+	stored, err := c.loadFolderStates(ctx, a.Name)
+	if err != nil {
+		return st, err
+	}
+	// Remember each folder's special-use attributes (\All for Gmail's All
+	// Mail) so server search can skip LIST. Best effort, and for rows that
+	// exist; a folder first seen now gets its attributes on the next refresh.
+	defer func() { c.saveFolderAttrs(a.Name, folders) }()
+
+	now := c.now()
+	var errs []error
+	for _, m := range folders {
 		if err := ctx.Err(); err != nil {
 			return st, err
 		}
-		fs, err := c.refreshFolder(ctx, a, client, m.Mailbox)
+		stat := statuses[m.Mailbox]
+		if prev, ok := stored[m.Mailbox]; ok && stat.complete() && prev.unchanged(stat, now) {
+			st.FoldersSkipped++
+			st.Folders++
+			continue
+		}
+		st.FoldersScanned++
+		fs, err := c.refreshFolder(ctx, a, client, m.Mailbox, stat)
 		st.add(fs)
 		if err != nil {
 			errs = append(errs, fmt.Errorf("%s: folder %q: %w", a.Name, m.Mailbox, err))
@@ -94,6 +172,62 @@ func (c *Cache) Refresh(ctx context.Context, a accounts.Account, client *imapcli
 		st.Folders++
 	}
 	return st, errors.Join(errs...)
+}
+
+// folderStatus is what STATUS reported for one folder. ok is false when the
+// command failed or left out a number the skip test needs.
+type folderStatus struct {
+	validity, uidNext, messages uint32
+	ok                          bool
+}
+
+func (s folderStatus) complete() bool { return s.ok && s.uidNext != 0 }
+
+// folderState is what the cache recorded when a folder's last scan completed.
+type folderState struct {
+	validity, uidNext, messages uint32
+	scannedAt                   int64
+}
+
+func (p folderState) unchanged(s folderStatus, now time.Time) bool {
+	if p.uidNext == 0 { // never completed
+		return false
+	}
+	age := now.Unix() - p.scannedAt
+	if age < 0 || age >= int64(fullScanEvery/time.Second) {
+		return false
+	}
+	return p.validity == s.validity && p.uidNext == s.uidNext && p.messages == s.messages
+}
+
+// statusAll sends STATUS for every name before waiting for any answer, so the
+// server's per-command latency is paid once for the lot. A STATUS that fails
+// for one folder leaves it not ok (it will be scanned); only the session
+// ending is an error.
+func statusAll(ctx context.Context, client *imapclient.Client, names []string) (map[string]folderStatus, error) {
+	out := make(map[string]folderStatus, len(names))
+	opts := &imap.StatusOptions{NumMessages: true, UIDNext: true, UIDValidity: true}
+	for start := 0; start < len(names); start += statusBatch {
+		end := min(start+statusBatch, len(names))
+		cmds := make([]*imapclient.StatusCommand, 0, end-start)
+		for _, n := range names[start:end] {
+			cmds = append(cmds, client.Status(n, opts))
+		}
+		for i, cmd := range cmds {
+			data, err := cmd.Wait()
+			if err != nil {
+				if cerr := ctx.Err(); cerr != nil {
+					return nil, cerr
+				}
+				continue
+			}
+			if data.NumMessages == nil || data.UIDNext == 0 || data.UIDValidity == 0 {
+				continue
+			}
+			out[names[start+i]] = folderStatus{validity: data.UIDValidity, uidNext: uint32(data.UIDNext), messages: *data.NumMessages, ok: true}
+		}
+	}
+	return out, nil
 }
 
 func hasAttr(attrs []imap.MailboxAttr, want imap.MailboxAttr) bool {
@@ -113,18 +247,32 @@ type headerInfo struct {
 	internal   time.Time
 }
 
-func (c *Cache) refreshFolder(ctx context.Context, a accounts.Account, client *imapclient.Client, folder string) (Stats, error) {
+func (c *Cache) refreshFolder(ctx context.Context, a accounts.Account, client *imapclient.Client, folder string, stat folderStatus) (Stats, error) {
 	var st Stats
 
 	// EXAMINE, not SELECT: read-only, so nothing here can set \Seen or any
-	// other flag, even by accident.
-	sel, err := client.Select(folder, &imap.SelectOptions{ReadOnly: true}).Wait()
+	// other flag, even by accident. The UID listing is sent right behind it
+	// without waiting (the server runs them in order), so the pair costs one
+	// round trip. STATUS already said the folder is empty: no listing.
+	imapx.SetPhase(ctx, "examine")
+	selCmd := client.Select(folder, &imap.SelectOptions{ReadOnly: true})
+	var listCmd *imapclient.FetchCommand
+	if !(stat.ok && stat.messages == 0) {
+		listCmd = startListUIDs(client)
+	}
+	sel, err := selCmd.Wait()
 	if err != nil {
+		if listCmd != nil {
+			_ = listCmd.Close() // answered with an error too; drain it
+		}
 		return st, fmt.Errorf("examine: %w", err)
 	}
 
 	known, validity, haveFolder, err := c.loadFolder(ctx, a.Name, folder)
 	if err != nil {
+		if listCmd != nil {
+			_ = listCmd.Close()
+		}
 		return st, err
 	}
 	if haveFolder && validity != sel.UIDValidity {
@@ -133,12 +281,20 @@ func (c *Cache) refreshFolder(ctx context.Context, a accounts.Account, client *i
 		known = map[imap.UID]string{}
 		n, err := c.dropFolder(ctx, a.Name, folder)
 		if err != nil {
+			if listCmd != nil {
+				_ = listCmd.Close()
+			}
 			return st, err
 		}
 		st.Removed += n
 	}
 
-	current, err := listUIDs(client, sel.NumMessages)
+	imapx.SetPhase(ctx, "list-uids")
+	if listCmd == nil && sel.NumMessages > 0 {
+		// STATUS said empty but mail arrived before EXAMINE: list now.
+		listCmd = startListUIDs(client)
+	}
+	current, err := collectUIDs(listCmd, sel.NumMessages)
 	if err != nil {
 		return st, err
 	}
@@ -186,20 +342,37 @@ func (c *Cache) refreshFolder(ctx context.Context, a accounts.Account, client *i
 		}
 		emit(Progress{Folder: folder, Done: end, Total: len(fresh), NewBodies: st.NewBodies})
 	}
+	// Only now is the folder complete. The STATUS numbers are the ones taken
+	// before the scan, so mail that arrived meanwhile changes UIDNEXT next time.
+	if stat.complete() {
+		if err := c.markFolderComplete(ctx, a.Name, folder, stat); err != nil {
+			return st, err
+		}
+	}
 	return st, nil
 }
 
-// listUIDs returns every UID in the selected folder with one UID FETCH asking
-// for nothing but UIDs. Bridge has no CONDSTORE, so there is no cheaper "what
-// changed" to ask; a per-folder scan is the expected cost.
-func listUIDs(client *imapclient.Client, exists uint32) ([]imap.UID, error) {
-	if exists == 0 {
-		return nil, nil
-	}
+// startListUIDs sends the UID listing (UID FETCH 1:* (UID)) without waiting.
+// Bridge has no CONDSTORE, so there is no cheaper "what changed" to ask; a
+// per-folder scan is the cost of a folder that did change.
+func startListUIDs(client *imapclient.Client) *imapclient.FetchCommand {
 	var all imap.UIDSet
 	all.AddRange(1, 0) // 1:*
-	msgs, err := client.Fetch(all, &imap.FetchOptions{UID: true}).Collect()
+	return client.Fetch(all, &imap.FetchOptions{UID: true})
+}
+
+// collectUIDs reads the answer to startListUIDs, ascending. cmd is nil for a
+// folder known to be empty. A refusal on a folder EXAMINE reported empty is
+// taken as empty (some servers reject 1:* with no messages).
+func collectUIDs(cmd *imapclient.FetchCommand, exists uint32) ([]imap.UID, error) {
+	if cmd == nil {
+		return nil, nil
+	}
+	msgs, err := cmd.Collect()
 	if err != nil {
+		if exists == 0 {
+			return nil, nil
+		}
 		return nil, fmt.Errorf("list uids: %w", err)
 	}
 	out := make([]imap.UID, 0, len(msgs))
@@ -417,7 +590,8 @@ func (c *Cache) dropFolder(ctx context.Context, account, folder string) (int, er
 	return int(n), nil
 }
 
-// setFolder records the folder's UIDVALIDITY and deletes the membership rows
+// setFolder records the folder's UIDVALIDITY, marks the folder incomplete
+// (uidnext 0: markFolderComplete sets it once the scan has finished), and deletes the membership rows
 // for UIDs that are gone, atomically.
 func (c *Cache) setFolder(ctx context.Context, account, folder string, validity uint32, gone []imap.UID) (int, error) {
 	tx, err := c.db.BeginTx(ctx, nil)
@@ -425,7 +599,10 @@ func (c *Cache) setFolder(ctx context.Context, account, folder string, validity 
 		return 0, fmt.Errorf("begin: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
-	if _, err := tx.ExecContext(ctx, `INSERT OR REPLACE INTO folders (account, folder, uidvalidity) VALUES (?, ?, ?)`, account, folder, validity); err != nil {
+	if _, err := tx.ExecContext(ctx, `
+INSERT INTO folders (account, folder, uidvalidity) VALUES (?, ?, ?)
+ON CONFLICT (account, folder) DO UPDATE SET uidvalidity = excluded.uidvalidity, uidnext = 0, messages = 0, scanned_at = 0`,
+		account, folder, validity); err != nil {
 		return 0, fmt.Errorf("record folder: %w", err)
 	}
 	removed := 0
@@ -521,4 +698,65 @@ func (c *Cache) recordRefresh(account string, st Stats, ok bool) {
 INSERT OR REPLACE INTO refreshes (account, at, ok, folders, new_uids, new_ids, new_bodies, removed)
 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
 		account, time.Now().Unix(), o, st.Folders, st.NewUIDs, st.NewIDs, st.NewBodies, st.Removed)
+}
+
+// loadFolderStates returns the completion record of every folder of account.
+func (c *Cache) loadFolderStates(ctx context.Context, account string) (map[string]folderState, error) {
+	rows, err := c.db.QueryContext(ctx, `SELECT folder, uidvalidity, uidnext, messages, scanned_at FROM folders WHERE account = ?`, account)
+	if err != nil {
+		return nil, fmt.Errorf("load folder states: %w", err)
+	}
+	defer rows.Close()
+	out := map[string]folderState{}
+	for rows.Next() {
+		var (
+			name string
+			fs   folderState
+		)
+		if err := rows.Scan(&name, &fs.validity, &fs.uidNext, &fs.messages, &fs.scannedAt); err != nil {
+			return nil, fmt.Errorf("load folder states: %w", err)
+		}
+		out[name] = fs
+	}
+	return out, rows.Err()
+}
+
+// markFolderComplete records the STATUS numbers a finished scan was based on.
+func (c *Cache) markFolderComplete(ctx context.Context, account, folder string, s folderStatus) error {
+	_, err := c.db.ExecContext(ctx,
+		`UPDATE folders SET uidvalidity = ?, uidnext = ?, messages = ?, scanned_at = ? WHERE account = ? AND folder = ?`,
+		s.validity, s.uidNext, s.messages, c.now().Unix(), account, folder)
+	if err != nil {
+		return fmt.Errorf("mark folder complete: %w", err)
+	}
+	return nil
+}
+
+// saveFolderAttrs stores each folder's LIST attributes, for rows that exist.
+// It runs on a fresh context: the refresh's may be cancelled.
+func (c *Cache) saveFolderAttrs(account string, folders []*imap.ListData) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	for _, m := range folders {
+		attrs := make([]string, 0, len(m.Attrs))
+		for _, at := range m.Attrs {
+			attrs = append(attrs, string(at))
+		}
+		_, _ = c.db.ExecContext(ctx, `UPDATE folders SET attrs = ? WHERE account = ? AND folder = ?`,
+			strings.Join(attrs, " "), account, m.Mailbox)
+	}
+}
+
+// AllMailFolder returns the folder LIST last marked \All for account, as
+// recorded by Refresh, or "" when none is known. Server search uses it to
+// skip a LIST.
+func (c *Cache) AllMailFolder(ctx context.Context, account string) string {
+	var name string
+	err := c.db.QueryRowContext(ctx,
+		`SELECT folder FROM folders WHERE account = ? AND (' ' || attrs || ' ') LIKE '% \All %' ORDER BY folder LIMIT 1`,
+		account).Scan(&name)
+	if err != nil {
+		return ""
+	}
+	return name
 }

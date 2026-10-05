@@ -18,6 +18,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -53,15 +54,37 @@ type gfConfig struct {
 	Entered chan struct{}
 }
 
+type gfArrival struct {
+	at time.Time
+	s  string
+}
+
 type gfLog struct {
-	mu  sync.Mutex
-	buf strings.Builder
+	mu       sync.Mutex
+	buf      strings.Builder
+	arrivals []gfArrival
 }
 
 func (l *gfLog) write(p []byte) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.buf.Write(p)
+	l.arrivals = append(l.arrivals, gfArrival{at: time.Now(), s: string(p)})
+}
+
+// firstArrival is when the first chunk containing sub reached the server
+// after the first n bytes, and false if none has.
+func (l *gfLog) firstArrival(sub string, after int) (time.Time, bool) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	off := 0
+	for _, a := range l.arrivals {
+		if off >= after && strings.Contains(a.s, sub) {
+			return a.at, true
+		}
+		off += len(a.s)
+	}
+	return time.Time{}, false
 }
 
 // raw is every byte the client sent.
@@ -114,7 +137,11 @@ type gmailFake struct {
 	pin  string
 	ln   net.Listener
 	once sync.Once
+	// delay is the one-way server-to-client latency of new connections.
+	delay atomic.Int64
 }
+
+func (f *gmailFake) setDelay(d time.Duration) { f.delay.Store(int64(d)) }
 
 func startGmailFake(t *testing.T, cfg gfConfig) *gmailFake {
 	t.Helper()
@@ -139,9 +166,10 @@ func startGmailFake(t *testing.T, cfg gfConfig) *gmailFake {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				defer c.Close()
 				_ = c.SetDeadline(time.Now().Add(60 * time.Second)) // bound every wait
-				f.serve(gfConn{Conn: c, log: f.log})
+				dc := maybeDelay(c, time.Duration(f.delay.Load()))
+				defer dc.Close() // delivers queued answers, then closes c
+				f.serve(gfConn{Conn: dc, log: f.log})
 			}()
 		}
 	}()
