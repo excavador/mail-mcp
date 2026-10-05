@@ -26,7 +26,7 @@ const (
 	bodyBatch = 25
 	// bodyBatchBytes caps the summed RFC822.SIZE of one body FETCH, since
 	// bodies are read into memory.
-	bodyBatchBytes = 32 << 20
+	bodyBatchBytes = 16 << 20
 	// maxMessageSize is the largest message cached. Anything bigger is
 	// skipped (counted, logged, not stored) rather than held in memory.
 	maxMessageSize = 50 << 20
@@ -165,18 +165,26 @@ func (c *Cache) refreshFolder(ctx context.Context, a accounts.Account, client *i
 	st.Removed += n
 	st.NewUIDs = len(fresh)
 
+	emit := progressFrom(ctx)
+	emit(Progress{Folder: folder, Done: 0, Total: len(fresh)})
 	for start := 0; start < len(fresh); start += headerBatch {
 		if err := ctx.Err(); err != nil {
 			return st, err
 		}
 		end := min(start+headerBatch, len(fresh))
-		bs, err := c.refreshBatch(ctx, a, client, folder, sel.UIDValidity, fresh[start:end])
+		// step reports progress from inside the batch, so a slow batch of
+		// bodies still counts as the refresh being alive.
+		step := func(resolved, bodies int) {
+			emit(Progress{Folder: folder, Done: start + resolved, Total: len(fresh), NewBodies: st.NewBodies + bodies})
+		}
+		bs, err := c.refreshBatch(ctx, a, client, folder, sel.UIDValidity, fresh[start:end], step)
 		st.NewIDs += bs.NewIDs
 		st.NewBodies += bs.NewBodies
 		st.Skipped += bs.Skipped
 		if err != nil {
 			return st, err
 		}
+		emit(Progress{Folder: folder, Done: end, Total: len(fresh), NewBodies: st.NewBodies})
 	}
 	return st, nil
 }
@@ -204,9 +212,14 @@ func listUIDs(client *imapclient.Client, exists uint32) ([]imap.UID, error) {
 
 // refreshBatch resolves stable ids for one batch of new UIDs, fetches the
 // bodies of those whose id the index has not seen, and records membership.
-// Membership is written last, only for messages that are now in the index, so
-// an interrupted refresh leaves the UID unknown and picks it up next time.
-func (c *Cache) refreshBatch(ctx context.Context, a accounts.Account, client *imapclient.Client, folder string, validity uint32, uids []imap.UID) (Stats, error) {
+//
+// Membership is written incrementally, never ahead of the index: UIDs whose
+// stable id is already indexed are recorded right after the header fetch, and
+// the rest are recorded by fetchBodies in the same transaction that indexes
+// their message. An interrupted refresh therefore loses at most the batch in
+// flight; the UIDs it had not recorded stay unknown and are picked up next
+// time, while the ones it had are not fetched again.
+func (c *Cache) refreshBatch(ctx context.Context, a accounts.Account, client *imapclient.Client, folder string, validity uint32, uids []imap.UID, step func(resolved, bodies int)) (Stats, error) {
 	var st Stats
 
 	hdrSection := &imap.FetchItemBodySection{
@@ -254,23 +267,37 @@ func (c *Cache) refreshBatch(ctx context.Context, a accounts.Account, client *im
 	}
 
 	// One body per stable id, however many UIDs (or folders) carry it.
+	// known rows go to membership now; pending maps each not-yet-indexed id
+	// to every UID in this batch that carries it.
 	var needBody []imap.UID
-	wanted := map[string]bool{}
+	var known []memberRow
+	pending := map[string][]imap.UID{}
 	for _, u := range uids {
 		info, ok := infos[u]
-		if !ok || wanted[info.stableID] {
+		if !ok {
+			continue // expunged between LIST and FETCH, or skipped as too large
+		}
+		if _, dup := pending[info.stableID]; dup {
+			pending[info.stableID] = append(pending[info.stableID], u)
 			continue
 		}
 		have, err := c.hasMessage(ctx, a.Name, info.stableID)
 		if err != nil {
 			return st, err
 		}
-		if !have {
-			wanted[info.stableID] = true
-			needBody = append(needBody, u)
+		if have {
+			known = append(known, memberRow{uid: u, stableID: info.stableID})
+			continue
 		}
+		pending[info.stableID] = []imap.UID{u}
+		needBody = append(needBody, u)
 	}
 	st.NewIDs = len(needBody)
+	resolved := len(known)
+	if err := c.addMembership(ctx, a.Name, folder, validity, known); err != nil {
+		return st, err
+	}
+	step(resolved, 0)
 
 	for start := 0; start < len(needBody); {
 		if err := ctx.Err(); err != nil {
@@ -285,42 +312,40 @@ func (c *Cache) refreshBatch(ctx context.Context, a accounts.Account, client *im
 			total += sz
 			end++
 		}
-		n, err := c.fetchBodies(ctx, a, client, needBody[start:end], infos)
+		n, rows, err := c.fetchBodies(ctx, a, client, folder, validity, needBody[start:end], infos, pending)
 		st.NewBodies += n
+		resolved += rows
 		if err != nil {
 			return st, err
 		}
+		step(resolved, st.NewBodies)
 		start = end
 	}
-
-	rows := make([]memberRow, 0, len(uids))
-	for _, u := range uids {
-		info, ok := infos[u]
-		if !ok {
-			continue // expunged between LIST and FETCH
-		}
-		have, err := c.hasMessage(ctx, a.Name, info.stableID)
-		if err != nil {
-			return st, err
-		}
-		if have {
-			rows = append(rows, memberRow{uid: u, stableID: info.stableID})
-		}
-	}
-	return st, c.addMembership(ctx, a.Name, folder, validity, rows)
+	return st, nil
 }
 
-func (c *Cache) fetchBodies(ctx context.Context, a accounts.Account, client *imapclient.Client, uids []imap.UID, infos map[imap.UID]headerInfo) (int, error) {
+// fetchBodies fetches and stores the bodies of uids. The index rows of the
+// whole batch and the membership rows of every UID in pending that carries one
+// of those messages are committed in one transaction, so a UID is a member of
+// the folder exactly when its message is indexed. It returns the messages
+// stored and the membership rows written.
+func (c *Cache) fetchBodies(ctx context.Context, a accounts.Account, client *imapclient.Client, folder string, validity uint32, uids []imap.UID, infos map[imap.UID]headerInfo, pending map[string][]imap.UID) (int, int, error) {
 	section := &imap.FetchItemBodySection{Peek: true} // BODY.PEEK[]: whole message, \Seen untouched
 	msgs, err := client.Fetch(imap.UIDSetNum(uids...), &imap.FetchOptions{
 		UID:         true,
 		BodySection: []*imap.FetchItemBodySection{section},
 	}).Collect()
 	if err != nil {
-		return 0, fmt.Errorf("fetch bodies: %w", err)
+		return 0, 0, fmt.Errorf("fetch bodies: %w", err)
 	}
-	stored := 0
-	for _, m := range msgs {
+	tx, err := c.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, 0, fmt.Errorf("begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	stored, rows := 0, 0
+	for i := range msgs {
+		m := msgs[i]
 		raw := m.FindBodySection(section)
 		info, ok := infos[m.UID]
 		if raw == nil || !ok {
@@ -328,14 +353,28 @@ func (c *Cache) fetchBodies(ctx context.Context, a accounts.Account, client *ima
 		}
 		sum, err := c.putBlob(raw)
 		if err != nil {
-			return stored, err
+			return 0, 0, err
 		}
-		if err := c.insertMessage(ctx, a.Name, info, sum, parseMessage(raw)); err != nil {
-			return stored, err
+		// parseMessage keeps no reference to raw (the indexed text is a
+		// bounded copy), so drop the buffer as soon as the message is
+		// handled instead of holding the whole batch until Collect's result
+		// goes out of scope.
+		p := parseMessage(raw)
+		raw, m.BodySection = nil, nil
+		if err := insertMessageTx(ctx, tx, a.Name, info, sum, p); err != nil {
+			return 0, 0, err
 		}
 		stored++
+		for _, u := range pending[info.stableID] {
+			if err := addMembershipTx(ctx, tx, a.Name, folder, validity, memberRow{uid: u, stableID: info.stableID}); err != nil {
+				return 0, 0, err
+			}
+			rows++
+		}
 	}
-	return stored, nil
+	// All or nothing: a failure above rolls the batch back (blobs stay, they
+	// are write-once and harmless), so no UID is a member without its message.
+	return stored, rows, tx.Commit()
 }
 
 // --- index access -----------------------------------------------------------
@@ -416,13 +455,20 @@ func (c *Cache) addMembership(ctx context.Context, account, folder string, valid
 	}
 	defer func() { _ = tx.Rollback() }()
 	for _, r := range rows {
-		if _, err := tx.ExecContext(ctx,
-			`INSERT OR REPLACE INTO membership (account, stable_id, folder, uid, uidvalidity) VALUES (?, ?, ?, ?, ?)`,
-			account, r.stableID, folder, uint32(r.uid), validity); err != nil {
-			return fmt.Errorf("add membership: %w", err)
+		if err := addMembershipTx(ctx, tx, account, folder, validity, r); err != nil {
+			return err
 		}
 	}
 	return tx.Commit()
+}
+
+func addMembershipTx(ctx context.Context, tx *sql.Tx, account, folder string, validity uint32, r memberRow) error {
+	if _, err := tx.ExecContext(ctx,
+		`INSERT OR REPLACE INTO membership (account, stable_id, folder, uid, uidvalidity) VALUES (?, ?, ?, ?, ?)`,
+		account, r.stableID, folder, uint32(r.uid), validity); err != nil {
+		return fmt.Errorf("add membership: %w", err)
+	}
+	return nil
 }
 
 func (c *Cache) hasMessage(ctx context.Context, account, stableID string) (bool, error) {
@@ -437,15 +483,9 @@ func (c *Cache) hasMessage(ctx context.Context, account, stableID string) (bool,
 	return true, nil
 }
 
-// insertMessage adds the index and FTS rows for a message whose blob is
-// already on disk. INSERT OR IGNORE: an existing entry is never rewritten.
-func (c *Cache) insertMessage(ctx context.Context, account string, info headerInfo, blobSum string, p parsed) error {
-	tx, err := c.db.BeginTx(ctx, nil)
-	if err != nil {
-		return fmt.Errorf("begin: %w", err)
-	}
-	defer func() { _ = tx.Rollback() }()
-
+// insertMessageTx adds, inside tx, the index and FTS rows for a message whose
+// blob is already on disk. INSERT OR IGNORE: an existing entry is never rewritten.
+func insertMessageTx(ctx context.Context, tx *sql.Tx, account string, info headerInfo, blobSum string, p parsed) error {
 	var dateUnix int64
 	if !p.Date.IsZero() {
 		dateUnix = p.Date.Unix()
@@ -465,7 +505,7 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			return fmt.Errorf("index text: %w", err)
 		}
 	}
-	return tx.Commit()
+	return nil
 }
 
 func (c *Cache) recordRefresh(account string, st Stats, ok bool) {
