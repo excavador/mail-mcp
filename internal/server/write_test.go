@@ -258,10 +258,30 @@ func TestApplyCountsMailRemovedAfterThePreviewAsSkipped(t *testing.T) {
 
 // ---- 7 and 8: target and UIDVALIDITY ----
 
+const missingNope = "target folder NoSuchLabel does not exist on acct; create it with create_folder first"
+
+// The cache is where previews learn which folders exist, so a target it does
+// not know is refused before any token is issued.
+func TestPreviewRefusesATargetAbsentFromTheCache(t *testing.T) {
+	e := basic(t, true)
+	cs := e.admin()
+	requireToolError(t, cs, "preview_intent", previewArgs("acct", "INBOX", fromCrit("alice@example.com"), "NoSuchLabel", "move"), missingNope)
+	requireToolError(t, cs, "preview_intent", previewArgs("acct", "INBOX", fromCrit("alice@example.com"), "NoSuchLabel", "label"), missingNope)
+	e.noWrites(t)
+	if n := e.serverCount("INBOX"); n != 3 {
+		t.Errorf("INBOX = %d", n)
+	}
+}
+
+// apply still re-checks with LIST: a folder the cache believes in but the
+// server does not have keeps the old, account-less message.
 func TestApplyMissingTargetSaysToCreateIt(t *testing.T) {
 	e := basic(t, true)
 	cs := e.admin()
-	p := preview(t, cs, "acct", "INBOX", fromCrit("alice@example.com"), "NoSuchLabel", "move")
+	if err := e.cache.NoteFolder(e.ctx(), "acct", "Ghost"); err != nil {
+		t.Fatal(err)
+	}
+	p := preview(t, cs, "acct", "INBOX", fromCrit("alice@example.com"), "Ghost", "move")
 	requireToolError(t, cs, "apply_intent", applyArgs(p), "target folder does not exist; create it with create_folder first")
 	if e.log.count("MOVE") != 0 || e.log.count("COPY") != 0 || e.log.count("CREATE") != 0 {
 		t.Errorf("log %q", e.log.lines())
@@ -269,6 +289,70 @@ func TestApplyMissingTargetSaysToCreateIt(t *testing.T) {
 	if n := e.serverCount("INBOX"); n != 3 {
 		t.Errorf("INBOX = %d", n)
 	}
+}
+
+func TestPreviewWorksRightAfterCreateFolderWithoutARefresh(t *testing.T) {
+	e := basic(t, true)
+	cs := e.admin()
+	ok[map[string]any](t, cs, "create_folder", map[string]any{"account": "acct", "name": "Fresh"})
+	p := preview(t, cs, "acct", "INBOX", fromCrit("alice@example.com"), "Fresh", "move")
+	if p.Matched != 2 {
+		t.Errorf("matched %d, want 2", p.Matched)
+	}
+	// The placeholder row must not break apply: it moves into the new folder.
+	a := apply(t, cs, p)
+	if a.Done != 2 {
+		t.Errorf("apply = %+v", a)
+	}
+	e.refresh("acct")
+	sameSet(t, "Fresh", e.members("acct", "Fresh"), "a1", "a2")
+}
+
+// A folder that exists on the server but the cache has not seen: create_folder
+// finds it already there and still records it.
+func TestPreviewWorksAfterCreateFolderOfAnExistingServerFolder(t *testing.T) {
+	e := basic(t, true)
+	cs := e.admin()
+	if err := e.user.Create("Existing", nil); err != nil {
+		t.Fatal(err)
+	}
+	requireToolError(t, cs, "preview_intent", previewArgs("acct", "INBOX", fromCrit("alice@example.com"), "Existing", "move"),
+		"target folder Existing does not exist on acct; create it with create_folder first")
+	e.log.reset()
+	ok[map[string]any](t, cs, "create_folder", map[string]any{"account": "acct", "name": "Existing"})
+	if n := e.log.count("CREATE"); n != 0 {
+		t.Errorf("CREATE sent for a folder that exists: %q", e.log.lines())
+	}
+	preview(t, cs, "acct", "INBOX", fromCrit("alice@example.com"), "Existing", "move")
+}
+
+func forgetFolder(t *testing.T, e *wenv, folder string) {
+	t.Helper()
+	if _, err := e.db().Exec(`DELETE FROM folders WHERE account = 'acct' AND folder = ?`, folder); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestUndoAndReapplyRefuseATargetAbsentFromTheCache(t *testing.T) {
+	e := basic(t, true)
+	cs := e.admin()
+	a := apply(t, cs, preview(t, cs, "acct", "INBOX", fromCrit("alice@example.com"), "Work", "move"))
+
+	// undo moves back into the original source folder.
+	forgetFolder(t, e, "INBOX")
+	requireToolError(t, cs, "undo", map[string]any{"history_id": a.HistoryID},
+		"target folder INBOX does not exist on acct; create it with create_folder first")
+
+	// reapply targets the original target.
+	forgetFolder(t, e, "Work")
+	requireToolError(t, cs, "reapply", map[string]any{"history_id": a.HistoryID},
+		"target folder Work does not exist on acct; create it with create_folder first")
+
+	// create_folder puts it back (the folder is on the server already), with no refresh.
+	ok[map[string]any](t, cs, "create_folder", map[string]any{"account": "acct", "name": "Work"})
+	ok[prevT](t, cs, "reapply", map[string]any{"history_id": a.HistoryID})
+	ok[map[string]any](t, cs, "create_folder", map[string]any{"account": "acct", "name": "INBOX"})
+	ok[prevT](t, cs, "undo", map[string]any{"history_id": a.HistoryID})
 }
 
 func TestUIDValidityChangeAbortsWithNothingTouched(t *testing.T) {

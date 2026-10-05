@@ -24,7 +24,20 @@ func newOrg(t *testing.T) *Organiser {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// The cache must know a preview's target (checkTarget), so the folders
+	// these tests move into are seeded the way create_folder seeds them.
+	seed(t, o, "acct", "INBOX", "X", "Y", "Z", "Z2")
 	return o
+}
+
+// seed records folders for an account in the cache, as create_folder does.
+func seed(t *testing.T, o *Organiser, account string, folders ...string) {
+	t.Helper()
+	for _, f := range folders {
+		if err := o.store.NoteFolder(context.Background(), account, f); err != nil {
+			t.Fatal(err)
+		}
+	}
 }
 
 func acct(p accounts.Provider) accounts.Account { return accounts.Account{Name: "acct", Provider: p} }
@@ -426,6 +439,7 @@ func TestOnly32PreviewsAreHeldOldestEvicted(t *testing.T) {
 	o := newOrg(t)
 	var toks []string
 	for i := range 33 {
+		seed(t, o, "acct", "T"+strconv.Itoa(i))
 		p, err := o.PreviewIntent(context.Background(), acct(accounts.Gmail), mv("INBOX", "T"+strconv.Itoa(i)), KindApply, time.Time{}, "")
 		if err != nil {
 			t.Fatal(err)
@@ -497,4 +511,65 @@ func TestAcquireIsPerAccountAndDoesNotWait(t *testing.T) {
 		t.Fatalf("slot not freed by release: %v", err)
 	}
 	rel2()
+}
+
+const wantMissing = "target folder Nope does not exist on acct; create it with create_folder first"
+
+func TestPreviewRefusesATargetTheCacheDoesNotKnow(t *testing.T) {
+	o := newOrg(t)
+	ctx := context.Background()
+	check := func(what string, p *Preview, err error) {
+		t.Helper()
+		if p != nil {
+			t.Errorf("%s: a preview was issued for a missing target", what)
+		}
+		wantErr(t, err, wantMissing)
+		if err != nil && err.Error() != wantMissing {
+			t.Errorf("%s: error = %q, want exactly %q", what, err, wantMissing)
+		}
+	}
+	p, err := o.PreviewIntent(ctx, acct(accounts.Gmail), mv("INBOX", "Nope"), KindApply, time.Time{}, "")
+	check("PreviewIntent", p, err)
+	p, err = o.PreviewIntent(ctx, acct(accounts.Gmail), lbl("INBOX", "Nope"), KindReapply, time.Now(), "rec1")
+	check("reapply", p, err)
+	undo := Intent{Criterion: Criterion{Folder: "Work"}, Target: "Nope", Action: ActionMove}
+	p, err = o.PreviewIDs(ctx, acct(accounts.Gmail), undo, []string{"gm:1"}, nil, 0, "rec1")
+	check("PreviewIDs", p, err)
+	// Nothing was held.
+	o.mu.Lock()
+	n := len(o.previews)
+	o.mu.Unlock()
+	if n != 0 {
+		t.Errorf("%d previews held after refusals", n)
+	}
+}
+
+func TestPreviewTargetIsCheckedPerAccountAndExactly(t *testing.T) {
+	o := newOrg(t)
+	ctx := context.Background()
+	// "X" is known for acct only.
+	other := accounts.Account{Name: "other", Provider: accounts.Gmail}
+	if _, err := o.PreviewIntent(ctx, other, mv("INBOX", "X"), KindApply, time.Time{}, ""); err == nil {
+		t.Error("a folder known for acct satisfied a preview on another account")
+	}
+	if _, err := o.PreviewIntent(ctx, acct(accounts.Gmail), mv("INBOX", "x"), KindApply, time.Time{}, ""); err == nil {
+		t.Error("target match is not exact (case)")
+	}
+}
+
+func TestPreviewSucceedsAfterNoteFolderWithoutARefresh(t *testing.T) {
+	o := newOrg(t)
+	ctx := context.Background()
+	in := Intent{Criterion: Criterion{Folder: "INBOX", From: "a@example.com"}, Target: "Nope", Action: ActionMove}
+	if _, err := o.PreviewIntent(ctx, acct(accounts.Gmail), in, KindApply, time.Time{}, ""); err == nil {
+		t.Fatal("preview before the folder exists succeeded")
+	}
+	seed(t, o, "acct", "Nope")
+	if _, err := o.PreviewIntent(ctx, acct(accounts.Gmail), in, KindApply, time.Time{}, ""); err != nil {
+		t.Errorf("PreviewIntent after NoteFolder: %v", err)
+	}
+	in.Criterion = Criterion{Folder: "Work"}
+	if _, err := o.PreviewIDs(ctx, acct(accounts.Gmail), in, []string{"gm:1"}, nil, 0, "r"); err != nil {
+		t.Errorf("PreviewIDs after NoteFolder: %v", err)
+	}
 }
