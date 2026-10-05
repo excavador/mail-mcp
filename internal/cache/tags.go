@@ -285,6 +285,9 @@ type SavedFilters struct {
 	Until     string `json:"until,omitempty"`
 	Tag       string `json:"tag,omitempty"`
 	GroupBy   string `json:"group_by,omitempty"`
+
+	ExcludeFrom []string `json:"exclude_from,omitempty"`
+	ExcludeKind []string `json:"exclude_kind,omitempty"`
 }
 
 // SavedQuery is a named SavedFilters.
@@ -308,6 +311,9 @@ func (c *Cache) SaveQuery(ctx context.Context, account, name string, f SavedFilt
 		if f.Tag, err = NormalizeTag(f.Tag); err != nil {
 			return err
 		}
+	}
+	if err := ValidateExclusions(f.ExcludeFrom, f.ExcludeKind); err != nil {
+		return err
 	}
 	if utf8.RuneCountInString(note) > maxNoteRunes {
 		return fmt.Errorf("%w: note is longer than %d characters", ErrTagLimit, maxNoteRunes)

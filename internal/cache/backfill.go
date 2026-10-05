@@ -32,7 +32,7 @@ type BackfillStatus struct {
 	Total    int  `json:"total"`
 	Complete bool `json:"complete"`
 	// State is "complete", "running", or "pending" (not started: the jobs run
-	// one after another, fts2 first, then threads).
+	// one after another: fts2, threads, senders, fts2 entities).
 	State string `json:"state"`
 }
 

@@ -185,6 +185,9 @@ func addCacheStatus(s *mcp.Server, store *cache.Cache) {
 		if sj, err := store.SendersStatus(ctx); err == nil {
 			out["senders_job"] = sj
 		}
+		if ej, err := store.EntitiesStatus(ctx); err == nil {
+			out["fts2_entities_job"] = ej
+		}
 		return nil, out, nil
 	})
 }

@@ -48,6 +48,7 @@ type Cache struct {
 
 	fts2Job, threadsJob jobState // in-process state of the backfill jobs
 	sendersJob          jobState
+	entitiesJob         jobState
 	sendersMax          atomic.Int64 // messages with a higher rowid are counted into senders by refresh itself
 	fgWriters           atomic.Int64 // refreshes and applies in progress; backfills give way
 	ws                  writeStats
@@ -453,6 +454,10 @@ func Open(dir string) (*Cache, error) {
 		return nil, fmt.Errorf("cache: initialise index: %w", err)
 	}
 	if err := c.initSenders(); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("cache: initialise index: %w", err)
+	}
+	if err := c.initEntities(); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("cache: initialise index: %w", err)
 	}

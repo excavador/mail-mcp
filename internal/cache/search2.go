@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -77,6 +78,49 @@ type matchPlan struct {
 	hasAtt bool // the attachment branch is part of the set
 }
 
+// ValidateExclusions checks the exclusion lists of a search or saved query:
+// at most 20 non-empty from fragments of at most 320 bytes, and only known
+// sender kinds. The errors are fixed texts that never echo the input.
+func ValidateExclusions(from, kinds []string) error {
+	if len(from) > maxExcludeFrom {
+		return fmt.Errorf("%w: exclude_from has more than %d entries", ErrQueryLimit, maxExcludeFrom)
+	}
+	for _, f := range from {
+		switch {
+		case len(f) > maxExcludeFromBytes:
+			return fmt.Errorf("%w: an exclude_from entry is longer than %d bytes", ErrQueryLimit, maxExcludeFromBytes)
+		case strings.TrimSpace(f) == "":
+			return fmt.Errorf("%w: an exclude_from entry is empty", ErrQueryLimit)
+		}
+	}
+	for _, k := range kinds {
+		if !ValidSenderKind(k) {
+			return fmt.Errorf("%w: exclude_kind must list only %s", ErrQueryLimit, strings.Join(SenderKinds, ", "))
+		}
+	}
+	return nil
+}
+
+// ExclusionKey is the canonical form of the exclusions, for a cursor or search
+// key: lowercased, sorted, without duplicates, "" when there are none.
+func ExclusionKey(from, kinds []string) string {
+	norm := func(in []string, fold bool) string {
+		out := make([]string, 0, len(in))
+		for _, s := range in {
+			if fold {
+				s = strings.ToLower(strings.TrimSpace(s))
+			}
+			out = append(out, s)
+		}
+		sort.Strings(out)
+		return strings.Join(slices.Compact(out), "\x1e")
+	}
+	if len(from) == 0 && len(kinds) == 0 {
+		return ""
+	}
+	return norm(from, true) + "\x1d" + norm(kinds, false)
+}
+
 func (c *Cache) matchSQL(q SearchQuery) (matchPlan, error) {
 	var p matchPlan
 	text := strings.TrimSpace(q.Text)
@@ -85,6 +129,9 @@ func (c *Cache) matchSQL(q SearchQuery) (matchPlan, error) {
 	}
 	if len(q.From) > maxFromBytes {
 		return p, fmt.Errorf("%w: from filter is longer than %d bytes", ErrQueryLimit, maxFromBytes)
+	}
+	if err := ValidateExclusions(q.ExcludeFrom, q.ExcludeKind); err != nil {
+		return p, err
 	}
 	if text != "" {
 		p.expr = text
@@ -112,6 +159,17 @@ func (c *Cache) matchSQL(q SearchQuery) (matchPlan, error) {
 	if q.From != "" {
 		filt = append(filt, `lower(m.from_addr) LIKE ? ESCAPE '\'`)
 		fa = append(fa, "%"+likeEscaper.Replace(strings.ToLower(q.From))+"%")
+	}
+	for _, x := range q.ExcludeFrom {
+		filt = append(filt, `lower(m.from_addr) NOT LIKE ? ESCAPE '\'`)
+		fa = append(fa, "%"+likeEscaper.Replace(strings.ToLower(strings.TrimSpace(x)))+"%")
+	}
+	if len(q.ExcludeKind) > 0 {
+		// A sender with no row yet has no kind and is kept.
+		filt = append(filt, `NOT EXISTS (SELECT 1 FROM senders sd WHERE sd.account = m.account AND sd.addr = `+senderAddrSQL+` AND sd.kind IN (`+inList(len(q.ExcludeKind))+`))`)
+		for _, k := range q.ExcludeKind {
+			fa = append(fa, k)
+		}
 	}
 	if q.Tag != "" {
 		filt = append(filt, `EXISTS (SELECT 1 FROM tags tg WHERE tg.account = m.account AND tg.stable_id = m.stable_id AND tg.tag = ?)`)
