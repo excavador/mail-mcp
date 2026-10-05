@@ -9,6 +9,11 @@ metadata:
   {{- end }}
 spec:
   replicas: {{ .Values.replicaCount }}
+  # Recreate strategy: the cache is a node-local SQLite database and
+  # history is an RWO PVC. A rolling update would cause multi-attach
+  # errors and concurrent writes to the cache. Only one pod at a time.
+  strategy:
+    type: Recreate
   selector:
     matchLabels: {{- include "mail-mcp.selectorLabels" . | nindent 6 }}
   template:

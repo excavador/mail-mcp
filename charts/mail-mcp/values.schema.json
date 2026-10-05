@@ -19,7 +19,9 @@
     },
     "replicaCount": {
       "type": "integer",
-      "minimum": 0
+      "minimum": 0,
+      "maximum": 1,
+      "description": "Fixed at 1: cache is a node-local SQLite database and history is an RWO PVC. Multiple replicas would cause multi-attach errors and concurrent writes."
     },
     "image": {
       "type": "object",
