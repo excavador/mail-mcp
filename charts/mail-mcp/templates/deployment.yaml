@@ -45,10 +45,13 @@ spec:
               value: {{ .Values.auth.adminResourceUrl | quote }}
             - name: SCOPE
               value: {{ .Values.auth.scope | quote }}
+            # Mount roots are owned by root and ignored by fsGroup. Point to
+            # subdirectories the app creates itself with MkdirAll; this lets the
+            # app own and chmod them to 0700 as a non-root user (65532).
             - name: CACHE_DIR
-              value: /var/cache/mail-mcp
+              value: /var/cache/mail-mcp/store
             - name: HISTORY_DIR
-              value: /var/lib/mail-mcp/history
+              value: /var/lib/mail-mcp/history/data
           ports:
             - name: http
               containerPort: {{ .Values.service.port }}
