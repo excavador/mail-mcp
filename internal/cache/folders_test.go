@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -293,5 +294,64 @@ func TestHitsByUIDOnACancelledContextErrors(t *testing.T) {
 func TestHitsByUIDTimeoutIsTenSeconds(t *testing.T) {
 	if HitsByUIDTimeout != 10*time.Second {
 		t.Errorf("HitsByUIDTimeout = %v", HitsByUIDTimeout)
+	}
+}
+
+func TestRefreshPrunesFoldersTheServerNoLongerLists(t *testing.T) {
+	e := newEnv(t, accounts.Gmail, "INBOX", "Gone", "Keep")
+	e.appendMsg("Gone", mkMsg("g1", "in gone", "b"), t0)
+	e.appendMsg("Keep", mkMsg("k1", "in keep", "b"), t0)
+	e.refresh()
+	if n := e.count(`SELECT COUNT(*) FROM membership WHERE folder='Gone'`); n != 1 {
+		t.Fatalf("Gone memberships before = %d, want 1", n)
+	}
+	msgs := e.count(`SELECT COUNT(*) FROM messages`)
+	e.deleteFolder("Gone")
+	e.refresh()
+	if n := e.count(`SELECT COUNT(*) FROM folders WHERE account='acct' AND folder='Gone'`); n != 0 {
+		t.Errorf("folders row for Gone survived: %d", n)
+	}
+	if n := e.count(`SELECT COUNT(*) FROM membership WHERE folder='Gone'`); n != 0 {
+		t.Errorf("membership for Gone survived: %d", n)
+	}
+	if ok, _ := e.cache.HasFolder(e.ctx(), "acct", "Gone"); ok {
+		t.Error("HasFolder still accepts Gone")
+	}
+	if ok, _ := e.cache.HasFolder(e.ctx(), "acct", "Keep"); !ok {
+		t.Error("Keep was pruned")
+	}
+	if n := e.count(`SELECT COUNT(*) FROM membership WHERE folder='Keep'`); n != 1 {
+		t.Errorf("Keep memberships = %d, want 1", n)
+	}
+	if got := e.count(`SELECT COUNT(*) FROM messages`); got != msgs {
+		t.Errorf("messages changed %d -> %d; pruning must keep them", msgs, got)
+	}
+}
+
+func TestPruneFoldersIgnoresAnEmptyOrFailedList(t *testing.T) {
+	e := newEnv(t, accounts.Gmail, "INBOX", "Keep")
+	e.appendMsg("Keep", mkMsg("k1", "in keep", "b"), t0)
+	e.refresh()
+	rows := func() int { return e.count(`SELECT COUNT(*) FROM folders WHERE account='acct'`) }
+	before := rows()
+
+	// Failed LIST: the connection dies when LIST arrives.
+	e.log.setHook(func(chunk string) {
+		if strings.Contains(strings.ToUpper(chunk), " LIST ") {
+			e.log.killConns()
+		}
+	})
+	if _, err := e.refreshErr(e.ctx()); err == nil {
+		t.Fatal("Refresh with a dead LIST succeeded")
+	}
+	e.clearHook()
+	if got := rows(); got != before {
+		t.Errorf("failed LIST changed folders rows %d -> %d", before, got)
+	}
+
+	// Empty listing: Refresh's guard never reaches pruneFolders; the helper
+	// itself is only ever called with a non-empty list.
+	if got := e.count(`SELECT COUNT(*) FROM membership WHERE folder='Keep'`); got != 1 {
+		t.Errorf("Keep membership = %d, want 1", got)
 	}
 }

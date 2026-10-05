@@ -132,6 +132,17 @@ func (c *Cache) Refresh(ctx context.Context, a accounts.Account, client *imapcli
 	}
 	st.FoldersTotal = len(folders)
 
+	// A folder deleted on the server (a Gmail label removed in the web UI)
+	// must leave the cache, or HasFolder keeps accepting it. Never prune on
+	// an empty listing: a transient oddity must not wipe the folder list.
+	if len(folders) > 0 {
+		if removed, perr := c.pruneFolders(ctx, a.Name, folders); perr != nil {
+			slog.Warn("cache: prune vanished folders failed", "account", a.Name, "err", perr)
+		} else if len(removed) > 0 {
+			slog.Info("cache: removed folders the server no longer lists", "account", a.Name, "folders", removed)
+		}
+	}
+
 	imapx.SetPhase(ctx, "status")
 	names := make([]string, len(folders))
 	for i, m := range folders {
@@ -730,6 +741,57 @@ func (c *Cache) markFolderComplete(ctx context.Context, account, folder string, 
 		return fmt.Errorf("mark folder complete: %w", err)
 	}
 	return nil
+}
+
+// pruneFolders deletes the folders rows, and their membership rows, of every
+// folder of account that is not in listed. Blobs and messages stay. It
+// returns the removed folder names. Callers must pass a non-empty listing.
+func (c *Cache) pruneFolders(ctx context.Context, account string, listed []*imap.ListData) ([]string, error) {
+	keep := make(map[string]bool, len(listed))
+	for _, m := range listed {
+		keep[m.Mailbox] = true
+	}
+	rows, err := c.db.QueryContext(ctx, `SELECT folder FROM folders WHERE account = ?`, account)
+	if err != nil {
+		return nil, fmt.Errorf("prune folders: %w", err)
+	}
+	var gone []string
+	for rows.Next() {
+		var f string
+		if err := rows.Scan(&f); err != nil {
+			rows.Close()
+			return nil, fmt.Errorf("prune folders: %w", err)
+		}
+		if !keep[f] {
+			gone = append(gone, f)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, err
+	}
+	rows.Close()
+	if len(gone) == 0 {
+		return nil, nil
+	}
+	sort.Strings(gone)
+	tx, err := c.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("prune folders: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	for _, f := range gone {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM membership WHERE account = ? AND folder = ?`, account, f); err != nil {
+			return nil, fmt.Errorf("prune membership: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM folders WHERE account = ? AND folder = ?`, account, f); err != nil {
+			return nil, fmt.Errorf("prune folder: %w", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("prune folders: %w", err)
+	}
+	return gone, nil
 }
 
 // saveFolderAttrs stores each folder's LIST attributes, for rows that exist.
