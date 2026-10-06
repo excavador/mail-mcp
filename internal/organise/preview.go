@@ -103,7 +103,7 @@ func (o *Organiser) query(in Intent, after time.Time) cache.MemberQuery {
 	c := in.Criterion
 	return cache.MemberQuery{
 		Folder: c.Folder, From: c.From, To: c.To, SubjectContains: c.SubjectContains,
-		ListID: c.ListID, GitHubReason: c.GitHubReason, Since: c.Since, Before: c.Before,
+		ListID: c.ListID, GitHubReason: c.GitHubReason, Tag: c.Tag, Since: c.Since, Before: c.Before,
 		ReceivedAfter: after,
 	}
 }

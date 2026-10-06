@@ -50,6 +50,8 @@ type gfConfig struct {
 	Search  []uint32 // UIDs answered to UID SEARCH
 	// Hold, if non-nil, blocks every UID SEARCH until closed (slot-busy tests).
 	Hold chan struct{}
+	// FailExpunge answers UID EXPUNGE with NO.
+	FailExpunge bool
 	// Entered is closed (once) when the first UID SEARCH arrives.
 	Entered chan struct{}
 }
@@ -344,6 +346,14 @@ func (f *gmailFake) serve(c net.Conn) {
 					say("* SEARCH")
 				} else {
 					say("* SEARCH " + strings.Join(ids, " "))
+				}
+				say(tag + " OK done")
+			case "STORE", "EXPUNGE":
+				// Writes are only logged (the verbs and arguments are what
+				// the tests read); nothing changes in the fake.
+				if strings.ToUpper(sub[0]) == "EXPUNGE" && f.cfg.FailExpunge {
+					say(tag + " NO expunge failed")
+					continue
 				}
 				say(tag + " OK done")
 			default:

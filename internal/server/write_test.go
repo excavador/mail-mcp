@@ -611,7 +611,9 @@ func TestUndoRefusesLabelUndoOfUndoAndCreateFolder(t *testing.T) {
 	u, _ := ok[prevT](t, cs, "undo", map[string]any{"history_id": mov.HistoryID})
 	ua := apply(t, cs, u)
 
-	requireToolError(t, cs, "undo", map[string]any{"history_id": lab.HistoryID}, "label")
+	if lu, _ := ok[prevT](t, cs, "undo", map[string]any{"history_id": lab.HistoryID}); lu.Action != "unlabel" {
+		t.Errorf("undo of a label previews %q, want unlabel", lu.Action)
+	}
 	requireToolError(t, cs, "undo", map[string]any{"history_id": ua.HistoryID}, "only an applied intent")
 	requireToolError(t, cs, "undo", map[string]any{"history_id": cfID}, "only an applied intent")
 	requireToolError(t, cs, "undo", map[string]any{"history_id": "nope"}, "no such history record")

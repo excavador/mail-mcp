@@ -528,6 +528,7 @@ type prevT struct {
 	Matched      int    `json:"matched"`
 	NotFound     int    `json:"not_found"`
 	MoveBack     int    `json:"move_back"`
+	Unlabel      int    `json:"unlabel"`
 	CopyBack     int    `json:"copy_back"`
 	Sampled      int    `json:"sampled"`
 	Untrusted    struct {

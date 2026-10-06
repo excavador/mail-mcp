@@ -9,6 +9,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/emersion/go-imap/v2"
+
 	"github.com/excavador/mail-mcp/internal/accounts"
 	"github.com/excavador/mail-mcp/internal/cache"
 )
@@ -571,5 +573,70 @@ func TestPreviewSucceedsAfterNoteFolderWithoutARefresh(t *testing.T) {
 	in.Criterion = Criterion{Folder: "Work"}
 	if _, err := o.PreviewIDs(ctx, acct(accounts.Gmail), in, []string{"gm:1"}, nil, 0, "r"); err != nil {
 		t.Errorf("PreviewIDs after NoteFolder: %v", err)
+	}
+}
+
+func TestValidateTagCriterionAndUnlabelRules(t *testing.T) {
+	in := func(c Criterion, action, target string) Intent {
+		return Intent{Criterion: c, Action: action, Target: target}
+	}
+	// A tag alone is a matcher; its syntax is the tags' syntax, exactly.
+	if err := in(Criterion{Folder: "INBOX", Tag: "purchase"}, ActionLabel, "Work").Validate(accounts.Gmail); err != nil {
+		t.Errorf("tag alone refused: %v", err)
+	}
+	for _, bad := range []string{"Purchase", "has space", "-x", "a*b"} {
+		if err := in(Criterion{Folder: "INBOX", Tag: bad}, ActionLabel, "Work").Validate(accounts.Gmail); err == nil {
+			t.Errorf("tag %q accepted", bad)
+		}
+	}
+	if err := in(Criterion{Folder: "INBOX"}, ActionLabel, "Work").Validate(accounts.Gmail); err != ErrNoMatcher {
+		t.Errorf("no matcher: %v", err)
+	}
+	// unlabel is undo's: Validate (preview_intent) refuses it, CheckMove allows
+	// it for a user label only.
+	if err := in(Criterion{Folder: "Work", From: "a@b"}, ActionUnlabel, "INBOX").Validate(accounts.Gmail); err == nil {
+		t.Error("unlabel accepted from a caller")
+	}
+	for _, tc := range []struct {
+		p       accounts.Provider
+		label   string
+		allowed bool
+	}{
+		{accounts.Gmail, "Purchases/Imported", true}, {accounts.Gmail, "INBOX", false}, {accounts.Gmail, "[Gmail]/Spam", false},
+		{accounts.Proton, "Labels/Purchases", true}, {accounts.Proton, "Folders/x", false}, {accounts.Proton, "INBOX", false},
+	} {
+		err := in(Criterion{Folder: tc.label}, ActionUnlabel, "INBOX").CheckMove(tc.p)
+		if (err == nil) != tc.allowed {
+			t.Errorf("unlabel %s on %s: err = %v, allowed %v", tc.label, tc.p, err, tc.allowed)
+		}
+	}
+}
+
+func TestChooseUnlabelNeverExpungesOnGmailAndOnlyInProtonLabels(t *testing.T) {
+	ext := imap.CapSet{imap.CapGmailExt1: {}}
+	uidplus := imap.CapSet{imap.CapUIDPlus: {}}
+	both := imap.CapSet{imap.CapGmailExt1: {}, imap.CapUIDPlus: {}}
+	for _, tc := range []struct {
+		name  string
+		p     accounts.Provider
+		label string
+		caps  imap.CapSet
+		want  unlabelMode // 0: refused
+	}{
+		{"gmail ext1", accounts.Gmail, "Purchases/Imported", ext, unlabelGmailLabels},
+		{"gmail ext1 and uidplus still labels only", accounts.Gmail, "Purchases/Imported", both, unlabelGmailLabels},
+		{"gmail without ext1 (uidplus present)", accounts.Gmail, "Purchases/Imported", uidplus, 0},
+		{"gmail no caps", accounts.Gmail, "Purchases/Imported", imap.CapSet{}, 0},
+		{"proton labels uidplus", accounts.Proton, "Labels/x", uidplus, unlabelExpunge},
+		{"proton labels no uidplus", accounts.Proton, "Labels/x", imap.CapSet{}, 0},
+		{"proton folder", accounts.Proton, "Folders/x", uidplus, 0},
+		{"proton inbox", accounts.Proton, "INBOX", uidplus, 0},
+		{"proton labels-like prefix", accounts.Proton, "Labelsx/y", uidplus, 0},
+		{"other provider", accounts.Provider("imap"), "Labels/x", both, 0},
+	} {
+		got, err := chooseUnlabel(tc.p, tc.label, tc.caps)
+		if got != tc.want || (tc.want == 0) != (err != nil) {
+			t.Errorf("%s: mode %d, err %v; want mode %d", tc.name, got, err, tc.want)
+		}
 	}
 }

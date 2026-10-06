@@ -28,6 +28,7 @@ type MemberQuery struct {
 	SubjectContains string    // substring
 	ListID          string    // exact, case-insensitive; "<id>" brackets optional
 	GitHubReason    string    // exact, case-insensitive
+	Tag             string    // a local tag (normalised) the message carries
 	Since           time.Time // message date, inclusive
 	Before          time.Time // message date, exclusive
 	// ReceivedAfter keeps only messages the server received after this
@@ -83,6 +84,10 @@ func (c *Cache) ResolveMembers(ctx context.Context, account string, q MemberQuer
 	if q.GitHubReason != "" {
 		where += ` AND lower(m.gh_reason) = lower(?)`
 		args = append(args, strings.TrimSpace(q.GitHubReason))
+	}
+	if q.Tag != "" {
+		where += ` AND EXISTS (SELECT 1 FROM tags t WHERE t.account = s.account AND t.stable_id = s.stable_id AND t.tag = ?)`
+		args = append(args, q.Tag)
 	}
 	if q.To != "" {
 		where += ` AND instr(lower(m.to_addr), lower(?)) > 0`
