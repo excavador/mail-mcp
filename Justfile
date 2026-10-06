@@ -95,6 +95,9 @@ chart:
     @! helm template t charts/mail-mcp --set accounts.existingSecret=x {{auth_values}} --set pdfExtractor.typo=1 >/dev/null 2>&1 \
         || (echo "FAIL: accepted an unknown pdfExtractor key"; exit 1)
     @! helm template t charts/mail-mcp --set accounts.existingSecret=x {{auth_values}} --set pdfExtractor.enabled=true \
+        --set pdfExtractor.resources.limits.memory=256Mi >/dev/null 2>&1 \
+        || (echo "FAIL: accepted a pdf sidecar memory limit below the address-space cap"; exit 1)
+    @! helm template t charts/mail-mcp --set accounts.existingSecret=x {{auth_values}} --set pdfExtractor.enabled=true \
         --set pdfExtractor.resources.limits=null >/dev/null 2>&1 \
         || (echo "FAIL: accepted a pdf sidecar without a memory limit"; exit 1)
     @echo "chart ok: renders, refuses missing values (including auth and accounts), equal resource URLs, and unknown keys, annotates the Deployment, wires auth.scope, and renders the PDF sidecar only when enabled, strictly confined"

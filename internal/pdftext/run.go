@@ -103,6 +103,22 @@ func (r *Runner) Extract(ctx context.Context, hash string) Response {
 	if r.isBroken() {
 		return Response{Status: StatusUnavailable}
 	}
+	resp := r.extractOnce(ctx, path)
+	if resp.Status == StatusUnavailable {
+		// An unsent SIGKILL or a failed start can be the file's doing: the
+		// kernel OOM-kills only pdftotext when the container limit is below
+		// what it reaches. Blame the helper only if it cannot do the job on a
+		// known-good document too; otherwise the file caused it.
+		if r.SelfTest(ctx) {
+			return Response{Status: StatusFailed}
+		}
+	}
+	return resp
+}
+
+// extractOnce is one job under a slot. The slot is released before the
+// caller re-runs the self-test, which needs one itself.
+func (r *Runner) extractOnce(ctx context.Context, path string) Response {
 	select {
 	case r.sem <- struct{}{}:
 		defer func() { <-r.sem }()

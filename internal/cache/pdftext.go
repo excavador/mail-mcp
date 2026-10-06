@@ -53,6 +53,13 @@ type PDFExtractor interface {
 // breaker is open, or it is not running). The job stops and tries again later.
 var ErrPDFUnavailable = errors.New("pdf extractor unavailable")
 
+// ErrPDFHelperUnavailable is ErrPDFUnavailable as reported by the sidecar
+// itself (its answer was "unavailable"), as opposed to a breaker that is open
+// or a staging problem. It is counted per file: a file that gets it three
+// times is recorded as failed, so one file that makes the helper look sick
+// cannot stay first in line forever.
+var ErrPDFHelperUnavailable = fmt.Errorf("%w: the extractor reported itself unavailable", ErrPDFUnavailable)
+
 // SetPDFExtractor turns the pdf_text job on (nil turns it off).
 func (c *Cache) SetPDFExtractor(x PDFExtractor) {
 	c.pdfMu.Lock()
@@ -297,7 +304,7 @@ func (c *Cache) pdfOne(ctx context.Context, log *slog.Logger, x PDFExtractor, a 
 	} else {
 		res, err = c.extractPDF(ctx, log, x, a)
 		if err != nil {
-			if errors.Is(err, ErrPDFUnavailable) || ctx.Err() != nil {
+			if ctx.Err() != nil || (errors.Is(err, ErrPDFUnavailable) && !errors.Is(err, ErrPDFHelperUnavailable)) {
 				return 0, err
 			}
 			if c.noteAttempt(a.sha) < pdfMaxAttempts {

@@ -495,3 +495,32 @@ func TestAttachmentTextsCaps(t *testing.T) {
 		t.Fatalf("unknown message: %+v", ts)
 	}
 }
+
+func TestPDFTextRepeatedHelperUnavailableForOneFileBecomesFailed(t *testing.T) {
+	c := openCache(t)
+	ctx := tctx(t)
+	good := &fakeX{c: c}
+	c.SetPDFExtractor(extractorFunc(func(ctx context.Context, sha string) (PDFResult, error) {
+		b, _ := os.ReadFile(c.pdfFile(sha))
+		if strings.Contains(string(b), "MARK-Oom") {
+			return PDFResult{}, ErrPDFHelperUnavailable
+		}
+		return good.Extract(ctx, sha)
+	}))
+	addPDFMessage(t, c, "m1", pdfDoc("MARK-Oom")) // first in line
+	addPDFMessage(t, c, "m2", pdfDoc("MARK-Fine"))
+	for i := 1; i < pdfMaxAttempts; i++ {
+		if err := c.RunPDFTextOnce(ctx, nil); !errors.Is(err, ErrPDFUnavailable) {
+			t.Fatalf("pass %d: %v", i, err)
+		}
+		if st, _ := c.PDFTextStatus(ctx); st.Outcomes["failed"] != 0 {
+			t.Fatalf("pass %d recorded a verdict early: %+v", i, st)
+		}
+	}
+	if err := c.RunPDFTextOnce(ctx, nil); err != nil {
+		t.Fatal(err)
+	}
+	if st, _ := c.PDFTextStatus(ctx); st.Outcomes["failed"] != 1 || st.Outcomes["ok"] != 1 || !st.Complete {
+		t.Fatalf("%+v", st)
+	}
+}

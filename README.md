@@ -118,7 +118,7 @@ What this design assumes and does about it:
 
 - **The parser is compromised or runs away.** It runs in its own container
   with a read-only root file system, no capabilities, the default seccomp
-  profile, a 512 Mi memory limit and one CPU. It does not mount the mail
+  profile, a 512 Mi memory limit (at least the 400 MB address-space cap plus 64 Mi; the chart refuses less, because below it the kernel OOM-kills `pdftotext` on large files and that looks like a bad file) and one CPU. It does not mount the mail
   store at all: it sees one small staging `emptyDir` (64 Mi), read-only, into
   which mail-mcp writes one decoded PDF at a time, and nothing writable but
   the socket directory. It has no credentials: the accounts secret is mounted
@@ -158,9 +158,9 @@ What this design assumes and does about it:
   can loop and a restart does not condemn a good file. A broken sidecar is told
   apart from a bad file: the helper runs a self-test on a tiny embedded PDF at
   start and answers `unavailable` to every request while it fails, and also for
-  an exec or limit failure or a kill it did not send (the OOM killer); the client
+  an exec or limit failure or a kill it did not send (the OOM killer), but only if it then also fails its self-test (otherwise a healthy helper means the file caused it, and the answer is `failed`); the client
   counts `unavailable` toward the breaker and never records it as a file's
-  outcome. A full or broken staging directory is likewise a retryable error, not
+  outcome, except that a file that gets it three times is recorded as `failed`. A full or broken staging directory is likewise a retryable error, not
   a verdict. Errors have
   fixed texts and never echo input. mail-mcp streams the message blob and the
   attachment (never holding either whole), so a large PDF does not threaten

@@ -132,7 +132,7 @@ func (c *Client) Extract(ctx context.Context, sha string) (cache.PDFResult, erro
 		// self-test, an OOM kill): the breaker counts it, and it is never a
 		// file's outcome.
 		c.record(true)
-		return cache.PDFResult{}, ErrOpen
+		return cache.PDFResult{}, cache.ErrPDFHelperUnavailable
 	case "ok", "too_large", "not_pdf", "timeout", "failed":
 		// Every status is the sidecar answering. timeout and failed are about
 		// the file, not the sidecar's health.

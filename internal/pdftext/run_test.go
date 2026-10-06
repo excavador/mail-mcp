@@ -163,6 +163,25 @@ func TestKillNotCausedByTheHelperIsUnavailable(t *testing.T) {
 	}
 }
 
+func TestKillIsBlamedOnTheFileWhenTheSelfTestPasses(t *testing.T) {
+	// pdftotext "gets OOM-killed" on the file but handles the self-test
+	// document: a healthy helper, so the file caused it.
+	f := newFixture(t, `case "$*" in *selftest*) echo `+selfTestMarker+` ;; *) kill -9 $$ ;; esac`, func(c *Config) { c.ScratchDir = t.TempDir() })
+	if got := f.r.Extract(context.Background(), f.put(t, pdfBytes)); got.Status != StatusFailed {
+		t.Fatalf("got %+v, want failed", got)
+	}
+	if f.r.isBroken() {
+		t.Fatal("the helper was marked broken by one bad file")
+	}
+}
+
+func TestKillIsBlamedOnTheHelperWhenTheSelfTestFails(t *testing.T) {
+	f := newFixture(t, `kill -9 $$`, func(c *Config) { c.ScratchDir = t.TempDir() })
+	if got := f.r.Extract(context.Background(), f.put(t, pdfBytes)); got.Status != StatusUnavailable {
+		t.Fatalf("got %+v, want unavailable", got)
+	}
+}
+
 func TestSelfTestGatesEveryRequest(t *testing.T) {
 	// A fake that prints the marker passes; one that fails does not, and then
 	// every request, valid file or not, is answered unavailable.

@@ -75,7 +75,9 @@ pdfExtractor:
     tag: ""
     pullPolicy: IfNotPresent
   # Memory is the one that matters: poppler on a hostile file. Two jobs run at
-  # once, each with an address-space cap of 400 MB.
+  # once, each with an address-space cap of 400 MB. limits.memory must be at
+  # least 464Mi (400 MB plus 64Mi; the chart refuses less): under it the OOM
+  # killer takes pdftotext on large files, which looks like a bad file.
   resources:
     requests: {cpu: 50m, memory: 64Mi}
     limits: {cpu: "1", memory: 512Mi}
