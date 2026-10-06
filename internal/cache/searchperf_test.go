@@ -57,7 +57,7 @@ func TestSearchBroadMatchStaysInBudget(t *testing.T) {
 	if v := os.Getenv("PERF_N"); v != "" {
 		n, _ = strconv.Atoi(v)
 	}
-	if testing.Short() {
+	if testing.Short() || raceEnabled {
 		n = 2000
 	}
 	c := thrOpen(t)
@@ -84,7 +84,9 @@ func TestSearchBroadMatchStaysInBudget(t *testing.T) {
 				if got := c.FolderQueries() - before; got > 2 {
 					t.Errorf("folder lookups = %d, want one batch for the page", got)
 				}
-				if el > 2*time.Second {
+				if raceEnabled {
+					t.Logf("race detector on: wall-clock bound skipped (took %s)", el)
+				} else if el > 2*time.Second {
 					t.Errorf("took %s, want well under the %s budget", el, searchTimeout)
 				}
 				if group == "message" {
