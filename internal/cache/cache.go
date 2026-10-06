@@ -49,6 +49,9 @@ type Cache struct {
 	fts2Job, threadsJob jobState // in-process state of the backfill jobs
 	sendersJob          jobState
 	entitiesJob         jobState
+	pdfJob              jobState
+	pdfMu               sync.RWMutex
+	pdfX                PDFExtractor // nil: the feature is off
 	sendersMax          atomic.Int64 // messages with a higher rowid are counted into senders by refresh itself
 	fgWriters           atomic.Int64 // refreshes and applies in progress; backfills give way
 	ws                  writeStats
@@ -359,6 +362,21 @@ CREATE TABLE IF NOT EXISTS refreshes (
 	new_bodies INTEGER NOT NULL DEFAULT 0,
 	removed    INTEGER NOT NULL DEFAULT 0
 );
+
+-- Added after v1.1, additively (IF NOT EXISTS, no schemaVersion bump). Text
+-- extracted from PDF attachments by the sidecar (see pdftext.go), keyed by the
+-- SHA-256 of the decoded attachment so the same file forwarded a hundred times
+-- is extracted once. status is the sidecar's: ok, timeout, too_large, failed,
+-- not_pdf. A row is written for every outcome, so a hostile file is never
+-- retried.
+CREATE TABLE IF NOT EXISTS pdf_text (
+	sha256       TEXT    PRIMARY KEY,
+	status       TEXT    NOT NULL,
+	text         TEXT    NOT NULL DEFAULT '',
+	truncated    INTEGER NOT NULL DEFAULT 0,
+	pages_capped INTEGER NOT NULL DEFAULT 0,
+	updated_at   INTEGER NOT NULL DEFAULT 0
+) WITHOUT ROWID;
 `
 
 // schemaVersion is stored in PRAGMA user_version. The index is derived data
@@ -370,7 +388,7 @@ const schemaVersion = 2
 
 // indexTables are the tables the index owns, FTS first (dropping the virtual
 // table removes its shadow tables).
-var indexTables = []string{"message_fts", "message_fts2", "attachment_fts", "attachments", "backfill", "messages", "membership", "folders", "refreshes", "threads", "message_thread", "message_ref"}
+var indexTables = []string{"message_fts", "message_fts2", "attachment_fts", "attachments", "backfill", "messages", "membership", "folders", "refreshes", "threads", "message_thread", "message_ref", "pdf_text"}
 
 // ensureSchema creates the schema, first wiping the index tables when the
 // database carries a different user_version (0 for a fresh or pre-versioned
