@@ -1,0 +1,54 @@
+name: PDF sidecar image
+# Publishes ghcr.io/excavador/mail-mcp-pdftext:<version> for linux/amd64 and
+# linux/arm64 on the same tags as the release. Separate from release.yaml
+# because the shared release-public workflow builds images with ko from Go
+# alone, and this one needs poppler-utils from a package manager.
+on:
+  push:
+    tags:
+      - "v*"
+  pull_request:
+    paths:
+      - cmd/pdftext/**
+      - internal/pdftext/**
+      - .github/workflows/pdftext-image.yaml
+permissions:
+  contents: read
+  packages: write
+concurrency:
+  group: pdftext-image-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - name: Log in to GHCR
+        if: github.ref_type == 'tag'
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Version
+        id: v
+        # The tag without its "v", like the main image and the chart appVersion.
+        run: |
+          if [ "${GITHUB_REF_TYPE}" = tag ]; then echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"; else echo "version=dev" >> "$GITHUB_OUTPUT"; fi
+      # On a pull request the image is built for both platforms and not pushed:
+      # the Dockerfile and the poppler install stay proven without publishing.
+      - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          file: cmd/pdftext/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: ${{ github.ref_type == 'tag' }}
+          build-args: |
+            VERSION=${{ steps.v.outputs.version }}
+          tags: |
+            ghcr.io/excavador/mail-mcp-pdftext:${{ steps.v.outputs.version }}
+            ${{ !contains(steps.v.outputs.version, '-') && 'ghcr.io/excavador/mail-mcp-pdftext:latest' || '' }}
+          provenance: false
+          sbom: false
