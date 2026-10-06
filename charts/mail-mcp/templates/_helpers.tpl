@@ -52,4 +52,10 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- if eq .Values.auth.readResourceUrl .Values.auth.adminResourceUrl -}}
 {{- fail "auth.readResourceUrl and auth.adminResourceUrl must be different" -}}
 {{- end -}}
+{{- if .Values.pdfExtractor.enabled -}}
+{{- $mem := toString .Values.pdfExtractor.resources.limits.memory -}}
+{{- if and (regexMatch "^[0-9]+Mi$" $mem) (lt (int (trimSuffix "Mi" $mem)) 464) -}}
+{{- fail "pdfExtractor.resources.limits.memory must be at least 464Mi (the helper's 400 MB address-space cap plus 64Mi): below it the kernel OOM-kills pdftotext on large files" -}}
+{{- end -}}
+{{- end -}}
 {{- end -}}

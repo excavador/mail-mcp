@@ -34,6 +34,7 @@ import (
 	"github.com/excavador/mail-mcp/internal/history"
 	"github.com/excavador/mail-mcp/internal/memlimit"
 	"github.com/excavador/mail-mcp/internal/organise"
+	"github.com/excavador/mail-mcp/internal/pdfclient"
 	"github.com/excavador/mail-mcp/internal/server"
 )
 
@@ -140,6 +141,23 @@ func main() {
 				Value:   string(server.ApprovalClient),
 				Sources: cli.EnvVars("APPROVAL_MODE"),
 			},
+			&cli.StringFlag{
+				Name: "pdf-extractor-socket",
+				// Empty (the default) turns PDF text off: mail-mcp has no PDF
+				// parser and never will. With a socket, a sidecar running
+				// the pdftext helper does the parsing, killably, in its own
+				// container.
+				Usage:   "unix socket of the pdftext sidecar; empty disables PDF attachment text",
+				Sources: cli.EnvVars("PDF_EXTRACTOR_SOCKET"),
+			},
+			&cli.StringFlag{
+				Name: "pdf-stage-dir",
+				// Decoded PDFs are staged under <dir>/pdf for the sidecar. In a
+				// pod this is a dedicated emptyDir the sidecar mounts read-only,
+				// so it never sees the mail store. Default: the cache dir.
+				Usage:   "root under which PDFs are staged for the sidecar (default: --cache-dir)",
+				Sources: cli.EnvVars("PDF_STAGE_DIR"),
+			},
 			&cli.DurationFlag{
 				Name:    "refresh-interval",
 				Usage:   "how often to refresh the cache from each mailbox; 0 disables refreshing",
@@ -201,6 +219,13 @@ func run(ctx context.Context, cmd *cli.Command) error {
 		return err
 	}
 	opts := []server.Option{server.WithHistory(hist), server.WithOrganiser(org), server.WithMaxUnelicited(cmd.Int("max-unelicited-apply")), server.WithApprovalMode(approval)}
+	if sock := cmd.String("pdf-extractor-socket"); sock != "" {
+		if d := cmd.String("pdf-stage-dir"); d != "" {
+			store.SetPDFStageDir(d)
+		}
+		store.SetPDFExtractor(pdfclient.New(sock))
+		log.Info("pdf text", "extractor_socket", sock)
+	}
 	// Refreshers stop, and are waited for, before the cache closes under them.
 	ctx, cancel := context.WithCancel(ctx)
 	var wg sync.WaitGroup

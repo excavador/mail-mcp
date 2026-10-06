@@ -298,7 +298,7 @@ func (c *Cache) snippets(ctx context.Context, p matchPlan, rows []snipRef) map[i
 		run(`SELECT rowid, replace(replace(CASE WHEN instr(a, char(1)) > 0 OR instr(b, char(1)) = 0 THEN a ELSE b END, char(1), '['), char(2), ']') -- msg
 FROM (SELECT rowid, snippet(message_fts2, 4, char(1), char(2), '…', 20) AS a, snippet(message_fts2, 5, char(1), char(2), '…', 20) AS b
       FROM message_fts2 WHERE message_fts2 MATCH ? AND rowid IN (?IDS))`, msg)
-		run(`SELECT rowid, 'attachment: ' || snippet(attachment_fts, 3, '[', ']', '…', 20) -- att
+		run(`SELECT rowid, 'attachment: ' || replace(replace(snippet(attachment_fts, -1, char(1), char(2), '…', 20), char(1), '['), char(2), ']') -- att
 FROM attachment_fts WHERE attachment_fts MATCH ? AND rowid IN (?IDS)`, att)
 	} else {
 		run(`SELECT rowid, snippet(`+p.table+`, 4, '[', ']', '…', 20) -- msg

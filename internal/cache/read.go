@@ -885,7 +885,7 @@ ORDER BY hit.d DESC, hit.account, hit.stable_id`
 )
 SELECT hit.account, hit.stable_id, hit.d, m.from_addr, m.subject,
 	CASE WHEN hit.att = 0 THEN ` + msgSnip + `
-	ELSE (SELECT 'attachment: ' || snippet(attachment_fts, 3, '[', ']', '…', 20)
+	ELSE (SELECT 'attachment: ' || replace(replace(snippet(attachment_fts, -1, char(1), char(2), '…', 20), char(1), '['), char(2), ']')
 	      FROM attachment_fts WHERE attachment_fts.rowid = hit.rid AND attachment_fts MATCH ?) END
 FROM hit JOIN messages m ON m.account = hit.account AND m.stable_id = hit.stable_id
 ORDER BY hit.att, hit.d DESC, hit.account, hit.stable_id`

@@ -62,6 +62,26 @@ history:
 approval:
   mode: client
 
+# PDF attachment text. Off by default. mail-mcp contains no PDF parser; when
+# enabled, a sidecar container (poppler's pdftotext behind a small helper that
+# kills and rlimits every job) extracts the text, and mail-mcp indexes it so
+# search finds words inside PDFs. See "PDF attachment text" in the README.
+pdfExtractor:
+  enabled: false
+  image:
+    registry: ghcr.io
+    repository: excavador/mail-mcp-pdftext
+    # Empty means the chart's appVersion (the sidecar is released with mail-mcp).
+    tag: ""
+    pullPolicy: IfNotPresent
+  # Memory is the one that matters: poppler on a hostile file. Two jobs run at
+  # once, each with an address-space cap of 400 MB. limits.memory must be at
+  # least 464Mi (400 MB plus 64Mi; the chart refuses less): under it the OOM
+  # killer takes pdftotext on large files, which looks like a bad file.
+  resources:
+    requests: {cpu: 50m, memory: 64Mi}
+    limits: {cpu: "1", memory: 512Mi}
+
 resources:
   requests: {cpu: 20m, memory: 64Mi}
   limits: {memory: 128Mi}

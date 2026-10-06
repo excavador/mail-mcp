@@ -148,8 +148,69 @@
       "properties": {
         "mode": {
           "type": "string",
-          "enum": ["client", "elicitation"],
+          "enum": [
+            "client",
+            "elicitation"
+          ],
           "description": "client: approval is the client's tool-approval prompt, capped per apply. elicitation: MCP forms. See anthropics/claude-code#98978."
+        }
+      }
+    },
+    "pdfExtractor": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Optional PDF text sidecar. Off by default.",
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "image": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "registry",
+            "repository"
+          ],
+          "properties": {
+            "registry": {
+              "type": "string",
+              "minLength": 1
+            },
+            "repository": {
+              "type": "string",
+              "minLength": 1
+            },
+            "tag": {
+              "type": "string",
+              "description": "Empty means the chart's appVersion."
+            },
+            "pullPolicy": {
+              "enum": [
+                "Always",
+                "IfNotPresent",
+                "Never"
+              ]
+            }
+          }
+        },
+        "resources": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "requests": {
+              "type": "object"
+            },
+            "limits": {
+              "type": "object",
+              "required": [
+                "memory"
+              ],
+              "description": "A memory limit is required: it is the container-level bound on a parser handling untrusted files. It must be at least 464Mi (the helper's 400 MB address-space cap plus 64Mi; the chart refuses a smaller value written in Mi): below that the kernel OOM-kills pdftotext on large files, which looks like a bad file."
+            }
+          },
+          "required": [
+            "limits"
+          ]
         }
       }
     },

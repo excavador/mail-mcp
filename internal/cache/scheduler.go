@@ -168,7 +168,7 @@ func (r *rateLog) tick(done, total int) {
 
 // RunBackfills is the one backfill scheduler: the fts2 index first (search
 // quality depends on it), then Gmail bulk threading and the per-message threads job,
-// then senders, then the fts2 entity re-index, each to completion and
+// then senders, then the fts2 entity re-index, then PDF text (when a sidecar is configured), each to completion and
 // resumable. It returns when all are done or ctx ends. Writers other than these jobs
 // (refresh, apply) are not queued behind it; the jobs yield to them.
 func (c *Cache) RunBackfills(ctx context.Context, log *slog.Logger) {
@@ -227,5 +227,19 @@ func (c *Cache) RunBackfills(ctx context.Context, log *slog.Logger) {
 		if err := c.RunEntities(ctx, log); err != nil && ctx.Err() == nil {
 			log.Error("fts2 entities job failed", "error", err.Error())
 		}
+	}()
+	if ctx.Err() != nil {
+		return
+	}
+	// Last: PDF text through the sidecar is the slowest and least urgent job,
+	// and it only runs when an extractor is configured. It then keeps
+	// rescanning for new mail's PDFs until ctx ends.
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Error("pdf_text job panicked", "panic", fmt.Sprint(r))
+			}
+		}()
+		c.RunPDFText(ctx, log)
 	}()
 }
