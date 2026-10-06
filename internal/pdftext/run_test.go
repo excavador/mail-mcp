@@ -149,10 +149,40 @@ func TestNonZeroExitIsFailed(t *testing.T) {
 	}
 }
 
-func TestMissingProgramIsFailed(t *testing.T) {
+func TestMissingProgramIsUnavailableNotFailed(t *testing.T) {
 	f := newFixture(t, `true`, func(c *Config) { c.Program = "/nonexistent/pdftotext" })
-	if got := f.r.Extract(context.Background(), f.put(t, pdfBytes)); got.Status != StatusFailed {
+	if got := f.r.Extract(context.Background(), f.put(t, pdfBytes)); got.Status != StatusUnavailable {
 		t.Fatalf("got %+v", got)
+	}
+}
+
+func TestKillNotCausedByTheHelperIsUnavailable(t *testing.T) {
+	f := newFixture(t, `kill -9 $$`, nil)
+	if got := f.r.Extract(context.Background(), f.put(t, pdfBytes)); got.Status != StatusUnavailable {
+		t.Fatalf("got %+v", got)
+	}
+}
+
+func TestSelfTestGatesEveryRequest(t *testing.T) {
+	// A fake that prints the marker passes; one that fails does not, and then
+	// every request, valid file or not, is answered unavailable.
+	good := newFixture(t, `echo `+selfTestMarker, func(c *Config) { c.ScratchDir = t.TempDir() })
+	if !good.r.SelfTest(context.Background()) {
+		t.Fatal("self-test should pass")
+	}
+	if got := good.r.Extract(context.Background(), good.put(t, pdfBytes)); got.Status != StatusOK {
+		t.Fatalf("after a passing self-test: %+v", got)
+	}
+	bad := newFixture(t, `echo something else`, func(c *Config) { c.ScratchDir = t.TempDir() })
+	if bad.r.SelfTest(context.Background()) {
+		t.Fatal("self-test should fail")
+	}
+	if got := bad.r.Extract(context.Background(), bad.put(t, pdfBytes)); got.Status != StatusUnavailable {
+		t.Fatalf("after a failed self-test: %+v", got)
+	}
+	// The embedded document itself is a PDF the helper accepts.
+	if b := selfTestPDF(); !strings.HasPrefix(string(b), "%PDF-") || !strings.Contains(string(b), selfTestMarker) {
+		t.Fatal("bad self-test document")
 	}
 }
 

@@ -294,29 +294,51 @@ func TestPDFTextRepeatedTransportFailureIsRecordedAsFailedAndPassContinues(t *te
 	}
 }
 
-func TestPDFTextPendingRowFromACrashIsRecordedAsFailed(t *testing.T) {
+func TestPDFTextPendingRowFromARestartIsOneStrikeNotAVerdict(t *testing.T) {
 	c := openCache(t)
 	ctx := tctx(t)
 	x := &fakeX{c: c}
 	c.SetPDFExtractor(x)
-	addPDFMessage(t, c, "m1", pdfDoc("MARK-Crashy"))
+	addPDFMessage(t, c, "m1", pdfDoc("MARK-Restarted"))
 	var sha string
 	_ = c.db.QueryRow(`SELECT sha256 FROM attachments WHERE mime = 'application/pdf'`).Scan(&sha)
-	// A previous process died after marking the file and before finishing.
+	// (c) A drain or restart stopped the process between "pending" and the
+	// final write. The good file must still be extracted and indexed.
 	if err := c.markPDFPending(ctx, sha); err != nil {
 		t.Fatal(err)
 	}
 	if err := c.RunPDFTextOnce(ctx, nil); err != nil {
 		t.Fatal(err)
 	}
-	if x.n() != 0 {
-		t.Fatal("a file that crashed the process was tried again")
+	if st, _ := c.PDFTextStatus(ctx); st.Outcomes["ok"] != 1 || st.Outcomes["failed"] != 0 || !st.Complete {
+		t.Fatalf("a good file was lost to a stale pending row: %+v", st)
 	}
-	if st, _ := c.PDFTextStatus(ctx); st.Outcomes["failed"] != 1 || !st.Complete || st.Outcomes["pending"] != 0 {
+	if ids, _ := searchIDs(t, c, "Restarted"); len(ids) != 1 {
+		t.Fatalf("not indexed: %v", ids)
+	}
+
+	// Only the third strike makes a file failed, with no further extraction.
+	addPDFMessage(t, c, "m2", pdfDoc("MARK-Crashy"))
+	var sha2 string
+	_ = c.db.QueryRow(`SELECT sha256 FROM attachments WHERE stable_id = 'm2' AND mime = 'application/pdf'`).Scan(&sha2)
+	if err := c.markPDFPending(ctx, sha2); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.db.Exec(`UPDATE pdf_text SET strikes = ? WHERE sha256 = ?`, pdfMaxAttempts-1, sha2); err != nil {
+		t.Fatal(err)
+	}
+	before := x.n()
+	if err := c.RunPDFTextOnce(ctx, nil); err != nil {
+		t.Fatal(err)
+	}
+	if x.n() != before {
+		t.Fatal("a file with three strikes was extracted again")
+	}
+	if st, _ := c.PDFTextStatus(ctx); st.Outcomes["failed"] != 1 || st.Outcomes["pending"] != 0 || !st.Complete {
 		t.Fatalf("%+v", st)
 	}
 	// An error return leaves no pending row behind.
-	addPDFMessage(t, c, "m2", pdfDoc("MARK-Err"))
+	addPDFMessage(t, c, "m3", pdfDoc("MARK-Err"))
 	x.failN = map[string]int{"MARK-Err": 1}
 	if err := c.RunPDFTextOnce(ctx, nil); err == nil {
 		t.Fatal("want error")
@@ -325,6 +347,59 @@ func TestPDFTextPendingRowFromACrashIsRecordedAsFailed(t *testing.T) {
 	_ = c.db.QueryRow(`SELECT COUNT(*) FROM pdf_text WHERE status = 'pending'`).Scan(&n)
 	if n != 0 {
 		t.Fatalf("pending rows left after a transport error: %d", n)
+	}
+}
+
+func TestPDFTextBusyOnTheFinalWriteDoesNotDiscardTheExtraction(t *testing.T) {
+	c := openCache(t)
+	ctx := tctx(t)
+	x := &fakeX{c: c}
+	c.SetPDFExtractor(x)
+	addPDFMessage(t, c, "m1", pdfDoc("MARK-Busy"))
+	tries := 0
+	pdfStoreHook = func() error {
+		tries++
+		if tries == 1 {
+			return errors.New("database is locked (SQLITE_BUSY)")
+		}
+		return nil
+	}
+	defer func() { pdfStoreHook = nil }()
+	if err := c.RunPDFTextOnce(ctx, nil); err != nil {
+		t.Fatal(err)
+	}
+	if tries < 2 {
+		t.Fatal("the write was not retried")
+	}
+	if x.n() != 1 {
+		t.Fatalf("extractor called %d times: BUSY must retry the write, not the extraction", x.n())
+	}
+	if st, _ := c.PDFTextStatus(ctx); st.Outcomes["ok"] != 1 || st.Outcomes["failed"] != 0 {
+		t.Fatalf("%+v", st)
+	}
+	if ids, _ := searchIDs(t, c, "Busy"); len(ids) != 1 {
+		t.Fatalf("not indexed: %v", ids)
+	}
+}
+
+func TestPDFTextStageWriteErrorIsNotAFileOutcome(t *testing.T) {
+	c := openCache(t)
+	ctx := tctx(t)
+	x := &fakeX{c: c}
+	c.SetPDFExtractor(x)
+	// A stage root that is a file: creating directories under it fails, as a
+	// full or broken emptyDir would.
+	root := t.TempDir() + "/file"
+	_ = os.WriteFile(root, []byte("x"), 0o600)
+	c.SetPDFStageDir(root)
+	addPDFMessage(t, c, "m1", pdfDoc("MARK-Stage"))
+	for i := 0; i < pdfMaxAttempts+2; i++ {
+		if err := c.RunPDFTextOnce(ctx, nil); !errors.Is(err, ErrPDFUnavailable) {
+			t.Fatalf("pass %d: want a retryable error, got %v", i, err)
+		}
+	}
+	if st, _ := c.PDFTextStatus(ctx); st.Outcomes["failed"] != 0 || st.Done != 0 {
+		t.Fatalf("a stage write error became the file's verdict: %+v", st)
 	}
 }
 

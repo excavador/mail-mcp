@@ -153,11 +153,19 @@ What this design assumes and does about it:
   not answering, or answering garbage) it stops calling for a minute and then
   probes. A `failed` or `timeout` answer describes one file and does not count.
   A file that fails at the transport three times, across passes, is recorded as
-  `failed`, and a file that was being processed when the process died is
-  recorded as `failed` on the next start, so no file can loop. Errors have
+  `failed`. A file that was being processed when the process stopped is found
+  again as one strike, and is recorded as `failed` only at the third, so no file
+  can loop and a restart does not condemn a good file. A broken sidecar is told
+  apart from a bad file: the helper runs a self-test on a tiny embedded PDF at
+  start and answers `unavailable` to every request while it fails, and also for
+  an exec or limit failure or a kill it did not send (the OOM killer); the client
+  counts `unavailable` toward the breaker and never records it as a file's
+  outcome. A full or broken staging directory is likewise a retryable error, not
+  a verdict. Errors have
   fixed texts and never echo input. mail-mcp streams the message blob and the
   attachment (never holding either whole), so a large PDF does not threaten
-  the main container's memory limit.
+  the main container's memory limit; the attachment copy is bounded at 25 MB and
+  checked against its recorded hash.
 
 What it does not protect against: a bug in poppler that gives code execution
 inside the sidecar. The container limits are there for that case; the sidecar

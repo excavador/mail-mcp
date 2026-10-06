@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
@@ -36,12 +37,18 @@ type Config struct {
 	ASBytes  uint64
 	MaxIn    int64
 	MaxOut   int
+	// ScratchDir is a writable directory for the start-up self-test file.
+	ScratchDir string
 }
 
 // Runner extracts text from blobs.
 type Runner struct {
 	c   Config
 	sem chan struct{}
+
+	mu       sync.Mutex
+	broken   bool      // the last self-test failed
+	testedAt time.Time // when it ran
 }
 
 // NewRunner fills defaults and returns a Runner that serves at most
@@ -93,6 +100,9 @@ func (r *Runner) Extract(ctx context.Context, hash string) Response {
 	if !ok {
 		return Response{Status: StatusFailed}
 	}
+	if r.isBroken() {
+		return Response{Status: StatusUnavailable}
+	}
 	select {
 	case r.sem <- struct{}{}:
 		defer func() { <-r.sem }()
@@ -135,10 +145,10 @@ func (r *Runner) run(ctx context.Context, path string) Response {
 	cmd.Stderr = nil
 	out, err := cmd.StdoutPipe()
 	if err != nil {
-		return Response{Status: StatusFailed}
+		return Response{Status: StatusUnavailable}
 	}
 	if err := cmd.Start(); err != nil {
-		return Response{Status: StatusFailed}
+		return Response{Status: StatusUnavailable}
 	}
 	pgid := cmd.Process.Pid
 	// kill never signals a reaped child: after Wait the group id could be
@@ -189,8 +199,18 @@ func (r *Runner) run(ctx context.Context, path string) Response {
 	if !truncated && (rerr != nil || werr != nil) {
 		var ee *exec.ExitError
 		if errors.As(werr, &ee) {
-			if ws, ok := ee.Sys().(syscall.WaitStatus); ok && ws.Signaled() && ws.Signal() == syscall.SIGXCPU {
-				return Response{Status: StatusTimeout}
+			if ws, ok := ee.Sys().(syscall.WaitStatus); ok {
+				switch {
+				case ws.Signaled() && ws.Signal() == syscall.SIGXCPU:
+					return Response{Status: StatusTimeout}
+				case ws.Signaled() && ws.Signal() == syscall.SIGKILL:
+					// Not sent by this helper (that case returned above): the
+					// kernel's OOM killer, or an operator.
+					return Response{Status: StatusUnavailable}
+				case ws.Exited() && (ws.ExitStatus() == ExitLimitFailed || ws.ExitStatus() == 127):
+					// The limit-and-exec stage could not set limits or exec.
+					return Response{Status: StatusUnavailable}
+				}
 			}
 		}
 		return Response{Status: StatusFailed}
@@ -216,4 +236,78 @@ func clean(b []byte, cut bool) (string, int) {
 		}
 	}
 	return strings.ToValidUTF8(string(b), ""), pages
+}
+
+// selfTestMarker is the text of the embedded self-test document.
+const selfTestMarker = "pdftext-selftest-ok"
+
+// selfTestPDF is a one-page PDF with a valid xref table, built at start-up.
+func selfTestPDF() []byte {
+	var b strings.Builder
+	var offs []int
+	obj := func(s string) {
+		offs = append(offs, b.Len())
+		b.WriteString(strconv.Itoa(len(offs)) + " 0 obj\n" + s + "\nendobj\n")
+	}
+	b.WriteString("%PDF-1.4\n")
+	obj("<< /Type /Catalog /Pages 2 0 R >>")
+	obj("<< /Type /Pages /Kids [3 0 R] /Count 1 >>")
+	obj("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 100] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>")
+	content := "BT /F1 12 Tf 20 50 Td (" + selfTestMarker + ") Tj ET"
+	obj("<< /Length " + strconv.Itoa(len(content)) + " >>\nstream\n" + content + "\nendstream")
+	obj("<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>")
+	x := b.Len()
+	b.WriteString("xref\n0 " + strconv.Itoa(len(offs)+1) + "\n0000000000 65535 f \n")
+	for _, o := range offs {
+		b.WriteString(fmt.Sprintf("%010d 00000 n \n", o))
+	}
+	b.WriteString("trailer\n<< /Size " + strconv.Itoa(len(offs)+1) + " /Root 1 0 R >>\nstartxref\n" + strconv.Itoa(x) + "\n%%EOF\n")
+	return []byte(b.String())
+}
+
+// SelfTest runs the extractor, under the real limits, on a tiny embedded PDF.
+// It records the result: while the last self-test failed every request is
+// answered "unavailable" instead of marking each file failed. It returns the
+// result. A failed helper retests itself, at most every 30 s, when a request
+// arrives.
+func (r *Runner) SelfTest(ctx context.Context) bool {
+	ok := r.selfTest(ctx)
+	r.mu.Lock()
+	r.broken, r.testedAt = !ok, time.Now()
+	r.mu.Unlock()
+	return ok
+}
+
+func (r *Runner) selfTest(ctx context.Context) bool {
+	dir := r.c.ScratchDir
+	if dir == "" {
+		dir = os.TempDir()
+	}
+	f, err := os.CreateTemp(dir, ".selftest-*.pdf")
+	if err != nil {
+		return false
+	}
+	name := f.Name()
+	defer os.Remove(name)
+	_, werr := f.Write(selfTestPDF())
+	if cerr := f.Close(); werr != nil || cerr != nil {
+		return false
+	}
+	r.sem <- struct{}{}
+	defer func() { <-r.sem }()
+	resp := r.run(ctx, name)
+	return resp.Status == StatusOK && strings.Contains(resp.Text, selfTestMarker)
+}
+
+func (r *Runner) isBroken() bool {
+	r.mu.Lock()
+	broken, at := r.broken, r.testedAt
+	r.mu.Unlock()
+	if !broken {
+		return false
+	}
+	if time.Since(at) < 30*time.Second {
+		return true
+	}
+	return !r.SelfTest(context.Background())
 }

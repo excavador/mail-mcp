@@ -199,3 +199,17 @@ func TestPoolOfTwo(t *testing.T) {
 		t.Fatalf("max concurrent calls = %d, want %d", m, workers)
 	}
 }
+
+func TestUnavailableCountsForTheBreakerAndIsNeverAnOutcome(t *testing.T) {
+	sock, _ := fakeSidecar(t, func(string) *response { return &response{Status: "unavailable"} })
+	c := New(sock)
+	for i := 0; i < 5; i++ {
+		r, err := c.Extract(context.Background(), h1)
+		if !errors.Is(err, cache.ErrPDFUnavailable) || r.Status != "" {
+			t.Fatalf("call %d: %+v %v", i, r, err)
+		}
+	}
+	if !c.Open() {
+		t.Fatal("five unavailable answers must open the breaker")
+	}
+}

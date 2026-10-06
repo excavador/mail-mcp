@@ -377,7 +377,10 @@ CREATE TABLE IF NOT EXISTS pdf_text (
 	text         TEXT    NOT NULL DEFAULT '',
 	truncated    INTEGER NOT NULL DEFAULT 0,
 	pages_capped INTEGER NOT NULL DEFAULT 0,
-	updated_at   INTEGER NOT NULL DEFAULT 0
+	updated_at   INTEGER NOT NULL DEFAULT 0,
+	-- strikes: how many times a provisional (status pending) row was found
+	-- again after the process died mid-file; the third makes the file failed.
+	strikes      INTEGER NOT NULL DEFAULT 0
 ) WITHOUT ROWID;
 `
 

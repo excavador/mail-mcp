@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 
 	"github.com/excavador/mail-mcp/internal/pdftext"
@@ -25,7 +26,7 @@ func main() {
 	flag.Parse()
 
 	log := slog.New(slog.NewJSONHandler(os.Stderr, nil))
-	r, err := pdftext.NewRunner(pdftext.Config{Root: *root, Program: *prog})
+	r, err := pdftext.NewRunner(pdftext.Config{Root: *root, Program: *prog, ScratchDir: filepath.Dir(*socket)})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "pdftext:", err)
 		os.Exit(1)
@@ -38,6 +39,13 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	go func() { <-ctx.Done(); _ = ln.Close() }()
+	// A helper that cannot extract anything (poppler missing, limits too tight
+	// for it) says so, to every request, instead of marking each file failed.
+	if r.SelfTest(ctx) {
+		log.Info("pdftext self-test passed")
+	} else {
+		log.Error("pdftext self-test FAILED: answering every request as unavailable until it passes")
+	}
 	log.Info("pdftext listening", "socket", *socket, "root", *root)
 	if err := pdftext.Serve(ln, r, log); err != nil {
 		fmt.Fprintln(os.Stderr, "pdftext:", err)

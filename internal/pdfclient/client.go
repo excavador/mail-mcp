@@ -127,6 +127,12 @@ func (c *Client) Extract(ctx context.Context, sha string) (cache.PDFResult, erro
 		return cache.PDFResult{}, ErrCall
 	}
 	switch resp.Status {
+	case "unavailable":
+		// The helper itself is sick (no poppler, limits too tight, a failed
+		// self-test, an OOM kill): the breaker counts it, and it is never a
+		// file's outcome.
+		c.record(true)
+		return cache.PDFResult{}, ErrOpen
 	case "ok", "too_large", "not_pdf", "timeout", "failed":
 		// Every status is the sidecar answering. timeout and failed are about
 		// the file, not the sidecar's health.

@@ -18,6 +18,10 @@ import (
 // and execs the real program, which therefore begins life already limited.
 const ChildMode = "__limit-exec"
 
+// ExitLimitFailed is the exit status of the limit stage when it could not set
+// a limit or exec the program: a fault of the helper's setup, not of any file.
+const ExitLimitFailed = 125
+
 // RunChild implements ChildMode. args is os.Args[2:]. It only returns on
 // error: on success the process image is replaced.
 func RunChild(args []string) error {
@@ -49,6 +53,6 @@ func RunChild(args []string) error {
 func ExitChild(args []string) {
 	if err := RunChild(args); err != nil {
 		fmt.Fprintln(os.Stderr, "pdftext: limit-exec failed")
-		os.Exit(125)
+		os.Exit(ExitLimitFailed)
 	}
 }

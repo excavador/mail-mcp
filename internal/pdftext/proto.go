@@ -16,6 +16,11 @@ const (
 	StatusTooLarge = "too_large"
 	StatusFailed   = "failed"
 	StatusNotPDF   = "not_pdf"
+	// StatusUnavailable: the helper cannot do its job at all (pdftotext
+	// missing or not startable, limits that cannot be applied, a failed
+	// start-up self-test, a kill the file did not cause). It is about the
+	// helper, never about the file: clients must not record it as an outcome.
+	StatusUnavailable = "unavailable"
 )
 
 // Limits. They are constants, not flags: the point is that a deployment

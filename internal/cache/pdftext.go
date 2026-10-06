@@ -70,9 +70,6 @@ const (
 	// maxPDFInput is the largest attachment sent for extraction; the sidecar
 	// enforces the same bound, this one saves writing the file.
 	maxPDFInput = 25 << 20
-	// maxPDFBlob is the largest message blob opened to find an attachment
-	// (25 MiB in base64 is about 34 MiB). The blob is streamed, not read whole.
-	maxPDFBlob = 36 << 20
 	// maxPDFStored caps the text kept per file, in pdf_text and in the index:
 	// the same bound as indexed body text.
 	maxPDFStored = maxIndexedText
@@ -232,12 +229,7 @@ func (c *Cache) pdfPass(ctx context.Context, log *slog.Logger) (pdfStats, error)
 				return st, ctx.Err()
 			}
 			st.Seen++
-			var held time.Duration
-			err := c.retryBusy(ctx, log, "pdf_text", func() error {
-				var err error
-				held, err = c.pdfOne(ctx, x, a, &st)
-				return err
-			})
+			held, err := c.pdfOne(ctx, log, x, a, &st)
 			if err != nil {
 				return st, err
 			}
@@ -274,22 +266,36 @@ ORDER BY rowid LIMIT ?`, after, pdfBatch)
 // Transport failures are counted per file across passes (c.pdfAttempts); the
 // third records the file as failed, so a file that kills the sidecar cannot
 // block the files behind it. ErrPDFUnavailable is not the file's fault and is
-// not counted. A "pending" row, written before the risky steps, that is found
-// again means the process died mid-file: the file is recorded as failed.
-func (c *Cache) pdfOne(ctx context.Context, x PDFExtractor, a pdfAtt, st *pdfStats) (time.Duration, error) {
-	res, cached, err := c.cachedPDF(ctx, a.sha)
+// not counted. A "pending" row is written before the risky steps; finding one
+// again means the process stopped mid-file (a crash, or a restart), which is
+// one strike, and the file becomes failed only at the third. Only the final
+// write is retried on SQLITE_BUSY, never the extraction.
+func (c *Cache) pdfOne(ctx context.Context, log *slog.Logger, x PDFExtractor, a pdfAtt, st *pdfStats) (time.Duration, error) {
+	res, strikes, cached, err := c.cachedPDF(ctx, a.sha)
 	if err != nil {
 		return 0, err
 	}
 	record := !cached
-	switch {
-	case cached && res.Status == pdfPending:
-		res, record = PDFResult{Status: "failed"}, true
-		st.Failed++
-	case cached:
+	if cached && res.Status == pdfPending {
+		strikes++
+		if strikes >= pdfMaxAttempts {
+			res, record = PDFResult{Status: "failed"}, true
+			st.Failed++
+			c.clearAttempts(a.sha)
+			return c.storeRetry(ctx, log, a.sha, res, record)
+		}
+		if err := c.retryBusy(ctx, log, "pdf_text", func() error {
+			_, e := c.db.ExecContext(ctx, `UPDATE pdf_text SET strikes = ? WHERE sha256 = ? AND status = ?`, strikes, a.sha, pdfPending)
+			return e
+		}); err != nil {
+			return 0, err
+		}
+		cached, record = false, true
+	}
+	if cached {
 		st.Cached++
-	default:
-		res, err = c.extractPDF(ctx, x, a)
+	} else {
+		res, err = c.extractPDF(ctx, log, x, a)
 		if err != nil {
 			if errors.Is(err, ErrPDFUnavailable) || ctx.Err() != nil {
 				return 0, err
@@ -306,7 +312,22 @@ func (c *Cache) pdfOne(ctx context.Context, x PDFExtractor, a pdfAtt, st *pdfSta
 		}
 	}
 	c.clearAttempts(a.sha)
-	return c.storePDF(ctx, a.sha, res, record)
+	held, err := c.storeRetry(ctx, log, a.sha, res, record)
+	if err != nil {
+		// The extraction is not lost for good: drop the provisional row so the
+		// next pass starts clean instead of counting a strike.
+		c.dropPDFPending(log, a.sha)
+	}
+	return held, err
+}
+
+func (c *Cache) storeRetry(ctx context.Context, log *slog.Logger, sha string, res PDFResult, record bool) (held time.Duration, err error) {
+	err = c.retryBusy(ctx, log, "pdf_text", func() error {
+		var e error
+		held, e = c.storePDF(ctx, sha, res, record)
+		return e
+	})
+	return held, err
 }
 
 func (c *Cache) noteAttempt(sha string) int {
@@ -326,20 +347,17 @@ func (c *Cache) clearAttempts(sha string) {
 }
 
 // cachedPDF looks the file up by hash.
-func (c *Cache) cachedPDF(ctx context.Context, sha string) (PDFResult, bool, error) {
-	var (
-		r         PDFResult
-		tr, pages int
-	)
-	err := c.db.QueryRowContext(ctx, `SELECT status, text, truncated, pages_capped FROM pdf_text WHERE sha256 = ?`, sha).Scan(&r.Status, &r.Text, &tr, &pages)
+func (c *Cache) cachedPDF(ctx context.Context, sha string) (r PDFResult, strikes int, found bool, err error) {
+	var tr, pages int
+	err = c.db.QueryRowContext(ctx, `SELECT status, text, truncated, pages_capped, strikes FROM pdf_text WHERE sha256 = ?`, sha).Scan(&r.Status, &r.Text, &tr, &pages, &strikes)
 	if errors.Is(err, sql.ErrNoRows) {
-		return r, false, nil
+		return r, 0, false, nil
 	}
 	if err != nil {
-		return r, false, fmt.Errorf("read pdf text: %w", err)
+		return r, 0, false, fmt.Errorf("read pdf text: %w", err)
 	}
 	r.Truncated, r.PagesCapped = tr == 1, pages == 1
-	return r, true, nil
+	return r, strikes, true, nil
 }
 
 // SetPDFStageDir sets the root under which decoded PDFs are staged for the
@@ -379,7 +397,7 @@ func (c *Cache) pdfFile(sha string) string {
 // and the part is copied to the staging file through a hash, never held whole.
 // A provisional "pending" outcome is written before any of that, so a crash
 // (an OOM kill, say) cannot make the same file loop forever.
-func (c *Cache) extractPDF(ctx context.Context, x PDFExtractor, a pdfAtt) (res PDFResult, err error) {
+func (c *Cache) extractPDF(ctx context.Context, log *slog.Logger, x PDFExtractor, a pdfAtt) (res PDFResult, err error) {
 	if a.size > maxPDFInput {
 		return PDFResult{Status: "too_large"}, nil
 	}
@@ -391,26 +409,27 @@ func (c *Cache) extractPDF(ctx context.Context, x PDFExtractor, a pdfAtt) (res P
 	if path == "" {
 		return PDFResult{Status: "failed"}, nil
 	}
-	fi, serr := os.Stat(path)
-	if serr != nil {
+	if _, serr := os.Stat(path); serr != nil {
 		return PDFResult{Status: "failed"}, nil
 	}
-	if fi.Size() > maxPDFBlob {
-		return PDFResult{Status: "too_large"}, nil
-	}
-	if err := c.markPDFPending(ctx, a.sha); err != nil {
+	// No cap on the blob size: it is streamed, and the copy of the part is
+	// bounded by maxPDFInput and checked against the recorded hash.
+	if err := c.retryBusy(ctx, log, "pdf_text", func() error { return c.markPDFPending(ctx, a.sha) }); err != nil {
 		return PDFResult{}, err
 	}
 	defer func() {
-		// Any error return is "try again later", not an outcome.
+		// Any error return (including a shutdown) is "try again later", not
+		// an outcome, and must not leave a row that counts as a strike.
 		if err != nil {
-			c.dropPDFPending(a.sha)
+			c.dropPDFPending(log, a.sha)
 		}
 	}()
 	dst := c.pdfFile(a.sha)
 	status, serr := c.stagePart(path, a, dst)
 	if serr != nil {
-		return PDFResult{}, fmt.Errorf("stage pdf: %w", serr)
+		// Writing the staging file failed (a full or broken emptyDir): the
+		// environment's problem, not the file's. Retryable, and not a strike.
+		return PDFResult{}, fmt.Errorf("stage pdf: %w", errors.Join(ErrPDFUnavailable, serr))
 	}
 	if status != "" {
 		return PDFResult{Status: status}, nil
@@ -427,8 +446,15 @@ func (c *Cache) markPDFPending(ctx context.Context, sha string) error {
 	return nil
 }
 
-func (c *Cache) dropPDFPending(sha string) {
-	_, _ = c.db.Exec(`DELETE FROM pdf_text WHERE sha256 = ? AND status = ?`, sha, pdfPending)
+// dropPDFPending removes the provisional row of sha, retrying on SQLITE_BUSY
+// for a few seconds and on a context of its own, so it still runs at shutdown.
+func (c *Cache) dropPDFPending(log *slog.Logger, sha string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	_ = c.retryBusy(ctx, log, "pdf_text", func() error {
+		_, err := c.db.ExecContext(ctx, `DELETE FROM pdf_text WHERE sha256 = ? AND status = ?`, sha, pdfPending)
+		return err
+	})
 }
 
 // stagePart copies the decoded MIME part a.part of the message blob at path
@@ -466,8 +492,12 @@ func (c *Cache) stagePart(path string, a pdfAtt, dst string) (status string, err
 	name := tmp.Name()
 	fail := func(e error) (string, error) { _ = tmp.Close(); _ = os.Remove(name); return "", e }
 	h := sha256.New()
-	n, cerr := io.Copy(io.MultiWriter(tmp, h), io.LimitReader(leaf.Body, maxPDFInput+1))
-	if cerr != nil {
+	ew := &errWriter{w: io.MultiWriter(tmp, h)}
+	n, cerr := io.Copy(ew, io.LimitReader(leaf.Body, maxPDFInput+1))
+	if ew.err != nil { // the write side: ENOSPC, EIO
+		return fail(ew.err)
+	}
+	if cerr != nil { // the read side: the part does not decode
 		_ = tmp.Close()
 		_ = os.Remove(name)
 		return "failed", nil
@@ -494,6 +524,21 @@ func (c *Cache) stagePart(path string, a pdfAtt, dst string) (status string, err
 		return "", err
 	}
 	return "", nil
+}
+
+// errWriter remembers a write error, so a failure of the destination can be
+// told from a failure to decode the source.
+type errWriter struct {
+	w   io.Writer
+	err error
+}
+
+func (e *errWriter) Write(p []byte) (int, error) {
+	n, err := e.w.Write(p)
+	if err != nil && e.err == nil {
+		e.err = err
+	}
+	return n, err
 }
 
 func findPart(e *message.Entity, path, want string, depth int) *message.Entity {
@@ -525,11 +570,19 @@ func findPart(e *message.Entity, path, want string, depth int) *message.Entity {
 	return nil
 }
 
+// pdfStoreHook, when set (tests), runs at the start of every storePDF try.
+var pdfStoreHook func() error
+
 // storePDF records the outcome for hash sha and marks the attachments that
 // carry it done, indexing the text of an ok result. Writes are short
 // transactions: at most writeRows attachments each. It returns the longest
 // hold.
 func (c *Cache) storePDF(ctx context.Context, sha string, r PDFResult, record bool) (time.Duration, error) {
+	if pdfStoreHook != nil {
+		if err := pdfStoreHook(); err != nil {
+			return 0, err
+		}
+	}
 	text := ""
 	trunc := r.Truncated
 	if r.Status == "ok" {
