@@ -331,7 +331,7 @@ func clientElicits(req *mcp.CallToolRequest) bool {
 // maxUnelicited messages and recorded as "client-tool-approval".
 func approve(ctx context.Context, req *mcp.CallToolRequest, d writeDeps, p *organise.Preview) (by string, pending *mcp.CallToolResult, err error) {
 	if d.approvalMode != ApprovalElicitation || !clientElicits(req) {
-		if limit := d.unelicitedLimit(p.Intent.Action); p.Matched > limit {
+		if limit := d.unelicitedLimit(p.Intent.Action, d.byName[p.Account].Provider); p.Matched > limit {
 			return "", nil, organise.SafeError(fmt.Sprintf(
 				"more than %d messages cannot be applied on the client's tool approval alone (%s)", limit, p.Intent.Action))
 		}
@@ -446,7 +446,12 @@ func elicitMessage(d writeDeps, p *organise.Preview) string {
 
 // unelicitedLimit is how many messages an apply of action may change on the
 // client's own tool approval: label (add only) and its undo get the larger cap.
-func (d writeDeps) unelicitedLimit(action string) int {
+func (d writeDeps) unelicitedLimit(action string, p accounts.Provider) int {
+	if action == organise.ActionUnlabel && p == accounts.Proton {
+		// Proton removes a label by expunge, not yet verified by hand against
+		// Bridge (TODO in organise.unlabel): keep the move cap.
+		return d.maxUnelicited
+	}
 	if action == organise.ActionLabel || action == organise.ActionUnlabel {
 		return d.maxUnelicitedLabel
 	}
@@ -460,7 +465,7 @@ func applyDescription(d writeDeps) string {
 	if d.approvalMode != ApprovalElicitation {
 		desc += fmt.Sprintf(" Approval is the client's own tool-approval prompt, which must show the account, action, "+
 			"source, target and count (restate them in the expect_* fields); above %d messages the apply is refused "+
-			"(for label, and the undo of a label: above %d).", d.maxUnelicited, d.maxUnelicitedLabel)
+			"(for label, and the undo of a Gmail label: above %d).", d.maxUnelicited, d.maxUnelicitedLabel)
 	}
 	return desc
 }

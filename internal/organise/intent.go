@@ -10,7 +10,8 @@
 //
 // There is no delete here and there will not be one: nothing in this package
 // sends DELETE or RENAME, and the one EXPUNGE is the UID EXPUNGE that undoes a
-// label (see unlabel), of exactly the label copies that apply added. The writes
+// label of a Proton Labels/ folder (see unlabel), of exactly the copies apply
+// added; Gmail never expunges. The writes
 // are CREATE, UID MOVE, UID COPY, and that removal.
 package organise
 

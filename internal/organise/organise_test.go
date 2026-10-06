@@ -9,6 +9,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/emersion/go-imap/v2"
+
 	"github.com/excavador/mail-mcp/internal/accounts"
 	"github.com/excavador/mail-mcp/internal/cache"
 )
@@ -606,6 +608,35 @@ func TestValidateTagCriterionAndUnlabelRules(t *testing.T) {
 		err := in(Criterion{Folder: tc.label}, ActionUnlabel, "INBOX").CheckMove(tc.p)
 		if (err == nil) != tc.allowed {
 			t.Errorf("unlabel %s on %s: err = %v, allowed %v", tc.label, tc.p, err, tc.allowed)
+		}
+	}
+}
+
+func TestChooseUnlabelNeverExpungesOnGmailAndOnlyInProtonLabels(t *testing.T) {
+	ext := imap.CapSet{imap.CapGmailExt1: {}}
+	uidplus := imap.CapSet{imap.CapUIDPlus: {}}
+	both := imap.CapSet{imap.CapGmailExt1: {}, imap.CapUIDPlus: {}}
+	for _, tc := range []struct {
+		name  string
+		p     accounts.Provider
+		label string
+		caps  imap.CapSet
+		want  unlabelMode // 0: refused
+	}{
+		{"gmail ext1", accounts.Gmail, "Purchases/Imported", ext, unlabelGmailLabels},
+		{"gmail ext1 and uidplus still labels only", accounts.Gmail, "Purchases/Imported", both, unlabelGmailLabels},
+		{"gmail without ext1 (uidplus present)", accounts.Gmail, "Purchases/Imported", uidplus, 0},
+		{"gmail no caps", accounts.Gmail, "Purchases/Imported", imap.CapSet{}, 0},
+		{"proton labels uidplus", accounts.Proton, "Labels/x", uidplus, unlabelExpunge},
+		{"proton labels no uidplus", accounts.Proton, "Labels/x", imap.CapSet{}, 0},
+		{"proton folder", accounts.Proton, "Folders/x", uidplus, 0},
+		{"proton inbox", accounts.Proton, "INBOX", uidplus, 0},
+		{"proton labels-like prefix", accounts.Proton, "Labelsx/y", uidplus, 0},
+		{"other provider", accounts.Provider("imap"), "Labels/x", both, 0},
+	} {
+		got, err := chooseUnlabel(tc.p, tc.label, tc.caps)
+		if got != tc.want || (tc.want == 0) != (err != nil) {
+			t.Errorf("%s: mode %d, err %v; want mode %d", tc.name, got, err, tc.want)
 		}
 	}
 }

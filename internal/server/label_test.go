@@ -2,12 +2,19 @@ package server
 
 import (
 	"context"
+	"fmt"
+	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/excavador/mail-mcp/internal/accounts"
+	"github.com/excavador/mail-mcp/internal/cache"
 	"github.com/excavador/mail-mcp/internal/history"
+	"github.com/excavador/mail-mcp/internal/imapx"
+	"github.com/excavador/mail-mcp/internal/organise"
 )
 
 // stableIDs returns the stable ids of the messages of acct with these subjects.
@@ -112,16 +119,15 @@ func TestLabelCapIsAThousandAndMoveStaysAtFifty(t *testing.T) {
 		t.Fatalf("undo preview = %+v", u)
 	}
 	requireToolError(t, cs5, "apply_intent", applyArgs(u), "more than 59 messages")
-	if a := apply(t, cs60, u); a.Done != 60 {
-		t.Errorf("undo apply = %+v", a)
-	}
+	// (Applying it needs the Gmail extension the in-memory server lacks; the
+	// undo itself is covered against the scripted server.)
 }
 
 func TestApplyDescriptionStatesBothCaps(t *testing.T) {
 	e := basic(t, true)
 	cs := e.admin()
 	d := toolNames(t, cs)["apply_intent"].Description
-	for _, want := range []string{"above 50 messages", "for label, and the undo of a label: above 1000"} {
+	for _, want := range []string{"above 50 messages", "for label, and the undo of a Gmail label: above 1000"} {
 		if !strings.Contains(d, want) {
 			t.Errorf("apply_intent description lacks %q: %s", want, d)
 		}
@@ -196,17 +202,6 @@ func labelUndoRoundTrip(t *testing.T, e *wenv, label string) {
 	requireToolError(t, cs, "undo", map[string]any{"history_id": ua.HistoryID}, "only an applied intent")
 }
 
-func TestGmailLabelUndoRemovesOnlyTheLabelsTheIntentAdded(t *testing.T) {
-	e := newWEnv(t, true, gmailPair, "INBOX", "Purchases/Imported", "[Gmail]/All Mail")
-	for _, id := range []string{"x1", "x2", "x3"} {
-		e.add("INBOX", id, alice, id)
-	}
-	e.add("Purchases/Imported", "x2", alice, "x2")
-	e.refresh("acct")
-	e.log.reset()
-	labelUndoRoundTrip(t, e, "Purchases/Imported")
-}
-
 func TestProtonLabelUndoRemovesOnlyTheCopiesTheIntentAdded(t *testing.T) {
 	e := newWEnv(t, true, []wspec{{"acct", accounts.Proton}}, "INBOX", "Labels/Purchases")
 	for _, id := range []string{"x1", "x2", "x3"} {
@@ -233,4 +228,147 @@ func TestLabelUndoRefusals(t *testing.T) {
 	b := apply(t, cs, preview(t, cs, "acct", "INBOX", map[string]any{"from": "alice@example.com", "subject_contains": "x2"}, "Work", "label"))
 	e.removeBySubject("Work", "x2")
 	requireToolError(t, cs, "undo", map[string]any{"history_id": b.HistoryID}, "none of those messages carry the label")
+}
+
+// ---- label undo against the scripted server (Gmail extensions, failures) ----
+
+type undoFake struct {
+	f     *gmailFake
+	org   *organise.Organiser
+	a     accounts.Account
+	label string
+	ids   []string // stable ids of the two messages in the label folder
+}
+
+// newUndoFake serves INBOX and a label folder that both hold the same two
+// messages, refreshes a cache from it and returns what is needed to preview
+// and apply the undo of a label by hand.
+func newUndoFake(t *testing.T, p accounts.Provider, caps, label string, failExpunge bool) *undoFake {
+	t.Helper()
+	m1, m2 := gfMailAt("one", "alpha", t0), gfMailAt("two", "beta", t0.Add(time.Hour))
+	f := startGmailFake(t, gfConfig{Caps: caps, FailExpunge: failExpunge, Folders: []gfFolder{
+		{Name: "INBOX", Validity: 1, Msgs: []gfMsg{{UID: 3, MsgID: 111, Raw: m1, Date: t0}, {UID: 4, MsgID: 222, Raw: m2, Date: t0.Add(time.Hour)}}},
+		{Name: label, Validity: 3, Msgs: []gfMsg{{UID: 10, MsgID: 111, Raw: m1, Date: t0}, {UID: 11, MsgID: 222, Raw: m2, Date: t0.Add(time.Hour)}}},
+	}})
+	dir := t.TempDir()
+	a := f.account(t, dir, fmt.Sprintf("undo%d", gmSeq.Add(1)), p)
+	st, err := cache.Open(filepath.Join(dir, "cache"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	c, err := imapx.Dial(ctx, a)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.Refresh(ctx, a, c); err != nil {
+		t.Fatalf("Refresh: %v", err)
+	}
+	_ = c.Close()
+	ms, err := st.ResolveMembers(ctx, a.Name, cache.MemberQuery{Folder: label, From: "alice@example.com"}, 10)
+	if err != nil || len(ms) != 2 {
+		t.Fatalf("label members = %v, %v", ms, err)
+	}
+	org, err := organise.New(st)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return &undoFake{f: f, org: org, a: a, label: label, ids: []string{ms[0].StableID, ms[1].StableID}}
+}
+
+// undo previews and applies the undo of a label from target; the verbs the
+// server saw during the apply are returned with the apply's error.
+func (u *undoFake) undo(t *testing.T, target string) (raw string, out organise.Outcome, previewErr, applyErr error) {
+	t.Helper()
+	in := organise.Intent{Criterion: organise.Criterion{Folder: u.label}, Target: target, Action: organise.ActionUnlabel}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	p, err := u.org.PreviewIDs(ctx, u.a, in, u.ids, nil, 0, "rec")
+	if err != nil {
+		return "", organise.Outcome{}, err, nil
+	}
+	off := len(u.f.log.raw())
+	out, err = u.org.Apply(ctx, u.a, p)
+	return u.f.log.raw()[off:], out, nil, err
+}
+
+func TestGmailLabelUndoUsesStoreXGMLabelsAndNeverExpunges(t *testing.T) {
+	u := newUndoFake(t, accounts.Gmail, gfCapsExt, "Purchases/Imported", false)
+	raw, out, perr, aerr := u.undo(t, "INBOX")
+	if perr != nil || aerr != nil {
+		t.Fatalf("preview %v, apply %v", perr, aerr)
+	}
+	if len(out.Touched) != 2 {
+		t.Errorf("touched %d, want 2", len(out.Touched))
+	}
+	if !regexp.MustCompile(`UID STORE \S+ -X-GM-LABELS\.SILENT \(\"?Purchases/Imported\"?\)`).MatchString(raw) {
+		t.Errorf("no STORE -X-GM-LABELS for the label; log: %q", raw)
+	}
+	if strings.Contains(raw, "EXPUNGE") || strings.Contains(raw, `\Deleted`) {
+		t.Errorf("Gmail undo sent an expunge or \\Deleted: %q", raw)
+	}
+}
+
+func TestGmailWithoutTheExtensionRefusesLabelUndoAndSendsNoWrite(t *testing.T) {
+	u := newUndoFake(t, accounts.Gmail, gfCapsPlain, "Purchases/Imported", false)
+	raw, out, perr, aerr := u.undo(t, "INBOX")
+	if perr != nil {
+		t.Fatal(perr)
+	}
+	if aerr == nil || !strings.Contains(aerr.Error(), "Gmail IMAP extension") {
+		t.Fatalf("apply err = %v, want the extension refusal", aerr)
+	}
+	if len(out.Touched) != 0 || strings.Contains(raw, "STORE") || strings.Contains(raw, "EXPUNGE") {
+		t.Errorf("touched %d; log: %q", len(out.Touched), raw)
+	}
+}
+
+func TestProtonUnlabelOutsideLabelsNeverExpunges(t *testing.T) {
+	u := newUndoFake(t, accounts.Proton, gfCapsPlain, "Folders/x", false)
+	raw, _, perr, aerr := u.undo(t, "INBOX")
+	if perr == nil && aerr == nil {
+		t.Fatal("unlabel of a non-Labels/ folder succeeded")
+	}
+	if strings.Contains(raw, "STORE") || strings.Contains(raw, "EXPUNGE") {
+		t.Errorf("log: %q", raw)
+	}
+}
+
+func TestProtonLabelUndoClearsTheFlagWhenTheExpungeFails(t *testing.T) {
+	u := newUndoFake(t, accounts.Proton, gfCapsPlain, "Labels/Purchases", true)
+	raw, out, perr, aerr := u.undo(t, "INBOX")
+	if perr != nil {
+		t.Fatal(perr)
+	}
+	if aerr == nil {
+		t.Fatal("apply succeeded although the expunge failed")
+	}
+	add := strings.Index(raw, `+FLAGS.SILENT (\Deleted)`)
+	exp := strings.Index(raw, "UID EXPUNGE")
+	del := strings.Index(raw, `-FLAGS.SILENT (\Deleted)`)
+	if add < 0 || exp < add || del < exp {
+		t.Errorf("want +FLAGS \\Deleted, UID EXPUNGE, then -FLAGS \\Deleted; log: %q", raw)
+	}
+	if len(out.Touched) != 0 {
+		t.Errorf("touched %d after a failed expunge, want 0", len(out.Touched))
+	}
+}
+
+func TestUnelicitedLimitForUnlabelDependsOnProvider(t *testing.T) {
+	d := writeDeps{maxUnelicited: 50, maxUnelicitedLabel: 1000}
+	for _, tc := range []struct {
+		action string
+		p      accounts.Provider
+		want   int
+	}{
+		{organise.ActionMove, accounts.Gmail, 50}, {organise.ActionLabel, accounts.Gmail, 1000},
+		{organise.ActionLabel, accounts.Proton, 1000}, {organise.ActionUnlabel, accounts.Gmail, 1000},
+		{organise.ActionUnlabel, accounts.Proton, 50},
+	} {
+		if got := d.unelicitedLimit(tc.action, tc.p); got != tc.want {
+			t.Errorf("%s on %s: %d, want %d", tc.action, tc.p, got, tc.want)
+		}
+	}
 }

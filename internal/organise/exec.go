@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 	"time"
 
@@ -310,6 +311,11 @@ func (o *Organiser) Apply(ctx context.Context, a accounts.Account, p *Preview) (
 		if in.Action == ActionLabel {
 			// Which of these messages already carry the label, as the server
 			// has it now: undo must never remove what was there before.
+			// Narrow race, accepted: a label added by someone else between this
+			// re-read and the COPY just below is counted as ours, and undo would
+			// remove it. Undo also cannot tell a user who removed the label and
+			// added it back after the apply from one who never touched it: both
+			// look like "ours, still present". The window is one round trip.
 			imapx.SetPhase(ctx, "refresh_target")
 			if _, err := o.store.RefreshFolders(ctx, c, a, []string{in.Target}); err != nil {
 				return err
@@ -434,18 +440,56 @@ func (o *Organiser) Apply(ctx context.Context, a accounts.Account, p *Preview) (
 	return out, nil
 }
 
+// unlabelMode is how a label is removed.
+type unlabelMode int
+
+const (
+	unlabelGmailLabels unlabelMode = iota + 1 // STORE -X-GM-LABELS
+	unlabelExpunge                            // \Deleted + UID EXPUNGE in a Proton Labels/ folder
+)
+
+// chooseUnlabel is the whole policy for removing a label, kept pure so it is
+// tested on its own and re-asserted inside unlabel (defence in depth: it does
+// not rely on CheckMove having run).
+//
+//   - Gmail needs X-GM-EXT-1 and uses STORE -X-GM-LABELS only. It NEVER
+//     expunges: depending on the account's IMAP deletion settings an expunge
+//     could send a message to the Trash.
+//   - Proton expunges, and only from a Labels/... folder, and only with
+//     UIDPLUS (so UID EXPUNGE names exactly our UIDs; a plain EXPUNGE could
+//     take other messages flagged \Deleted in the folder).
+//   - Any other provider is refused.
+func chooseUnlabel(p accounts.Provider, label string, caps imap.CapSet) (unlabelMode, error) {
+	switch p {
+	case accounts.Gmail:
+		if !caps.Has(imap.CapGmailExt1) {
+			return 0, SafeError("label undo needs the Gmail IMAP extension (X-GM-EXT-1), which this server did not advertise")
+		}
+		return unlabelGmailLabels, nil
+	case accounts.Proton:
+		if !strings.HasPrefix(label, "Labels/") {
+			return 0, SafeError("on Proton only a Labels/... label can be removed")
+		}
+		if !caps.Has(imap.CapUIDPlus) {
+			return 0, SafeError("the server does not advertise UIDPLUS; refusing to remove a label by expunge")
+		}
+		return unlabelExpunge, nil
+	}
+	return 0, SafeError("label removal is not supported for this provider")
+}
+
 // unlabel removes label from the messages ms, which sit in it (the folder is
-// SELECTed). Gmail, with X-GM-EXT-1: STORE -X-GM-LABELS, which changes the one
-// label and nothing else (no EXPUNGE, so a message never reaches the Trash
-// whatever the account's IMAP deletion settings). Otherwise (Proton Bridge, a
-// label is a folder holding a copy): mark those UIDs \Deleted and UID EXPUNGE
-// exactly them, which removes the copy from the label folder only. That needs
-// UIDPLUS; without it a plain EXPUNGE could take other messages the folder has
-// flagged, so it refuses.
+// SELECTed); see chooseUnlabel for the rules.
+//
+// TODO(manual): the Proton path (UID STORE \Deleted + UID EXPUNGE in a
+// Labels/ folder removes only that label, the message staying in its other
+// folders) is the documented Bridge behaviour but has not been verified by hand
+// against a real Proton Bridge. Until it is, an unelicited apply of it is capped
+// at the move cap (server.unelicitedLimit).
 func (o *Organiser) unlabel(ctx context.Context, c *imapclient.Client, a accounts.Account, label string, ms []uidMember, done func(Touched)) error {
-	gmail := a.Provider == accounts.Gmail && c.Caps().Has(imap.CapGmailExt1)
-	if !gmail && !c.Caps().Has(imap.CapUIDPlus) {
-		return SafeError("the server does not advertise UIDPLUS; refusing to remove a label by expunge")
+	mode, err := chooseUnlabel(a.Provider, label, c.Caps())
+	if err != nil {
+		return err
 	}
 	for start := 0; start < len(ms); start += chunkUIDs {
 		if err := ctx.Err(); err != nil {
@@ -458,7 +502,7 @@ func (o *Organiser) unlabel(ctx context.Context, c *imapclient.Client, a account
 		}
 		set := imap.UIDSetNum(uids...)
 		imapx.SetPhase(ctx, "unlabel")
-		if gmail {
+		if mode == unlabelGmailLabels {
 			if err := c.StoreGmailLabels(set, imap.StoreFlagsDel, []string{label}, true).Close(); err != nil {
 				return err
 			}
@@ -467,6 +511,9 @@ func (o *Organiser) unlabel(ctx context.Context, c *imapclient.Client, a account
 				return err
 			}
 			if err := c.UIDExpunge(set).Close(); err != nil {
+				// Do not leave these copies flagged \Deleted for the next
+				// client that expunges the folder: best effort, then report.
+				_ = c.Store(set, &imap.StoreFlags{Op: imap.StoreFlagsDel, Silent: true, Flags: []imap.Flag{imap.FlagDeleted}}, nil).Close()
 				return err
 			}
 		}
