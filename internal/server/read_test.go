@@ -12,6 +12,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"maps"
 	"math/big"
@@ -581,6 +582,7 @@ func TestSearchToolFTSSyntaxModeAndErrorsAreToolErrors(t *testing.T) {
 	for _, q := range []string{`"unbalanced`, `AND`, `(`, `nosuchcol:x`} {
 		requireToolError(t, cs, "search", map[string]any{"account": "acct", "query": q, "fts_syntax": true}, "invalid full-text query")
 	}
+	requireToolError(t, cs, "search", map[string]any{"account": "acct", "query": "amazon.nl", "fts_syntax": true}, `quote terms that contain punctuation, e.g. "amazon.nl"`)
 	// The same junk in default mode is not an error.
 	for _, q := range []string{`"unbalanced`, `AND`, `(`, `nosuchcol:x`, `NEAR(a b)`, `!!!`} {
 		if res := call(t, cs, "search", map[string]any{"account": "acct", "query": q}); res.IsError {
@@ -1020,5 +1022,23 @@ func TestToolErrorsLeakNoPathOrHostPort(t *testing.T) {
 	r := call(t, cs2, "fetch_message", map[string]any{"account": "acct", "stable_id": id})
 	if !r.IsError || text(r) != "message content unavailable" {
 		t.Errorf("blob missing: isError=%v %q", r.IsError, text(r))
+	}
+}
+
+func TestSyntaxHintIsActionableAndDoesNotEchoInput(t *testing.T) {
+	for _, tc := range []struct{ err, want string }{
+		{`invalid full-text query: SQL logic error: fts5: syntax error near "."`, `quote terms that contain punctuation, e.g. "amazon.nl"`},
+		{`SQL logic error: no such column: secretname`, "unknown column filter"},
+	} {
+		got := syntaxHint(errors.New(tc.err))
+		if !strings.Contains(got, tc.want) {
+			t.Errorf("syntaxHint(%q) = %q, want %q", tc.err, got, tc.want)
+		}
+		if strings.Contains(got, "near") || strings.Contains(got, "secretname") {
+			t.Errorf("syntaxHint(%q) echoes input: %q", tc.err, got)
+		}
+	}
+	if got := syntaxHint(errors.New("database is locked")); got != "" {
+		t.Errorf("unrelated error got a hint: %q", got)
 	}
 }
