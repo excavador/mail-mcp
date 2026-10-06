@@ -52,3 +52,61 @@ jobs:
             ${{ !contains(steps.v.outputs.version, '-') && 'ghcr.io/excavador/mail-mcp-pdftext:latest' || '' }}
           provenance: false
           sbom: false
+      # A multi-arch build cannot be --load-ed, so the pull request also builds
+      # linux/amd64 alone (layers are cached from the build above) and runs it
+      # the way the chart does: uid 65532, read-only root, no capabilities, no
+      # network, the store mounted read-only. It proves poppler starts under the
+      # helper's rlimits (NPROC, AS, CPU, FSIZE=0, NOFILE) and that the helper's
+      # refusals work. The socket dir is a bind mount rather than a tmpfs so a
+      # second container (the client, same uid) can reach it.
+      - name: Build amd64 image for the smoke test
+        if: github.event_name == 'pull_request'
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          file: cmd/pdftext/Dockerfile
+          platforms: linux/amd64
+          load: true
+          tags: pdftext:smoke
+          provenance: false
+          sbom: false
+      - name: Smoke test under runtime limits
+        if: github.event_name == 'pull_request'
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          T=$(mktemp -d); chmod 755 "$T"
+          mkdir -p "$T/store/pdf" "$T/run"; chmod 777 "$T/run"
+          put() { # name -> sha of its content (any 64-hex name works: the helper does not verify digests)
+            h=$(sha256sum "$1" | cut -d' ' -f1); mkdir -p "$T/store/pdf/${h:0:2}"; cp "$1" "$T/store/pdf/${h:0:2}/$h"; echo "$h"; }
+          stream="BT /F1 18 Tf 20 100 Td (SMOKE-INVOICE-4242) Tj ET"
+          printf '%%PDF-1.4\n1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n2 0 obj<</Type/Pages/Kids[3 0 R]/Count 1>>endobj\n3 0 obj<</Type/Page/Parent 2 0 R/MediaBox[0 0 300 200]/Contents 4 0 R/Resources<</Font<</F1 5 0 R>>>>>>endobj\n4 0 obj<</Length %d>>stream\n%s\nendstream endobj\n5 0 obj<</Type/Font/Subtype/Type1/BaseFont/Helvetica>>endobj\ntrailer<</Root 1 0 R/Size 6>>\n%%%%EOF\n' "${#stream}" "$stream" > "$T/good.pdf"
+          echo "this is not a pdf" > "$T/bad.txt"
+          printf '%%PDF-1.4\n' > "$T/big.pdf"; truncate -s 26214401 "$T/big.pdf"
+          good=$(put "$T/good.pdf"); bad=$(put "$T/bad.txt"); big=$(put "$T/big.pdf")
+          chmod -R a+rX "$T/store"
+          docker run -d --name pdftext-smoke --user 65532:65532 --read-only --cap-drop ALL \
+            --security-opt no-new-privileges --network none --memory 512m \
+            -v "$T/run:/run/pdftext" -v "$T/store:/var/cache/mail-mcp/store:ro" \
+            pdftext:smoke --socket=/run/pdftext/pdftext.sock --root=/var/cache/mail-mcp/store
+          for i in $(seq 50); do [ -S "$T/run/pdftext.sock" ] && break; sleep 0.2; done
+          docker logs pdftext-smoke
+          call() { docker run --rm --network none --user 65532:65532 --read-only --cap-drop ALL \
+            -v "$T/run:/run/pdftext" python:3-alpine python -c '
+          import socket,sys
+          s=socket.socket(socket.AF_UNIX); s.settimeout(30); s.connect("/run/pdftext/pdftext.sock")
+          s.sendall(("{\"hash\":\"%s\"}\n"%sys.argv[1]).encode())
+          b=b""
+          while True:
+              d=s.recv(65536)
+              if not d: break
+              b+=d
+          print(b.decode())' "$1"; }
+          fail=0
+          r=$(call "$good"); echo "good: $r"
+          echo "$r" | grep -q '"status":"ok"' && echo "$r" | grep -q SMOKE-INVOICE-4242 || { echo "FAIL text"; fail=1; }
+          r=$(call "$bad"); echo "bad: $r"; echo "$r" | grep -q '"status":"not_pdf"' || { echo "FAIL not_pdf"; fail=1; }
+          r=$(call "$big"); echo "big: $r"; echo "$r" | grep -q '"status":"too_large"' || { echo "FAIL too_large"; fail=1; }
+          docker logs pdftext-smoke
+          docker rm -f pdftext-smoke >/dev/null; rm -rf "$T" || true
+          exit $fail
