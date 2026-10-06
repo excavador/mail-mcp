@@ -150,6 +150,14 @@ func main() {
 				Usage:   "unix socket of the pdftext sidecar; empty disables PDF attachment text",
 				Sources: cli.EnvVars("PDF_EXTRACTOR_SOCKET"),
 			},
+			&cli.StringFlag{
+				Name: "pdf-stage-dir",
+				// Decoded PDFs are staged under <dir>/pdf for the sidecar. In a
+				// pod this is a dedicated emptyDir the sidecar mounts read-only,
+				// so it never sees the mail store. Default: the cache dir.
+				Usage:   "root under which PDFs are staged for the sidecar (default: --cache-dir)",
+				Sources: cli.EnvVars("PDF_STAGE_DIR"),
+			},
 			&cli.DurationFlag{
 				Name:    "refresh-interval",
 				Usage:   "how often to refresh the cache from each mailbox; 0 disables refreshing",
@@ -212,6 +220,9 @@ func run(ctx context.Context, cmd *cli.Command) error {
 	}
 	opts := []server.Option{server.WithHistory(hist), server.WithOrganiser(org), server.WithMaxUnelicited(cmd.Int("max-unelicited-apply")), server.WithApprovalMode(approval)}
 	if sock := cmd.String("pdf-extractor-socket"); sock != "" {
+		if d := cmd.String("pdf-stage-dir"); d != "" {
+			store.SetPDFStageDir(d)
+		}
 		store.SetPDFExtractor(pdfclient.New(sock))
 		log.Info("pdf text", "extractor_socket", sock)
 	}

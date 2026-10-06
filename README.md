@@ -70,6 +70,7 @@ openssl s_client -starttls imap -connect 127.0.0.1:143 </dev/null | \
 | `--admin-resource-url` | `ADMIN_RESOURCE_URL` | yes | http |
 | `--scope` | `SCOPE` | no; default `openid` | http |
 | `--pdf-extractor-socket` | `PDF_EXTRACTOR_SOCKET` | no; empty (default) turns PDF text off | all |
+| `--pdf-stage-dir` | `PDF_STAGE_DIR` | no; default `--cache-dir` | all |
 
 The read and admin resource URLs must differ — that difference is the whole
 point, so that sluis can mint 7-day tokens for the read endpoint and shorter
@@ -117,14 +118,18 @@ What this design assumes and does about it:
 
 - **The parser is compromised or runs away.** It runs in its own container
   with a read-only root file system, no capabilities, the default seccomp
-  profile, a 512 Mi memory limit and one CPU. It sees the blob store read-only
-  and nothing else writable but the socket directory. It has no credentials:
-  the mail-mcp pod's secrets are mounted in the main container only.
+  profile, a 512 Mi memory limit and one CPU. It does not mount the mail
+  store at all: it sees one small staging `emptyDir` (64 Mi), read-only, into
+  which mail-mcp writes one decoded PDF at a time, and nothing writable but
+  the socket directory. It has no credentials: the accounts secret is mounted
+  in the main container only, and the pod mounts no service-account token
+  (`automountServiceAccountToken: false`; mail-mcp does not use the
+  Kubernetes API).
 - **One file must not hurt the next.** The helper starts one `pdftotext` per
   request and kills its whole process group after 20 s of wall time. Before
   it execs, the child applies `RLIMIT_CPU` 15 s, `RLIMIT_AS` 400 MB,
   `RLIMIT_NPROC` 1, `RLIMIT_FSIZE` 0 (it cannot write a file), `RLIMIT_NOFILE`
-  16 and `RLIMIT_CORE` 0. They are applied by a limit-and-exec re-exec of the
+  64 and `RLIMIT_CORE` 0. They are applied by a limit-and-exec re-exec of the
   helper rather than by `prlimit` on a started child, because that would leave
   a window in which the parser runs unlimited.
 - **The client cannot steer the helper.** A request is `{"hash": ...}`. The
@@ -141,11 +146,18 @@ What this design assumes and does about it:
   `attachment_text`, each fenced in `<untrusted-email-content nonce=...>` with
   the same per-call nonce as the body (a closing tag inside it is defanged),
   capped at 32 KiB per attachment and 64 KiB per message (16 KiB per message in
-  `get_thread`). Search snippets that come from a PDF are treated like body
-  snippets.
+  `get_thread`, where it counts toward `max_chars`). Search snippets that come
+  from a PDF are treated like body snippets.
 - **A sick sidecar.** The client has a pool of 2, a 25 s deadline per call
-  and a circuit breaker: after 5 consecutive failures it stops calling for a
-  minute and then probes. Errors have fixed texts and never echo input.
+  and a circuit breaker: after 5 consecutive transport failures (the sidecar
+  not answering, or answering garbage) it stops calling for a minute and then
+  probes. A `failed` or `timeout` answer describes one file and does not count.
+  A file that fails at the transport three times, across passes, is recorded as
+  `failed`, and a file that was being processed when the process died is
+  recorded as `failed` on the next start, so no file can loop. Errors have
+  fixed texts and never echo input. mail-mcp streams the message blob and the
+  attachment (never holding either whole), so a large PDF does not threaten
+  the main container's memory limit.
 
 What it does not protect against: a bug in poppler that gives code execution
 inside the sidecar. The container limits are there for that case; the sidecar
@@ -158,7 +170,8 @@ The `pdf_text` job runs last in the background scheduler, never touches IMAP,
 and writes in short transactions like the other jobs. It walks the PDF
 attachments (content type `application/pdf` or a `.pdf` name), takes each
 decoded attachment out of its message blob (MIME decoding, no PDF code), stages
-it at `<cache>/pdf/<hh>/<sha256>` for the sidecar, and removes it again. The
+it at `<stage>/pdf/<hh>/<sha256>` for the sidecar (`--pdf-stage-dir`, default
+the cache directory), and removes it again; the stage is emptied at start. The
 outcome of every file (`ok`, `timeout`, `too_large`, `failed`, `not_pdf`) is
 cached in the `pdf_text` table by the file's SHA-256, so a hostile file is never
 retried and a PDF forwarded a hundred times is extracted once. The text is
@@ -177,15 +190,25 @@ pdfExtractor:
 
 This adds the `pdftext` sidecar (image tag defaults to the chart's appVersion,
 so it is released with mail-mcp), a 1 Mi `emptyDir` for the socket shared with
-the main container, the cache volume mounted read-only into the sidecar, and
-`PDF_EXTRACTOR_SOCKET` on the main container. Both containers must run as the
-same uid (the chart's `podSecurityContext` does this): the store is owner-only.
-The sidecar needs no network access.
+the main container, a 64 Mi staging `emptyDir` (read-write in mail-mcp,
+read-only in the sidecar), and `PDF_EXTRACTOR_SOCKET` and `PDF_STAGE_DIR` on the
+main container. The sidecar does not mount the cache volume. Both containers
+must run as the same uid (the chart's `podSecurityContext` does this): staged
+files are owner-only. The sidecar needs no network access and the pod adds no
+network need, so NetworkPolicies already written for mail-mcp (the nexus
+deployment has them in people-oleg) need no change.
 
 Without the chart: run `pdftext --socket /run/pdftext/pdftext.sock --root
-<cache dir>` with the cache directory mounted read-only, and start mail-mcp with
-`--pdf-extractor-socket /run/pdftext/pdftext.sock`. The image is built from
+<stage dir>` with the stage directory mounted read-only, and start mail-mcp with
+`--pdf-extractor-socket /run/pdftext/pdftext.sock --pdf-stage-dir <stage dir>`. The image is built from
 `cmd/pdftext/Dockerfile` (build context: the repository root).
+
+Licence of the image: mail-mcp is MIT, but the image also contains poppler
+(`pdftotext`), which is GPL-2.0-or-later, so the image is labelled
+`MIT AND GPL-2.0-or-later`. The poppler source for the installed version is
+available from Alpine's package page for `poppler-utils`
+(<https://pkgs.alpinelinux.org/package/v3.22/main/x86_64/poppler-utils>) and
+from <https://poppler.freedesktop.org/>.
 
 ## What it will not do
 

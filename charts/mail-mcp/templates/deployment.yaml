@@ -23,6 +23,9 @@ spec:
       annotations: {{- toYaml . | nindent 8 }}
       {{- end }}
     spec:
+      # mail-mcp does not use the Kubernetes API, and a parser sidecar has no
+      # business holding a service-account token.
+      automountServiceAccountToken: false
       securityContext: {{- toYaml .Values.podSecurityContext | nindent 8 }}
       containers:
         - name: mail-mcp
@@ -58,6 +61,8 @@ spec:
             # The PDF sidecar's socket; empty (the default) means no PDF text.
             - name: PDF_EXTRACTOR_SOCKET
               value: /run/pdftext/pdftext.sock
+            - name: PDF_STAGE_DIR
+              value: /var/lib/mail-mcp/pdf-stage
             {{- end }}
           ports:
             - name: http
@@ -88,12 +93,15 @@ spec:
             {{- if .Values.pdfExtractor.enabled }}
             - name: pdftext-socket
               mountPath: /run/pdftext
+            - name: pdftext-stage
+              mountPath: /var/lib/mail-mcp/pdf-stage
             {{- end }}
         {{- if .Values.pdfExtractor.enabled }}
         # PDF text extraction runs here, not in mail-mcp: poppler parses
         # untrusted files, so it gets its own container with no network use,
-        # a read-only view of the store, hard limits, and nothing writable
-        # but the socket directory. The helper kills each pdftotext it starts
+        # hard limits, and nothing writable but the socket directory. It does
+        # not mount the cache volume at all: it sees only the staging
+        # emptyDir, where mail-mcp puts one decoded PDF at a time, read-only. The helper kills each pdftotext it starts
         # after 20 s and applies rlimits to it; this container is the second
         # wall (memory limit, no capabilities, seccomp).
         - name: pdftext
@@ -101,10 +109,8 @@ spec:
           imagePullPolicy: {{ .Values.pdfExtractor.image.pullPolicy }}
           args:
             - --socket=/run/pdftext/pdftext.sock
-            # The whole cache volume is mounted read-only (not a subPath: the
-            # kubelet would create a missing "store" directory as root and
-            # mail-mcp could then not own it); blobs are under store/pdf/.
-            - --root=/var/cache/mail-mcp/store
+            # Files are at /stage/pdf/<hh>/<sha256>.
+            - --root=/stage
           securityContext:
             runAsNonRoot: true
             allowPrivilegeEscalation: false
@@ -113,8 +119,8 @@ spec:
             seccompProfile: {type: RuntimeDefault}
           resources: {{- toYaml .Values.pdfExtractor.resources | nindent 12 }}
           volumeMounts:
-            - name: cache
-              mountPath: /var/cache/mail-mcp
+            - name: pdftext-stage
+              mountPath: /stage
               readOnly: true
             - name: pdftext-socket
               mountPath: /run/pdftext
@@ -143,6 +149,10 @@ spec:
         - name: pdftext-socket
           emptyDir:
             sizeLimit: 1Mi
+        # One decoded PDF (at most 25 MiB) is staged at a time; 64Mi leaves room.
+        - name: pdftext-stage
+          emptyDir:
+            sizeLimit: 64Mi
         {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector: {{- toYaml . | nindent 8 }}

@@ -10,6 +10,7 @@ import (
 	"net"
 	"os"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -19,7 +20,11 @@ func Listen(path string) (net.Listener, error) {
 	if fi, err := os.Lstat(path); err == nil && fi.Mode()&os.ModeSocket != 0 {
 		_ = os.Remove(path)
 	}
+	// Owner-only from the moment it exists, not after a chmod: the umask is
+	// set around the bind (this runs once, at start-up).
+	old := syscall.Umask(0o177)
 	ln, err := net.Listen("unix", path)
+	syscall.Umask(old)
 	if err != nil {
 		return nil, err
 	}

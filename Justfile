@@ -79,11 +79,14 @@ chart:
     @grep -q 'image: "ghcr.io/excavador/mail-mcp-pdftext:1.1.0"' /tmp/mail-mcp-chart-pdf.yaml || (echo "FAIL: sidecar image does not default to appVersion"; exit 1)
     @grep -A1 'name: PDF_EXTRACTOR_SOCKET' /tmp/mail-mcp-chart-pdf.yaml | grep -q '/run/pdftext/pdftext.sock' || (echo "FAIL: main container lacks PDF_EXTRACTOR_SOCKET"; exit 1)
     @awk '/- name: pdftext$/,/^      volumes:/' /tmp/mail-mcp-chart-pdf.yaml > /tmp/mail-mcp-chart-pdf-side.yaml
-    @for want in 'runAsNonRoot: true' 'allowPrivilegeEscalation: false' 'readOnlyRootFilesystem: true' 'drop: \["ALL"\]' 'type: RuntimeDefault' 'memory: 512Mi' 'cpu: "1"' 'readOnly: true'; do \
-        grep -q -E "$want" /tmp/mail-mcp-chart-pdf-side.yaml || { echo "FAIL: sidecar lacks $want"; exit 1; }; done
+    @for want in 'runAsNonRoot: true' 'allowPrivilegeEscalation: false' 'readOnlyRootFilesystem: true' 'drop: \["ALL"\]' 'type: RuntimeDefault' 'memory: 512Mi' 'cpu: "1"' 'readOnly: true' '--root=/stage'; do \
+        grep -q -E -e "$want" /tmp/mail-mcp-chart-pdf-side.yaml || { echo "FAIL: sidecar lacks $want"; exit 1; }; done
     @grep -q 'sizeLimit: 1Mi' /tmp/mail-mcp-chart-pdf.yaml || (echo "FAIL: socket emptyDir has no sizeLimit"; exit 1)
-    @# the sidecar mounts the cache read-only: the cache mount in the sidecar block must say so
-    @awk '/- name: cache$/{getline a; getline b; print a b}' /tmp/mail-mcp-chart-pdf-side.yaml | grep -q 'readOnly: true' || (echo "FAIL: sidecar cache mount is not read-only"; exit 1)
+    @# the sidecar mounts only the staging emptyDir, read-only, and never the cache volume
+    @! grep -q 'name: cache' /tmp/mail-mcp-chart-pdf-side.yaml || (echo "FAIL: sidecar mounts the cache volume"; exit 1)
+    @awk '/- name: pdftext-stage$/{getline a; getline b; print a b}' /tmp/mail-mcp-chart-pdf-side.yaml | grep -q 'readOnly: true' || (echo "FAIL: sidecar staging mount is not read-only"; exit 1)
+    @grep -q 'sizeLimit: 64Mi' /tmp/mail-mcp-chart-pdf.yaml || (echo "FAIL: staging emptyDir has no sizeLimit"; exit 1)
+    @grep -q 'automountServiceAccountToken: false' /tmp/mail-mcp-chart-pdf.yaml || (echo "FAIL: service-account token is mounted"; exit 1)
     @# tag override, and bad values are refused
     @helm template t charts/mail-mcp --set accounts.existingSecret=x {{auth_values}} --set pdfExtractor.enabled=true \
         --set pdfExtractor.image.tag=9.9.9 | grep -q 'mail-mcp-pdftext:9.9.9' || (echo "FAIL: pdfExtractor.image.tag ignored"; exit 1)

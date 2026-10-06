@@ -23,7 +23,7 @@ ARG VERSION=dev
 LABEL org.opencontainers.image.title="mail-mcp-pdftext" \
       org.opencontainers.image.description="Sandboxed PDF text extraction sidecar for mail-mcp" \
       org.opencontainers.image.source="https://github.com/excavador/mail-mcp" \
-      org.opencontainers.image.licenses="MIT" \
+      org.opencontainers.image.licenses="MIT AND GPL-2.0-or-later" \
       org.opencontainers.image.version="$VERSION"
 # Same uid as the mail-mcp pod (chart podSecurityContext): the shared socket
 # and the blob store are owner-only.

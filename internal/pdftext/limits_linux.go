@@ -22,7 +22,7 @@ func applyLimits(cpuSec, asBytes uint64) error {
 		{syscall.RLIMIT_CPU, "cpu", cpuSec},
 		{syscall.RLIMIT_AS, "as", asBytes},
 		{syscall.RLIMIT_FSIZE, "fsize", 0},
-		{syscall.RLIMIT_NOFILE, "nofile", 16},
+		{syscall.RLIMIT_NOFILE, "nofile", 64},
 		{syscall.RLIMIT_CORE, "core", 0},
 		// One process for the uid at the time of the check; exec needs no
 		// fork, so pdftotext runs, and any fork it attempts fails.

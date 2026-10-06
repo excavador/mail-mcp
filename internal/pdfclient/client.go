@@ -81,9 +81,9 @@ func (c *Client) allow() bool {
 	return true
 }
 
-// record notes the outcome of a call. A failure is a transport error or a
-// "failed" or "timeout" status; ok, too_large and not_pdf prove the sidecar
-// works.
+// record notes the outcome of a call. A failure is a transport error or an
+// answer the client cannot read; any valid status, "failed" and "timeout"
+// included (those describe one file), proves the sidecar is alive.
 func (c *Client) record(fail bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -127,10 +127,10 @@ func (c *Client) Extract(ctx context.Context, sha string) (cache.PDFResult, erro
 		return cache.PDFResult{}, ErrCall
 	}
 	switch resp.Status {
-	case "ok", "too_large", "not_pdf":
+	case "ok", "too_large", "not_pdf", "timeout", "failed":
+		// Every status is the sidecar answering. timeout and failed are about
+		// the file, not the sidecar's health.
 		c.record(false)
-	case "timeout", "failed":
-		c.record(true)
 	default:
 		c.record(true)
 		return cache.PDFResult{}, ErrCall

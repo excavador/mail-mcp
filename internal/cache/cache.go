@@ -51,9 +51,11 @@ type Cache struct {
 	entitiesJob         jobState
 	pdfJob              jobState
 	pdfMu               sync.RWMutex
-	pdfX                PDFExtractor // nil: the feature is off
-	sendersMax          atomic.Int64 // messages with a higher rowid are counted into senders by refresh itself
-	fgWriters           atomic.Int64 // refreshes and applies in progress; backfills give way
+	pdfX                PDFExtractor   // nil: the feature is off
+	pdfStage            string         // staging root; empty means the cache dir
+	pdfAttempts         map[string]int // transport failures per file hash, across passes
+	sendersMax          atomic.Int64   // messages with a higher rowid are counted into senders by refresh itself
+	fgWriters           atomic.Int64   // refreshes and applies in progress; backfills give way
 	ws                  writeStats
 
 	folderQueries atomic.Int64 // membership lookups for folders of messages

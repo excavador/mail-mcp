@@ -262,33 +262,103 @@ func (f extractorFunc) Extract(ctx context.Context, sha string) (PDFResult, erro
 	return f(ctx, sha)
 }
 
-func TestPDFTextRepeatedTransportFailureIsRecordedAsFailed(t *testing.T) {
+func TestPDFTextRepeatedTransportFailureIsRecordedAsFailedAndPassContinues(t *testing.T) {
 	c := openCache(t)
 	ctx := tctx(t)
-	x := &fakeX{c: c, failN: map[string]int{"MARK-Poison": 100}}
+	x := &fakeX{c: c, failN: map[string]int{"MARK-Poison": 1000}}
 	c.SetPDFExtractor(x)
-	addPDFMessage(t, c, "m1", pdfDoc("MARK-Poison"))
+	addPDFMessage(t, c, "m1", pdfDoc("MARK-Poison")) // first in line
+	addPDFMessage(t, c, "m2", pdfDoc("MARK-Fine"))
+	// Each pass stops at the poison file with its transport error, but the
+	// count survives the pass; the third pass records it and goes on.
 	for i := 1; i < pdfMaxAttempts; i++ {
 		if err := c.RunPDFTextOnce(ctx, nil); err == nil {
 			t.Fatalf("pass %d: want the transport error", i)
 		}
+		if st, _ := c.PDFTextStatus(ctx); st.Done != 0 {
+			t.Fatalf("pass %d: done=%d", i, st.Done)
+		}
 	}
-	// Attempts are counted per pass in memory; within one pass the file is
-	// retried only once, so drive the count the way a long-running job does.
-	attempts := map[string]int{}
-	var st pdfStats
-	a := pdfAtt{}
-	rows, _ := c.pendingPDFs(ctx, 0)
-	if len(rows) != 1 {
-		t.Fatalf("pending: %d", len(rows))
-	}
-	a = rows[0]
-	for i := 0; i < pdfMaxAttempts; i++ {
-		_, _ = c.pdfOne(ctx, x, a, attempts, &st)
+	if err := c.RunPDFTextOnce(ctx, nil); err != nil {
+		t.Fatalf("third pass: %v", err)
 	}
 	s, _ := c.PDFTextStatus(ctx)
-	if s.Outcomes["failed"] != 1 || !s.Complete {
-		t.Fatalf("poison file not recorded as failed: %+v", s)
+	if s.Outcomes["failed"] != 1 || s.Outcomes["ok"] != 1 || !s.Complete {
+		t.Fatalf("poison file not recorded as failed with the next one processed: %+v", s)
+	}
+	if ids, _ := searchIDs(t, c, "Fine"); len(ids) != 1 {
+		t.Errorf("file behind the poison one not indexed: %v", ids)
+	}
+	if _, ok := c.pdfAttempts["x"]; ok || len(c.pdfAttempts) != 0 {
+		t.Errorf("attempt counters not cleared: %v", c.pdfAttempts)
+	}
+}
+
+func TestPDFTextPendingRowFromACrashIsRecordedAsFailed(t *testing.T) {
+	c := openCache(t)
+	ctx := tctx(t)
+	x := &fakeX{c: c}
+	c.SetPDFExtractor(x)
+	addPDFMessage(t, c, "m1", pdfDoc("MARK-Crashy"))
+	var sha string
+	_ = c.db.QueryRow(`SELECT sha256 FROM attachments WHERE mime = 'application/pdf'`).Scan(&sha)
+	// A previous process died after marking the file and before finishing.
+	if err := c.markPDFPending(ctx, sha); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.RunPDFTextOnce(ctx, nil); err != nil {
+		t.Fatal(err)
+	}
+	if x.n() != 0 {
+		t.Fatal("a file that crashed the process was tried again")
+	}
+	if st, _ := c.PDFTextStatus(ctx); st.Outcomes["failed"] != 1 || !st.Complete || st.Outcomes["pending"] != 0 {
+		t.Fatalf("%+v", st)
+	}
+	// An error return leaves no pending row behind.
+	addPDFMessage(t, c, "m2", pdfDoc("MARK-Err"))
+	x.failN = map[string]int{"MARK-Err": 1}
+	if err := c.RunPDFTextOnce(ctx, nil); err == nil {
+		t.Fatal("want error")
+	}
+	var n int
+	_ = c.db.QueryRow(`SELECT COUNT(*) FROM pdf_text WHERE status = 'pending'`).Scan(&n)
+	if n != 0 {
+		t.Fatalf("pending rows left after a transport error: %d", n)
+	}
+}
+
+func TestPDFTextStagesInADedicatedDirectory(t *testing.T) {
+	c := openCache(t)
+	ctx := tctx(t)
+	stage := t.TempDir()
+	c.SetPDFStageDir(stage)
+	_ = os.MkdirAll(stage+"/pdf/ab", 0o700)
+	_ = os.WriteFile(stage+"/pdf/ab/leftover", []byte("x"), 0o600)
+	var seen string
+	c.SetPDFExtractor(extractorFunc(func(_ context.Context, sha string) (PDFResult, error) {
+		seen = c.pdfFile(sha)
+		if _, err := os.Stat(seen); err != nil {
+			return PDFResult{}, err
+		}
+		return PDFResult{Status: "ok", Text: "Staged"}, nil
+	}))
+	addPDFMessage(t, c, "m1", pdfDoc("MARK-Stage"))
+	_ = os.RemoveAll(c.pdfDir()) // what RunPDFText does at start; the root (a mount point) stays
+	if _, err := os.Stat(stage + "/pdf/ab/leftover"); err == nil {
+		t.Fatal("leftover survived the startup cleanup")
+	}
+	if _, err := os.Stat(stage); err != nil {
+		t.Fatal("the staging directory itself was removed")
+	}
+	if err := c.RunPDFTextOnce(ctx, nil); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(seen, stage+"/pdf/") {
+		t.Fatalf("staged at %q, want under %s", seen, stage)
+	}
+	if ids, _ := searchIDs(t, c, "Staged"); len(ids) != 1 {
+		t.Fatalf("not indexed: %v", ids)
 	}
 }
 

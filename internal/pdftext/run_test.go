@@ -170,7 +170,7 @@ func TestRlimitsAreInForce(t *testing.T) {
 	if got.Status != StatusOK {
 		t.Fatalf("got %+v", got)
 	}
-	for _, want := range []string{"nofile=\n16", "fsize=\n0", "core=\n0", "cpu=\n15"} {
+	for _, want := range []string{"nofile=\n64", "fsize=\n0", "core=\n0", "cpu=\n15"} {
 		if !strings.Contains(got.Text, want) {
 			t.Fatalf("%q missing in %q", want, got.Text)
 		}
@@ -209,8 +209,8 @@ func TestHashValidationAndPathConfinement(t *testing.T) {
 	valid := f.put(t, pdfBytes)
 	for _, bad := range []string{
 		"", "../secret.pdf", "../../etc/passwd", "/etc/passwd", valid + "/../..", strings.ToUpper(valid),
-		valid[:63], valid + "0", strings.Repeat("g", 64), valid[:2] + "/" + valid[3:], valid + "\x00",
-		"pdf/" + valid[:2] + "/" + valid, "..%2f..%2fetc%2fpasswd",
+		"pdf/" + valid[:2] + "/" + valid, valid[:63], valid + "0", strings.Repeat("g", 64), valid[:2] + "/" + valid[3:], valid + "\x00",
+		"..%2f..%2fetc%2fpasswd",
 	} {
 		if p, ok := f.r.blobPath(bad); ok {
 			t.Errorf("%q accepted as %s", bad, p)

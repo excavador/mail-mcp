@@ -17,7 +17,6 @@ package cache
 // that timed out) is recorded by hash so it is never retried.
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha256"
 	"database/sql"
@@ -71,9 +70,9 @@ const (
 	// maxPDFInput is the largest attachment sent for extraction; the sidecar
 	// enforces the same bound, this one saves writing the file.
 	maxPDFInput = 25 << 20
-	// maxPDFBlob is the largest message blob read to find an attachment
-	// (25 MiB in base64 is about 34 MiB).
-	maxPDFBlob = 48 << 20
+	// maxPDFBlob is the largest message blob opened to find an attachment
+	// (25 MiB in base64 is about 34 MiB). The blob is streamed, not read whole.
+	maxPDFBlob = 36 << 20
 	// maxPDFStored caps the text kept per file, in pdf_text and in the index:
 	// the same bound as indexed body text.
 	maxPDFStored = maxIndexedText
@@ -82,6 +81,9 @@ const (
 	pdfRetryAfter  = 2 * time.Minute  // after the extractor was unavailable
 	pdfRescanEvery = 10 * time.Minute // new mail may carry new PDFs
 	pdfMaxAttempts = 3                // transport failures on one file before it is recorded as failed
+
+	// pdfPending is the provisional status written before a file is staged.
+	pdfPending = "pending"
 )
 
 // pdfCond selects the attachments that are PDFs: by type, or by file name.
@@ -130,7 +132,7 @@ func (c *Cache) PDFTextStatus(ctx context.Context) (PDFTextStatus, error) {
 	if err != nil {
 		return st, fmt.Errorf("cache: pdf status: %w", err)
 	}
-	rows, err := c.db.QueryContext(ctx, `SELECT status, COUNT(*) FROM pdf_text GROUP BY status`)
+	rows, err := c.db.QueryContext(ctx, `SELECT status, COUNT(*) FROM pdf_text WHERE status <> 'pending' GROUP BY status`)
 	if err != nil {
 		return st, fmt.Errorf("cache: pdf status: %w", err)
 	}
@@ -169,7 +171,7 @@ func (c *Cache) RunPDFText(ctx context.Context, log *slog.Logger) {
 		return
 	}
 	// Files left by a crash mid-extraction; the sidecar needs none of them.
-	_ = os.RemoveAll(c.pdfDir())
+	_ = os.RemoveAll(c.pdfDir()) // a subdirectory of the staging root, never the mount point
 	for ctx.Err() == nil {
 		wait := pdfRescanEvery
 		stats, err := c.pdfPass(ctx, log)
@@ -212,7 +214,6 @@ func (c *Cache) pdfPass(ctx context.Context, log *slog.Logger) (pdfStats, error)
 	if x == nil {
 		return st, nil
 	}
-	attempts := map[string]int{}
 	var after int64
 	for {
 		if ctx.Err() != nil {
@@ -234,7 +235,7 @@ func (c *Cache) pdfPass(ctx context.Context, log *slog.Logger) (pdfStats, error)
 			var held time.Duration
 			err := c.retryBusy(ctx, log, "pdf_text", func() error {
 				var err error
-				held, err = c.pdfOne(ctx, x, a, attempts, &st)
+				held, err = c.pdfOne(ctx, x, a, &st)
 				return err
 			})
 			if err != nil {
@@ -269,24 +270,31 @@ ORDER BY rowid LIMIT ?`, after, pdfBatch)
 
 // pdfOne brings one attachment to done: from the cache by hash if the file
 // was seen, else through the extractor. It returns the longest write hold.
-func (c *Cache) pdfOne(ctx context.Context, x PDFExtractor, a pdfAtt, attempts map[string]int, st *pdfStats) (time.Duration, error) {
+//
+// Transport failures are counted per file across passes (c.pdfAttempts); the
+// third records the file as failed, so a file that kills the sidecar cannot
+// block the files behind it. ErrPDFUnavailable is not the file's fault and is
+// not counted. A "pending" row, written before the risky steps, that is found
+// again means the process died mid-file: the file is recorded as failed.
+func (c *Cache) pdfOne(ctx context.Context, x PDFExtractor, a pdfAtt, st *pdfStats) (time.Duration, error) {
 	res, cached, err := c.cachedPDF(ctx, a.sha)
 	if err != nil {
 		return 0, err
 	}
-	if cached {
+	record := !cached
+	switch {
+	case cached && res.Status == pdfPending:
+		res, record = PDFResult{Status: "failed"}, true
+		st.Failed++
+	case cached:
 		st.Cached++
-	} else {
+	default:
 		res, err = c.extractPDF(ctx, x, a)
 		if err != nil {
 			if errors.Is(err, ErrPDFUnavailable) || ctx.Err() != nil {
 				return 0, err
 			}
-			// The call itself failed (the sidecar died mid-job, say): a few
-			// tries, then the file is recorded as failed, so a file that
-			// kills the sidecar cannot loop forever.
-			attempts[a.sha]++
-			if attempts[a.sha] < pdfMaxAttempts {
+			if c.noteAttempt(a.sha) < pdfMaxAttempts {
 				return 0, err
 			}
 			res = PDFResult{Status: "failed"}
@@ -297,7 +305,24 @@ func (c *Cache) pdfOne(ctx context.Context, x PDFExtractor, a pdfAtt, attempts m
 			st.Failed++
 		}
 	}
-	return c.storePDF(ctx, a.sha, res, !cached)
+	c.clearAttempts(a.sha)
+	return c.storePDF(ctx, a.sha, res, record)
+}
+
+func (c *Cache) noteAttempt(sha string) int {
+	c.pdfMu.Lock()
+	defer c.pdfMu.Unlock()
+	if c.pdfAttempts == nil {
+		c.pdfAttempts = map[string]int{}
+	}
+	c.pdfAttempts[sha]++
+	return c.pdfAttempts[sha]
+}
+
+func (c *Cache) clearAttempts(sha string) {
+	c.pdfMu.Lock()
+	delete(c.pdfAttempts, sha)
+	c.pdfMu.Unlock()
 }
 
 // cachedPDF looks the file up by hash.
@@ -317,7 +342,25 @@ func (c *Cache) cachedPDF(ctx context.Context, sha string) (PDFResult, bool, err
 	return r, true, nil
 }
 
-func (c *Cache) pdfDir() string { return filepath.Join(c.dir, "pdf") }
+// SetPDFStageDir sets the root under which decoded PDFs are staged for the
+// sidecar, as <root>/pdf/<hh>/<sha> (default root: the cache dir). In a pod it
+// is a dedicated emptyDir, read-write here and read-only in the sidecar (its
+// --root), so the sidecar never sees the mail store.
+func (c *Cache) SetPDFStageDir(dir string) {
+	c.pdfMu.Lock()
+	c.pdfStage = dir
+	c.pdfMu.Unlock()
+}
+
+func (c *Cache) pdfDir() string {
+	c.pdfMu.RLock()
+	defer c.pdfMu.RUnlock()
+	root := c.pdfStage
+	if root == "" {
+		root = c.dir
+	}
+	return filepath.Join(root, "pdf")
+}
 
 // pdfFile is where the sidecar looks for the file with the given hash.
 func (c *Cache) pdfFile(sha string) string {
@@ -331,7 +374,12 @@ func (c *Cache) pdfFile(sha string) string {
 // extractor and removes it again. Outcomes that are the file's own (too big,
 // missing, not what the index said) are results; only an extractor error is
 // an error.
-func (c *Cache) extractPDF(ctx context.Context, x PDFExtractor, a pdfAtt) (PDFResult, error) {
+//
+// Memory stays small: the message blob is streamed through the MIME reader
+// and the part is copied to the staging file through a hash, never held whole.
+// A provisional "pending" outcome is written before any of that, so a crash
+// (an OOM kill, say) cannot make the same file loop forever.
+func (c *Cache) extractPDF(ctx context.Context, x PDFExtractor, a pdfAtt) (res PDFResult, err error) {
 	if a.size > maxPDFInput {
 		return PDFResult{Status: "too_large"}, nil
 	}
@@ -343,91 +391,109 @@ func (c *Cache) extractPDF(ctx context.Context, x PDFExtractor, a pdfAtt) (PDFRe
 	if path == "" {
 		return PDFResult{Status: "failed"}, nil
 	}
-	if fi, err := os.Stat(path); err != nil || fi.Size() > maxPDFBlob {
-		if err == nil {
-			return PDFResult{Status: "too_large"}, nil
-		}
+	fi, serr := os.Stat(path)
+	if serr != nil {
 		return PDFResult{Status: "failed"}, nil
 	}
-	raw, err := os.ReadFile(path)
-	if err != nil {
-		return PDFResult{Status: "failed"}, nil
-	}
-	data, ok := partBody(raw, a.part, maxPDFInput)
-	if !ok {
-		return PDFResult{Status: "failed"}, nil
-	}
-	if len(data) > maxPDFInput {
+	if fi.Size() > maxPDFBlob {
 		return PDFResult{Status: "too_large"}, nil
 	}
-	if h := sha256.Sum256(data); hex.EncodeToString(h[:]) != a.sha {
-		return PDFResult{Status: "failed"}, nil
-	}
-	dst := c.pdfFile(a.sha)
-	if err := writePDFFile(dst, data); err != nil {
-		return PDFResult{}, fmt.Errorf("stage pdf: %w", err)
-	}
-	defer os.Remove(dst)
-	r, err := x.Extract(ctx, a.sha)
-	if err != nil {
+	if err := c.markPDFPending(ctx, a.sha); err != nil {
 		return PDFResult{}, err
 	}
-	return r, nil
+	defer func() {
+		// Any error return is "try again later", not an outcome.
+		if err != nil {
+			c.dropPDFPending(a.sha)
+		}
+	}()
+	dst := c.pdfFile(a.sha)
+	status, serr := c.stagePart(path, a, dst)
+	if serr != nil {
+		return PDFResult{}, fmt.Errorf("stage pdf: %w", serr)
+	}
+	if status != "" {
+		return PDFResult{Status: status}, nil
+	}
+	defer os.Remove(dst)
+	return x.Extract(ctx, a.sha)
 }
 
-// writePDFFile stores data at dst atomically, owner-readable only.
-func writePDFFile(dst string, data []byte) error {
-	dir := filepath.Dir(dst)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return err
-	}
-	tmp, err := os.CreateTemp(dir, ".tmp-*")
+func (c *Cache) markPDFPending(ctx context.Context, sha string) error {
+	_, err := c.db.ExecContext(ctx, `INSERT INTO pdf_text (sha256, status, updated_at) VALUES (?, ?, ?) ON CONFLICT (sha256) DO NOTHING`, sha, pdfPending, c.now().Unix())
 	if err != nil {
-		return err
-	}
-	name := tmp.Name()
-	if _, err := tmp.Write(data); err != nil {
-		_ = tmp.Close()
-		_ = os.Remove(name)
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		_ = os.Remove(name)
-		return err
-	}
-	if err := os.Chmod(name, 0o400); err != nil {
-		_ = os.Remove(name)
-		return err
-	}
-	if err := os.Rename(name, dst); err != nil {
-		_ = os.Remove(name)
-		return err
+		return fmt.Errorf("mark pdf pending: %w", err)
 	}
 	return nil
 }
 
-// partBody returns the decoded body of the MIME part at path (numbered as in
-// extractAttachments), reading at most limit+1 bytes. This is MIME, not PDF:
-// the bytes are not interpreted.
-func partBody(raw []byte, path string, limit int64) (out []byte, ok bool) {
+func (c *Cache) dropPDFPending(sha string) {
+	_, _ = c.db.Exec(`DELETE FROM pdf_text WHERE sha256 = ? AND status = ?`, sha, pdfPending)
+}
+
+// stagePart copies the decoded MIME part a.part of the message blob at path
+// to dst (atomically, owner-readable only), through a hash. It returns a
+// non-empty status when the file is the file's own problem (too large,
+// missing, not the bytes the index recorded) and an error only for staging
+// failures.
+func (c *Cache) stagePart(path string, a pdfAtt, dst string) (status string, err error) {
 	defer func() {
 		if recover() != nil {
-			out, ok = nil, false
+			status, err = "failed", nil // a parser panic in MIME code is the file's problem
 		}
 	}()
-	e, err := message.Read(bytes.NewReader(raw))
-	if e == nil || (err != nil && !message.IsUnknownCharset(err) && !message.IsUnknownEncoding(err)) {
-		return nil, false
+	f, oerr := os.Open(path)
+	if oerr != nil {
+		return "failed", nil
 	}
-	leaf := findPart(e, "", path, 0)
+	defer f.Close()
+	e, rerr := message.Read(f)
+	if e == nil || (rerr != nil && !message.IsUnknownCharset(rerr) && !message.IsUnknownEncoding(rerr)) {
+		return "failed", nil
+	}
+	leaf := findPart(e, "", a.part, 0)
 	if leaf == nil {
-		return nil, false
+		return "failed", nil
 	}
-	b, err := io.ReadAll(io.LimitReader(leaf.Body, limit+1))
+	dir := filepath.Dir(dst)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return "", err
+	}
+	tmp, err := os.CreateTemp(dir, ".tmp-*")
 	if err != nil {
-		return nil, false
+		return "", err
 	}
-	return b, true
+	name := tmp.Name()
+	fail := func(e error) (string, error) { _ = tmp.Close(); _ = os.Remove(name); return "", e }
+	h := sha256.New()
+	n, cerr := io.Copy(io.MultiWriter(tmp, h), io.LimitReader(leaf.Body, maxPDFInput+1))
+	if cerr != nil {
+		_ = tmp.Close()
+		_ = os.Remove(name)
+		return "failed", nil
+	}
+	if n > maxPDFInput {
+		_ = tmp.Close()
+		_ = os.Remove(name)
+		return "too_large", nil
+	}
+	if hex.EncodeToString(h.Sum(nil)) != a.sha {
+		_ = tmp.Close()
+		_ = os.Remove(name)
+		return "failed", nil
+	}
+	if err := tmp.Close(); err != nil {
+		return fail(err)
+	}
+	if err := os.Chmod(name, 0o400); err != nil {
+		_ = os.Remove(name)
+		return "", err
+	}
+	if err := os.Rename(name, dst); err != nil {
+		_ = os.Remove(name)
+		return "", err
+	}
+	return "", nil
 }
 
 func findPart(e *message.Entity, path, want string, depth int) *message.Entity {
@@ -435,7 +501,7 @@ func findPart(e *message.Entity, path, want string, depth int) *message.Entity {
 		return nil
 	}
 	if mr := e.MultipartReader(); mr != nil {
-		for i := 1; ; i++ {
+		for i := 1; i <= maxAttachments; i++ {
 			p, err := mr.NextPart()
 			if err != nil && (p == nil || errors.Is(err, io.EOF) || !message.IsUnknownCharset(err)) {
 				return nil
@@ -448,6 +514,7 @@ func findPart(e *message.Entity, path, want string, depth int) *message.Entity {
 				return got
 			}
 		}
+		return nil
 	}
 	if path == "" {
 		path = "1"
@@ -480,7 +547,8 @@ func (c *Cache) storePDF(ctx context.Context, sha string, r PDFResult, record bo
 		if first && record {
 			if _, err := tx.ExecContext(ctx, `
 INSERT INTO pdf_text (sha256, status, text, truncated, pages_capped, updated_at) VALUES (?, ?, ?, ?, ?, ?)
-ON CONFLICT (sha256) DO NOTHING`, sha, r.Status, text, b2i(trunc), b2i(r.PagesCapped), c.now().Unix()); err != nil {
+ON CONFLICT (sha256) DO UPDATE SET status = excluded.status, text = excluded.text, truncated = excluded.truncated,
+	pages_capped = excluded.pages_capped, updated_at = excluded.updated_at WHERE pdf_text.status = 'pending'`, sha, r.Status, text, b2i(trunc), b2i(r.PagesCapped), c.now().Unix()); err != nil {
 				_ = tx.Rollback()
 				return longest, fmt.Errorf("record pdf text: %w", err)
 			}

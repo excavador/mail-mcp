@@ -11,6 +11,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 	"unicode/utf8"
@@ -20,7 +21,7 @@ var hashRE = regexp.MustCompile(`^[0-9a-f]{64}$`)
 
 // Config configures a Runner.
 type Config struct {
-	// Root is the read-only blob store root. A blob is Root/pdf/<hh>/<hash>.
+	// Root is the read-only store root. A file is Root/pdf/<hh>/<hash>.
 	Root string
 	// Program is the pdftotext binary (default "pdftotext").
 	Program string
@@ -140,7 +141,19 @@ func (r *Runner) run(ctx context.Context, path string) Response {
 		return Response{Status: StatusFailed}
 	}
 	pgid := cmd.Process.Pid
-	kill := func() { _ = syscall.Kill(-pgid, syscall.SIGKILL) }
+	// kill never signals a reaped child: after Wait the group id could be
+	// reused, so reaped is set under the same lock the kill takes.
+	var (
+		mu     sync.Mutex
+		reaped bool
+	)
+	kill := func() {
+		mu.Lock()
+		defer mu.Unlock()
+		if !reaped {
+			_ = syscall.Kill(-pgid, syscall.SIGKILL)
+		}
+	}
 
 	// The wall-clock limit: kill the whole process group when ctx ends.
 	done := make(chan struct{})
@@ -164,8 +177,10 @@ func (r *Runner) run(ctx context.Context, path string) Response {
 		_, _ = io.Copy(io.Discard, io.LimitReader(out, 1<<20))
 	}
 	werr := cmd.Wait()
+	mu.Lock()
+	reaped = true
+	mu.Unlock()
 	close(done)
-	kill() // any stragglers in the group
 
 	timedOut := ctx.Err() != nil
 	if timedOut && !truncated {

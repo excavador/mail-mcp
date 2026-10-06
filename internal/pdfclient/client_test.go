@@ -136,7 +136,7 @@ func TestStatusesAndBreaker(t *testing.T) {
 	for _, tc := range []struct {
 		status string
 		trips  bool
-	}{{"ok", false}, {"too_large", false}, {"not_pdf", false}, {"failed", true}, {"timeout", true}} {
+	}{{"ok", false}, {"too_large", false}, {"not_pdf", false}, {"failed", false}, {"timeout", false}} {
 		sock, _ := fakeSidecar(t, func(string) *response { return &response{Status: tc.status} })
 		c := New(sock)
 		for i := 0; i < 5; i++ {

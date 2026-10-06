@@ -48,7 +48,7 @@ func decodeName(s string) string {
 			s = d
 		}
 	}
-	return capField(strings.ToValidUTF8(s, ""))
+	return capField(stripC0(strings.ToValidUTF8(s, "")))
 }
 
 // extractAttachments walks the MIME tree of raw and reports every attachment
