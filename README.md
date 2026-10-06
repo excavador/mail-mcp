@@ -69,6 +69,7 @@ openssl s_client -starttls imap -connect 127.0.0.1:143 </dev/null | \
 | `--read-resource-url` | `READ_RESOURCE_URL` | yes | http |
 | `--admin-resource-url` | `ADMIN_RESOURCE_URL` | yes | http |
 | `--scope` | `SCOPE` | no; default `openid` | http |
+| `--pdf-extractor-socket` | `PDF_EXTRACTOR_SOCKET` | no; empty (default) turns PDF text off | all |
 
 The read and admin resource URLs must differ — that difference is the whole
 point, so that sluis can mint 7-day tokens for the read endpoint and shorter
@@ -95,6 +96,96 @@ v1 will add organising tools and history, guarded by intent approval:
 ### Approval mode
 
 `--approval-mode` (`APPROVAL_MODE`, chart `approval.mode`) sets how `apply_intent` is approved. `client` (default) never elicits: approval is the client's own tool-approval prompt, which shows the account, action, source, target and count, and an apply of more than `--max-unelicited-apply` (50) messages is refused. `elicitation` asks the owner through MCP elicitation forms; use it once the Claude Code VS Code extension renders them ([anthropics/claude-code#98978](https://github.com/anthropics/claude-code/issues/98978)).
+
+## PDF attachment text
+
+With a PDF extractor configured, search finds words inside PDF attachments
+(an invoice by its number, a contract by a clause), and `fetch_message` and
+`get_thread` (`format=full`) return the extracted text. Without one, nothing
+about PDFs changes: attachment names, types and sizes only.
+
+**mail-mcp contains no PDF parser, and will not.** Parsing untrusted PDFs in
+the server process was removed after a security review (decompression bombs,
+page-tree loops, text amplification). The parsing happens in a sidecar
+container (`ghcr.io/excavador/mail-mcp-pdftext`: poppler's `pdftotext` behind
+a small static Go helper, `cmd/pdftext`) that can be killed at any time.
+
+### Threat model
+
+A PDF is attacker-controlled input, and so is the text that comes out of it.
+What this design assumes and does about it:
+
+- **The parser is compromised or runs away.** It runs in its own container
+  with a read-only root file system, no capabilities, the default seccomp
+  profile, a 512 Mi memory limit and one CPU. It sees the blob store read-only
+  and nothing else writable but the socket directory. It has no credentials:
+  the mail-mcp pod's secrets are mounted in the main container only.
+- **One file must not hurt the next.** The helper starts one `pdftotext` per
+  request and kills its whole process group after 20 s of wall time. Before
+  it execs, the child applies `RLIMIT_CPU` 15 s, `RLIMIT_AS` 400 MB,
+  `RLIMIT_NPROC` 1, `RLIMIT_FSIZE` 0 (it cannot write a file), `RLIMIT_NOFILE`
+  16 and `RLIMIT_CORE` 0. They are applied by a limit-and-exec re-exec of the
+  helper rather than by `prlimit` on a started child, because that would leave
+  a window in which the parser runs unlimited.
+- **The client cannot steer the helper.** A request is `{"hash": ...}`. The
+  hash must be 64 lowercase hex characters; the helper builds the path itself
+  under its read-only mount (`pdf/<hh>/<hash>`), does not follow symlinks, and
+  accepts only regular files that start with `%PDF-`. Input over 25 MB is
+  refused before anything is spawned. At most 2 jobs run at once.
+- **Output amplification.** At most 1 MiB is read from `pdftotext` (then it is
+  killed), cut on a UTF-8 boundary and flagged `truncated`; only the first 30
+  pages are read (`pages_capped`: the file has at least that many). mail-mcp
+  keeps at most 256 KiB per file.
+- **The text is hostile.** It reaches the model like a body does: control
+  characters are stripped, and `fetch_message` / `get_thread` return it under
+  `attachment_text`, each fenced in `<untrusted-email-content nonce=...>` with
+  the same per-call nonce as the body (a closing tag inside it is defanged),
+  capped at 32 KiB per attachment and 64 KiB per message (16 KiB per message in
+  `get_thread`). Search snippets that come from a PDF are treated like body
+  snippets.
+- **A sick sidecar.** The client has a pool of 2, a 25 s deadline per call
+  and a circuit breaker: after 5 consecutive failures it stops calling for a
+  minute and then probes. Errors have fixed texts and never echo input.
+
+What it does not protect against: a bug in poppler that gives code execution
+inside the sidecar. The container limits are there for that case; the sidecar
+can still read the mail blobs it is mounted with. It is not OCR: a scanned PDF
+without a text layer yields no text.
+
+### How it works
+
+The `pdf_text` job runs last in the background scheduler, never touches IMAP,
+and writes in short transactions like the other jobs. It walks the PDF
+attachments (content type `application/pdf` or a `.pdf` name), takes each
+decoded attachment out of its message blob (MIME decoding, no PDF code), stages
+it at `<cache>/pdf/<hh>/<sha256>` for the sidecar, and removes it again. The
+outcome of every file (`ok`, `timeout`, `too_large`, `failed`, `not_pdf`) is
+cached in the `pdf_text` table by the file's SHA-256, so a hostile file is never
+retried and a PDF forwarded a hundred times is extracted once. The text is
+written into `attachment_fts`, which search already queries, so no query syntax
+changes. `cache_status` reports it as `pdf_text_job`. New mail is picked up by
+a rescan every 10 minutes.
+
+### Enabling it
+
+Helm chart:
+
+```yaml
+pdfExtractor:
+  enabled: true
+```
+
+This adds the `pdftext` sidecar (image tag defaults to the chart's appVersion,
+so it is released with mail-mcp), a 1 Mi `emptyDir` for the socket shared with
+the main container, the cache volume mounted read-only into the sidecar, and
+`PDF_EXTRACTOR_SOCKET` on the main container. Both containers must run as the
+same uid (the chart's `podSecurityContext` does this): the store is owner-only.
+The sidecar needs no network access.
+
+Without the chart: run `pdftext --socket /run/pdftext/pdftext.sock --root
+<cache dir>` with the cache directory mounted read-only, and start mail-mcp with
+`--pdf-extractor-socket /run/pdftext/pdftext.sock`. The image is built from
+`cmd/pdftext/Dockerfile` (build context: the repository root).
 
 ## What it will not do
 

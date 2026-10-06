@@ -68,7 +68,33 @@ chart:
         {{auth_values}} --set auth.scope=openid+mail \
       | grep -A1 'name: SCOPE' | grep -q '"openid+mail"' \
       || (echo "FAIL: auth.scope did not override SCOPE"; exit 1)
-    @echo "chart ok: renders, refuses missing values (including auth and accounts), equal resource URLs, and unknown keys, annotates the Deployment, and wires auth.scope"
+    @# pdfExtractor is off by default: no sidecar, no socket variable, no socket volume.
+    @! helm template t charts/mail-mcp --set accounts.existingSecret=x {{auth_values}} \
+      | grep -q -E 'pdftext|PDF_EXTRACTOR_SOCKET' \
+      || (echo "FAIL: pdf sidecar rendered while pdfExtractor.enabled is false"; exit 1)
+    @# enabled: the sidecar, its strict securityContext and limits, the read-only
+    @# store mount, the socket volume with a size limit, and the flag on the main container.
+    @helm template t charts/mail-mcp --set accounts.existingSecret=x {{auth_values}} --set pdfExtractor.enabled=true > /tmp/mail-mcp-chart-pdf.yaml
+    @grep -q 'name: pdftext$' /tmp/mail-mcp-chart-pdf.yaml || (echo "FAIL: no pdftext container"; exit 1)
+    @grep -q 'image: "ghcr.io/excavador/mail-mcp-pdftext:1.1.0"' /tmp/mail-mcp-chart-pdf.yaml || (echo "FAIL: sidecar image does not default to appVersion"; exit 1)
+    @grep -A1 'name: PDF_EXTRACTOR_SOCKET' /tmp/mail-mcp-chart-pdf.yaml | grep -q '/run/pdftext/pdftext.sock' || (echo "FAIL: main container lacks PDF_EXTRACTOR_SOCKET"; exit 1)
+    @awk '/- name: pdftext$/,/^      volumes:/' /tmp/mail-mcp-chart-pdf.yaml > /tmp/mail-mcp-chart-pdf-side.yaml
+    @for want in 'runAsNonRoot: true' 'allowPrivilegeEscalation: false' 'readOnlyRootFilesystem: true' 'drop: \["ALL"\]' 'type: RuntimeDefault' 'memory: 512Mi' 'cpu: "1"' 'readOnly: true'; do \
+        grep -q -E "$want" /tmp/mail-mcp-chart-pdf-side.yaml || { echo "FAIL: sidecar lacks $want"; exit 1; }; done
+    @grep -q 'sizeLimit: 1Mi' /tmp/mail-mcp-chart-pdf.yaml || (echo "FAIL: socket emptyDir has no sizeLimit"; exit 1)
+    @# the sidecar mounts the cache read-only: the cache mount in the sidecar block must say so
+    @awk '/- name: cache$/{getline a; getline b; print a b}' /tmp/mail-mcp-chart-pdf-side.yaml | grep -q 'readOnly: true' || (echo "FAIL: sidecar cache mount is not read-only"; exit 1)
+    @# tag override, and bad values are refused
+    @helm template t charts/mail-mcp --set accounts.existingSecret=x {{auth_values}} --set pdfExtractor.enabled=true \
+        --set pdfExtractor.image.tag=9.9.9 | grep -q 'mail-mcp-pdftext:9.9.9' || (echo "FAIL: pdfExtractor.image.tag ignored"; exit 1)
+    @! helm template t charts/mail-mcp --set accounts.existingSecret=x {{auth_values}} --set pdfExtractor.enabled=maybe >/dev/null 2>&1 \
+        || (echo "FAIL: accepted a non-boolean pdfExtractor.enabled"; exit 1)
+    @! helm template t charts/mail-mcp --set accounts.existingSecret=x {{auth_values}} --set pdfExtractor.typo=1 >/dev/null 2>&1 \
+        || (echo "FAIL: accepted an unknown pdfExtractor key"; exit 1)
+    @! helm template t charts/mail-mcp --set accounts.existingSecret=x {{auth_values}} --set pdfExtractor.enabled=true \
+        --set pdfExtractor.resources.limits=null >/dev/null 2>&1 \
+        || (echo "FAIL: accepted a pdf sidecar without a memory limit"; exit 1)
+    @echo "chart ok: renders, refuses missing values (including auth and accounts), equal resource URLs, and unknown keys, annotates the Deployment, wires auth.scope, and renders the PDF sidecar only when enabled, strictly confined"
 
 # What the release will build, without publishing.
 #

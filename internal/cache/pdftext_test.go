@@ -258,7 +258,9 @@ func TestPDFTextJobRestartSafeAndRecordsOutcomes(t *testing.T) {
 
 type extractorFunc func(context.Context, string) (PDFResult, error)
 
-func (f extractorFunc) Extract(ctx context.Context, sha string) (PDFResult, error) { return f(ctx, sha) }
+func (f extractorFunc) Extract(ctx context.Context, sha string) (PDFResult, error) {
+	return f(ctx, sha)
+}
 
 func TestPDFTextRepeatedTransportFailureIsRecordedAsFailed(t *testing.T) {
 	c := openCache(t)

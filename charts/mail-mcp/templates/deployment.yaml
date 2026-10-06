@@ -54,6 +54,11 @@ spec:
               value: /var/cache/mail-mcp/store
             - name: HISTORY_DIR
               value: /var/lib/mail-mcp/history/data
+            {{- if .Values.pdfExtractor.enabled }}
+            # The PDF sidecar's socket; empty (the default) means no PDF text.
+            - name: PDF_EXTRACTOR_SOCKET
+              value: /run/pdftext/pdftext.sock
+            {{- end }}
           ports:
             - name: http
               containerPort: {{ .Values.service.port }}
@@ -80,6 +85,40 @@ spec:
               mountPath: /var/lib/mail-mcp/history
             - name: tmp
               mountPath: /tmp
+            {{- if .Values.pdfExtractor.enabled }}
+            - name: pdftext-socket
+              mountPath: /run/pdftext
+            {{- end }}
+        {{- if .Values.pdfExtractor.enabled }}
+        # PDF text extraction runs here, not in mail-mcp: poppler parses
+        # untrusted files, so it gets its own container with no network use,
+        # a read-only view of the store, hard limits, and nothing writable
+        # but the socket directory. The helper kills each pdftotext it starts
+        # after 20 s and applies rlimits to it; this container is the second
+        # wall (memory limit, no capabilities, seccomp).
+        - name: pdftext
+          image: "{{ .Values.pdfExtractor.image.registry }}/{{ .Values.pdfExtractor.image.repository }}:{{ .Values.pdfExtractor.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.pdfExtractor.image.pullPolicy }}
+          args:
+            - --socket=/run/pdftext/pdftext.sock
+            # The whole cache volume is mounted read-only (not a subPath: the
+            # kubelet would create a missing "store" directory as root and
+            # mail-mcp could then not own it); blobs are under store/pdf/.
+            - --root=/var/cache/mail-mcp/store
+          securityContext:
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: ["ALL"]}
+            seccompProfile: {type: RuntimeDefault}
+          resources: {{- toYaml .Values.pdfExtractor.resources | nindent 12 }}
+          volumeMounts:
+            - name: cache
+              mountPath: /var/cache/mail-mcp
+              readOnly: true
+            - name: pdftext-socket
+              mountPath: /run/pdftext
+        {{- end }}
       volumes:
         - name: accounts
           secret:
@@ -100,6 +139,11 @@ spec:
           {{- end }}
         - name: tmp
           emptyDir: {}
+        {{- if .Values.pdfExtractor.enabled }}
+        - name: pdftext-socket
+          emptyDir:
+            sizeLimit: 1Mi
+        {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector: {{- toYaml . | nindent 8 }}
       {{- end }}
