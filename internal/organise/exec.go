@@ -243,18 +243,29 @@ func (o *Organiser) Apply(ctx context.Context, a accounts.Account, p *Preview) (
 		return out, nil
 	}
 	// Messages already in the target stay out of Touched: undo would otherwise
-	// pull them out of a place they were in before this apply.
+	// pull them out of a place they were in before this apply. For a move the
+	// cache says which; for a label the target folder is re-read from the
+	// server first (below), so a label added since the last refresh is not
+	// mistaken for ours.
 	var actIDs []string
 	for id := range acting {
 		actIDs = append(actIDs, id)
 	}
-	inTarget, err := o.store.MembersByID(ctx, p.Account, in.Target, actIDs)
-	if err != nil {
-		return out, err
-	}
 	already := map[string]bool{}
-	for _, m := range inTarget {
-		already[m.StableID] = true
+	loadAlready := func() error {
+		inTarget, err := o.store.MembersByID(ctx, p.Account, in.Target, actIDs)
+		if err != nil {
+			return err
+		}
+		for _, m := range inTarget {
+			already[m.StableID] = true
+		}
+		return nil
+	}
+	if in.Action == ActionMove {
+		if err := loadAlready(); err != nil {
+			return out, err
+		}
 	}
 
 	// The IMAP part runs under imapx.Do: a server that stops answering costs
@@ -290,8 +301,22 @@ func (o *Organiser) Apply(ctx context.Context, a accounts.Account, p *Preview) (
 		if !ok {
 			return ErrTargetMissing
 		}
-		if isSpecialUse(dstAttrs) {
+		if in.Action != ActionUnlabel && isSpecialUse(dstAttrs) {
 			return ErrSpecialUse
+		}
+		if in.Action == ActionUnlabel && isSpecialUse(srcAttrs) {
+			return ErrSpecialUse
+		}
+		if in.Action == ActionLabel {
+			// Which of these messages already carry the label, as the server
+			// has it now: undo must never remove what was there before.
+			imapx.SetPhase(ctx, "refresh_target")
+			if _, err := o.store.RefreshFolders(ctx, c, a, []string{in.Target}); err != nil {
+				return err
+			}
+			if err := loadAlready(); err != nil {
+				return err
+			}
 		}
 
 		// SELECT, not EXAMINE: this is the one place the server writes.
@@ -360,6 +385,13 @@ func (o *Organiser) Apply(ctx context.Context, a accounts.Account, p *Preview) (
 			return nil
 		}
 
+		if in.Action == ActionUnlabel {
+			return o.unlabel(ctx, c, a, in.Criterion.Folder, members, func(t Touched) {
+				mu.Lock()
+				touched = append(touched, t)
+				mu.Unlock()
+			})
+		}
 		if len(members) > 0 {
 			if err := run(members, in.Action, &touched, &alreadyDone, already); err != nil {
 				return err
@@ -400,6 +432,49 @@ func (o *Organiser) Apply(ctx context.Context, a accounts.Account, p *Preview) (
 		return out, fmt.Errorf("%w (after %d of %d messages)", actErr, len(out.Touched)+len(out.AlreadyInTarget)+len(out.CopiedBack), len(members)+len(copyBack))
 	}
 	return out, nil
+}
+
+// unlabel removes label from the messages ms, which sit in it (the folder is
+// SELECTed). Gmail, with X-GM-EXT-1: STORE -X-GM-LABELS, which changes the one
+// label and nothing else (no EXPUNGE, so a message never reaches the Trash
+// whatever the account's IMAP deletion settings). Otherwise (Proton Bridge, a
+// label is a folder holding a copy): mark those UIDs \Deleted and UID EXPUNGE
+// exactly them, which removes the copy from the label folder only. That needs
+// UIDPLUS; without it a plain EXPUNGE could take other messages the folder has
+// flagged, so it refuses.
+func (o *Organiser) unlabel(ctx context.Context, c *imapclient.Client, a accounts.Account, label string, ms []uidMember, done func(Touched)) error {
+	gmail := a.Provider == accounts.Gmail && c.Caps().Has(imap.CapGmailExt1)
+	if !gmail && !c.Caps().Has(imap.CapUIDPlus) {
+		return SafeError("the server does not advertise UIDPLUS; refusing to remove a label by expunge")
+	}
+	for start := 0; start < len(ms); start += chunkUIDs {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		chunk := ms[start:min(start+chunkUIDs, len(ms))]
+		uids := make([]imap.UID, len(chunk))
+		for i, m := range chunk {
+			uids[i] = m.uid
+		}
+		set := imap.UIDSetNum(uids...)
+		imapx.SetPhase(ctx, "unlabel")
+		if gmail {
+			if err := c.StoreGmailLabels(set, imap.StoreFlagsDel, []string{label}, true).Close(); err != nil {
+				return err
+			}
+		} else {
+			if err := c.Store(set, &imap.StoreFlags{Op: imap.StoreFlagsAdd, Silent: true, Flags: []imap.Flag{imap.FlagDeleted}}, nil).Close(); err != nil {
+				return err
+			}
+			if err := c.UIDExpunge(set).Close(); err != nil {
+				return err
+			}
+		}
+		for _, m := range chunk {
+			done(Touched{StableID: m.id, FromFolder: label})
+		}
+	}
+	return nil
 }
 
 type uidMember struct {

@@ -573,3 +573,39 @@ func TestPreviewSucceedsAfterNoteFolderWithoutARefresh(t *testing.T) {
 		t.Errorf("PreviewIDs after NoteFolder: %v", err)
 	}
 }
+
+func TestValidateTagCriterionAndUnlabelRules(t *testing.T) {
+	in := func(c Criterion, action, target string) Intent {
+		return Intent{Criterion: c, Action: action, Target: target}
+	}
+	// A tag alone is a matcher; its syntax is the tags' syntax, exactly.
+	if err := in(Criterion{Folder: "INBOX", Tag: "purchase"}, ActionLabel, "Work").Validate(accounts.Gmail); err != nil {
+		t.Errorf("tag alone refused: %v", err)
+	}
+	for _, bad := range []string{"Purchase", "has space", "-x", "a*b"} {
+		if err := in(Criterion{Folder: "INBOX", Tag: bad}, ActionLabel, "Work").Validate(accounts.Gmail); err == nil {
+			t.Errorf("tag %q accepted", bad)
+		}
+	}
+	if err := in(Criterion{Folder: "INBOX"}, ActionLabel, "Work").Validate(accounts.Gmail); err != ErrNoMatcher {
+		t.Errorf("no matcher: %v", err)
+	}
+	// unlabel is undo's: Validate (preview_intent) refuses it, CheckMove allows
+	// it for a user label only.
+	if err := in(Criterion{Folder: "Work", From: "a@b"}, ActionUnlabel, "INBOX").Validate(accounts.Gmail); err == nil {
+		t.Error("unlabel accepted from a caller")
+	}
+	for _, tc := range []struct {
+		p       accounts.Provider
+		label   string
+		allowed bool
+	}{
+		{accounts.Gmail, "Purchases/Imported", true}, {accounts.Gmail, "INBOX", false}, {accounts.Gmail, "[Gmail]/Spam", false},
+		{accounts.Proton, "Labels/Purchases", true}, {accounts.Proton, "Folders/x", false}, {accounts.Proton, "INBOX", false},
+	} {
+		err := in(Criterion{Folder: tc.label}, ActionUnlabel, "INBOX").CheckMove(tc.p)
+		if (err == nil) != tc.allowed {
+			t.Errorf("unlabel %s on %s: err = %v, allowed %v", tc.label, tc.p, err, tc.allowed)
+		}
+	}
+}

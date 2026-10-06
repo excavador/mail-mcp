@@ -52,7 +52,9 @@ type options struct {
 	hist          *history.Store
 	org           *organise.Organiser
 	maxUnelicited int
-	approvalMode  ApprovalMode
+	// maxUnelicitedLabel is the cap for label actions (and their undo).
+	maxUnelicitedLabel int
+	approvalMode       ApprovalMode
 }
 
 // ApprovalMode says how apply_intent obtains the owner's approval.
@@ -87,6 +89,14 @@ const DefaultMaxUnelicited = 50
 // client cannot show the owner a confirmation of its own.
 func WithMaxUnelicited(n int) Option { return func(o *options) { o.maxUnelicited = n } }
 
+// DefaultMaxUnelicitedLabel is the largest label apply (or undo of one) a
+// client without elicitation may run. A label adds and never removes, so the
+// cap is larger than the one for a move.
+const DefaultMaxUnelicitedLabel = 1000
+
+// WithMaxUnelicitedLabel sets that cap.
+func WithMaxUnelicitedLabel(n int) Option { return func(o *options) { o.maxUnelicitedLabel = n } }
+
 // WithHistory adds list_history (both modes) and, with WithOrganiser, lets
 // Admin carry the write tools. One store is shared by every server.
 func WithHistory(h *history.Store) Option { return func(o *options) { o.hist = h } }
@@ -98,7 +108,7 @@ func WithOrganiser(g *organise.Organiser) Option { return func(o *options) { o.o
 
 // New builds one MCP server carrying the tools for mode.
 func New(accts []accounts.Account, store *cache.Cache, version string, mode Mode, opts ...Option) *mcp.Server {
-	o := options{maxUnelicited: DefaultMaxUnelicited, approvalMode: ApprovalClient}
+	o := options{maxUnelicited: DefaultMaxUnelicited, maxUnelicitedLabel: DefaultMaxUnelicitedLabel, approvalMode: ApprovalClient}
 	for _, f := range opts {
 		f(&o)
 	}
@@ -126,7 +136,7 @@ func New(accts []accounts.Account, store *cache.Cache, version string, mode Mode
 	// apply_intent, undo and reapply. The Read server cannot be handed them by
 	// any option.
 	if mode == Admin && o.hist != nil && o.org != nil {
-		addWriteTools(s, writeDeps{byName: byName, store: store, hist: o.hist, org: o.org, maxUnelicited: o.maxUnelicited, approvalMode: o.approvalMode})
+		addWriteTools(s, writeDeps{byName: byName, store: store, hist: o.hist, org: o.org, maxUnelicited: o.maxUnelicited, maxUnelicitedLabel: o.maxUnelicitedLabel, approvalMode: o.approvalMode})
 	}
 	return s
 }

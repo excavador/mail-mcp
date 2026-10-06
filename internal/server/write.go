@@ -32,6 +32,9 @@ type writeDeps struct {
 	// maxUnelicited is the most messages apply_intent will change when the
 	// client cannot show the owner a confirmation of its own.
 	maxUnelicited int
+	// maxUnelicitedLabel is the same for action label (and the undo of one):
+	// a label adds and never removes, so it may be larger.
+	maxUnelicitedLabel int
 	// approvalMode decides whether apply_intent may elicit at all.
 	approvalMode ApprovalMode
 }
@@ -106,13 +109,14 @@ type criterionIn struct {
 	SubjectContains string `json:"subject_contains,omitempty" jsonschema:"text contained in the subject"`
 	ListID          string `json:"list_id,omitempty" jsonschema:"List-Id, exact match, case-insensitive"`
 	GitHubReason    string `json:"github_reason,omitempty" jsonschema:"X-GitHub-Reason, exact match, case-insensitive"`
+	Tag             string `json:"tag,omitempty" jsonschema:"a local tag (set with tag_messages): only messages in the folder that carry it; same syntax as tags"`
 	Since           string `json:"since,omitempty" jsonschema:"earliest message date, RFC 3339 or YYYY-MM-DD"`
 	Before          string `json:"before,omitempty" jsonschema:"messages dated before this, RFC 3339 or YYYY-MM-DD"`
 }
 
 type previewIn struct {
 	Account   string      `json:"account" jsonschema:"account name"`
-	Criterion criterionIn `json:"criterion" jsonschema:"which messages; at least one of from, list_id, github_reason, subject_contains, to"`
+	Criterion criterionIn `json:"criterion" jsonschema:"which messages; at least one of from, list_id, github_reason, subject_contains, to, tag"`
 	Target    string      `json:"target" jsonschema:"folder or label to put them in; it must exist (create_folder)"`
 	Action    string      `json:"action" jsonschema:"move (leave the source) or label (keep the source and add the target)"`
 }
@@ -139,6 +143,7 @@ type previewOut struct {
 	Target       string           `json:"target"`
 	Matched      int              `json:"matched"`
 	MoveBack     int              `json:"move_back,omitempty" jsonschema:"undo: messages moved back to their source"`
+	Unlabel      int              `json:"unlabel,omitempty" jsonschema:"undo of a label: messages the label is removed from (only those the apply labelled)"`
 	CopyBack     int              `json:"copy_back,omitempty" jsonschema:"undo: messages copied back to their source because they were already in the target before the apply, so they keep it"`
 	NotFound     int              `json:"not_found,omitempty" jsonschema:"undo: recorded messages no longer in the folder"`
 	Sampled      int              `json:"sampled"`
@@ -154,7 +159,11 @@ func previewResult(p *organise.Preview) previewOut {
 		Untrusted: previewUntrusted{Samples: []sampleOut{}},
 	}
 	if p.Kind == organise.KindUndo {
-		out.MoveBack = len(p.IDs)
+		if p.Intent.Action == organise.ActionUnlabel {
+			out.Unlabel = len(p.IDs)
+		} else {
+			out.MoveBack = len(p.IDs)
+		}
 	}
 	for _, h := range p.Samples {
 		out.Untrusted.Samples = append(out.Untrusted.Samples, sampleOut{
@@ -173,11 +182,17 @@ func (c criterionIn) toIntent(account, target, action string) (organise.Intent, 
 	if err != nil {
 		return organise.Intent{}, err
 	}
+	tag := c.Tag
+	if tag != "" {
+		if tag, err = cache.NormalizeTag(tag); err != nil {
+			return organise.Intent{}, err
+		}
+	}
 	return organise.Intent{
 		Account: account, Target: target, Action: action,
 		Criterion: organise.Criterion{
 			Folder: c.Folder, From: c.From, To: c.To, SubjectContains: c.SubjectContains, ListID: c.ListID,
-			GitHubReason: c.GitHubReason, Since: since, Before: before,
+			GitHubReason: c.GitHubReason, Tag: tag, Since: since, Before: before,
 		},
 	}, nil
 }
@@ -189,7 +204,11 @@ func addPreviewIntent(s *mcp.Server, d writeDeps) {
 			"happen to them, and a preview token. Nothing changes. Show the owner the count and samples; only " +
 			"apply_intent with the token (and the owner's approval) changes anything. Gmail: move = UID MOVE " +
 			"(removes the source label, adds the target), label = copy (keeps the source). Proton: move needs a " +
-			"Folders/... target, label a Labels/... target.",
+			"Folders/... target, label a Labels/... target. criterion.tag selects the messages of the folder that " +
+			"carry a local tag (set by tag_messages), ANDed with the other criteria; it needs the folder like the rest. " +
+			"A label adds only and is undoable (undo removes the label from just the messages that apply labelled, " +
+			"never from one that had it before), so a client without elicitation may apply it to more messages " +
+			"than a move.",
 		// Read-only in effect (cache only); registered on the admin server only.
 		Annotations: readOnly(),
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, in previewIn) (*mcp.CallToolResult, previewOut, error) {
@@ -228,7 +247,7 @@ type applyIn struct {
 	// approval prompt, which shows a tool call's arguments, shows the owner
 	// what is about to happen and not just an opaque token.
 	ExpectAccount string `json:"expect_account" jsonschema:"the account, as the preview shows it"`
-	ExpectAction  string `json:"expect_action" jsonschema:"move or label, as the preview shows it"`
+	ExpectAction  string `json:"expect_action" jsonschema:"move, label or unlabel (undo of a label), as the preview shows it"`
 	ExpectSource  string `json:"expect_source" jsonschema:"the source folder, as the preview shows it"`
 	ExpectTarget  string `json:"expect_target" jsonschema:"the target folder, as the preview shows it"`
 	ExpectMatched int    `json:"expect_matched" jsonschema:"the matched count, as the preview shows it"`
@@ -312,9 +331,9 @@ func clientElicits(req *mcp.CallToolRequest) bool {
 // maxUnelicited messages and recorded as "client-tool-approval".
 func approve(ctx context.Context, req *mcp.CallToolRequest, d writeDeps, p *organise.Preview) (by string, pending *mcp.CallToolResult, err error) {
 	if d.approvalMode != ApprovalElicitation || !clientElicits(req) {
-		if p.Matched > d.maxUnelicited {
+		if limit := d.unelicitedLimit(p.Intent.Action); p.Matched > limit {
 			return "", nil, organise.SafeError(fmt.Sprintf(
-				"more than %d messages cannot be applied on the client's tool approval alone", d.maxUnelicited))
+				"more than %d messages cannot be applied on the client's tool approval alone (%s)", limit, p.Intent.Action))
 		}
 		return history.ApprovedClientTool, nil, nil
 	}
@@ -381,6 +400,9 @@ func warnings(d writeDeps, p *organise.Preview) []string {
 		w = append(w, "moves mail OUT OF INBOX")
 	}
 	applied, created := d.hist.TargetHistory(p.Account, p.Intent.Target)
+	if p.Intent.Action == organise.ActionUnlabel {
+		return w // nothing is put in the target: it is where the messages stay
+	}
 	if !applied || (!created.IsZero() && time.Since(created) < newTargetWindow) {
 		w = append(w, "target folder is new")
 	}
@@ -401,7 +423,7 @@ func elicitMessage(d writeDeps, p *organise.Preview) string {
 	c := in.Criterion
 	for _, kv := range [][2]string{
 		{"from", c.From}, {"to", c.To}, {"subject contains", c.SubjectContains},
-		{"list-id", c.ListID}, {"github reason", c.GitHubReason},
+		{"list-id", c.ListID}, {"github reason", c.GitHubReason}, {"tag", c.Tag},
 	} {
 		if kv[1] != "" {
 			fmt.Fprintf(&b, "Criterion %s: %s\n", kv[0], field(kv[1]))
@@ -422,13 +444,23 @@ func elicitMessage(d writeDeps, p *organise.Preview) string {
 	return b.String()
 }
 
+// unelicitedLimit is how many messages an apply of action may change on the
+// client's own tool approval: label (add only) and its undo get the larger cap.
+func (d writeDeps) unelicitedLimit(action string) int {
+	if action == organise.ActionLabel || action == organise.ActionUnlabel {
+		return d.maxUnelicitedLabel
+	}
+	return d.maxUnelicited
+}
+
 func applyDescription(d writeDeps) string {
 	desc := "Execute a previewed intent (from preview_intent, undo or reapply) after the owner approves it. " +
 		"It acts only on messages that were in the preview AND still match, so mail that arrived since is never " +
 		"touched, and it never deletes. Requires approved=true. Recorded in the history, from which it can be undone."
 	if d.approvalMode != ApprovalElicitation {
 		desc += fmt.Sprintf(" Approval is the client's own tool-approval prompt, which must show the account, action, "+
-			"source, target and count (restate them in the expect_* fields); above %d messages the apply is refused.", d.maxUnelicited)
+			"source, target and count (restate them in the expect_* fields); above %d messages the apply is refused "+
+			"(for label, and the undo of a label: above %d).", d.maxUnelicited, d.maxUnelicitedLabel)
 	}
 	return desc
 }
@@ -599,7 +631,7 @@ func cleanIntent(in *organise.Intent) *organise.Intent {
 	c.Account, c.Target, c.Action = field(c.Account), field(c.Target), field(c.Action)
 	c.Criterion.Folder, c.Criterion.From, c.Criterion.To = field(c.Criterion.Folder), field(c.Criterion.From), field(c.Criterion.To)
 	c.Criterion.SubjectContains, c.Criterion.ListID = field(c.Criterion.SubjectContains), field(c.Criterion.ListID)
-	c.Criterion.GitHubReason = field(c.Criterion.GitHubReason)
+	c.Criterion.GitHubReason, c.Criterion.Tag = field(c.Criterion.GitHubReason), field(c.Criterion.Tag)
 	return &c
 }
 
@@ -652,9 +684,12 @@ type historyIDIn struct {
 func addUndo(s *mcp.Server, d writeDeps) {
 	mcp.AddTool(s, &mcp.Tool{
 		Name: "undo",
-		Description: "Preview reversing an applied move: the messages it moved go back to where they came from, found " +
-			"by stable id so it works after UIDs changed. Returns a preview token; apply_intent executes it, with " +
-			"the owner's approval. Undo of a label action is not supported yet. Local changes are different: " +
+		Description: "Preview reversing an applied move or label. Move: the messages it moved go back to where they " +
+			"came from, found by stable id so it works after UIDs changed. Label: the label is removed from exactly " +
+			"the messages that intent labelled (Gmail: STORE -X-GM-LABELS; Proton: the copy in the Labels/... folder " +
+			"is expunged by UID) and never from a message that already had it before the intent; the preview's " +
+			"action is unlabel. Returns a preview token; apply_intent executes it, with " +
+			"the owner's approval. Local changes are different: " +
 			"undo of tag_messages, untag_messages or set_sender_kind takes effect at once (no preview token, no mailbox " +
 			"access) and the result says what was restored.",
 		// Only previews (and re-reads the target folder) for an intent;
@@ -684,8 +719,8 @@ func undoIntent(ctx context.Context, d writeDeps, rec history.Record) (previewOu
 		if (rec.Kind != organise.KindApply && rec.Kind != organise.KindReapply) || rec.Intent == nil {
 			return previewOut{}, errors.New("only an applied intent can be undone")
 		}
-		if rec.Action != organise.ActionMove {
-			return previewOut{}, errors.New("undo of label not supported yet")
+		if rec.Action != organise.ActionMove && rec.Action != organise.ActionLabel {
+			return previewOut{}, errors.New("only a move or a label can be undone")
 		}
 		a, err := account(d.byName, rec.Account)
 		if err != nil {
@@ -693,6 +728,9 @@ func undoIntent(ctx context.Context, d writeDeps, rec history.Record) (previewOu
 		}
 		if d.hist.Undone(rec.ID) {
 			return previewOut{}, errors.New("that record was already undone")
+		}
+		if rec.Action == organise.ActionLabel {
+			return undoLabel(ctx, d, a, rec)
 		}
 		folders := map[string]bool{}
 		for f := range rec.Touched {
@@ -768,6 +806,58 @@ func undoIntent(ctx context.Context, d writeDeps, rec history.Record) (previewOu
 		}
 		return previewResult(p), nil
 	}
+}
+
+// undoLabel previews removing the label an applied label intent added. The
+// record's Touched is exactly the messages that intent labelled; the ones that
+// already carried the label (AlreadyInTarget, found against the server at apply
+// time) are not in it, so they keep it. Messages are found again by stable id
+// (Gmail: X-GM-MSGID) in the label folder after a refresh, so it works after
+// UIDs changed.
+func undoLabel(ctx context.Context, d writeDeps, a accounts.Account, rec history.Record) (previewOut, error) {
+	var ids []string
+	seen := map[string]bool{}
+	for _, list := range rec.Touched {
+		for _, id := range list {
+			if !seen[id] {
+				seen[id] = true
+				ids = append(ids, id)
+			}
+		}
+	}
+	if len(ids) == 0 {
+		return previewOut{}, errors.New("that record labelled nothing; there is nothing to undo")
+	}
+	label := rec.Intent.Target
+	if err := d.org.RefreshFolder(ctx, a, label); err != nil {
+		return previewOut{}, writeFail("undo", err, a.Name)
+	}
+	ms, err := d.store.MembersByID(ctx, a.Name, label, ids)
+	if err != nil {
+		return previewOut{}, fail("undo", "preview failed", err, "account", a.Name)
+	}
+	var found []string
+	got := map[string]bool{}
+	for _, m := range ms {
+		if !got[m.StableID] {
+			got[m.StableID] = true
+			found = append(found, m.StableID)
+		}
+	}
+	if len(found) == 0 {
+		return previewOut{}, errors.New("none of those messages carry the label any more")
+	}
+	rev := organise.Intent{
+		Account:   a.Name,
+		Criterion: organise.Criterion{Folder: label},
+		Target:    rec.Intent.Criterion.Folder,
+		Action:    organise.ActionUnlabel,
+	}
+	p, err := d.org.PreviewIDs(ctx, a, rev, found, nil, len(ids)-len(found), rec.ID)
+	if err != nil {
+		return previewOut{}, previewFail("undo", err, a.Name)
+	}
+	return previewResult(p), nil
 }
 
 func addReapply(s *mcp.Server, d writeDeps) {

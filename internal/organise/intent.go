@@ -9,8 +9,9 @@
 // intersection of that set and what still matches.
 //
 // There is no delete here and there will not be one: nothing in this package
-// sends EXPUNGE, STORE \Deleted, DELETE or RENAME. The only writes are
-// CREATE, UID MOVE and UID COPY.
+// sends DELETE or RENAME, and the one EXPUNGE is the UID EXPUNGE that undoes a
+// label (see unlabel), of exactly the label copies that apply added. The writes
+// are CREATE, UID MOVE, UID COPY, and that removal.
 package organise
 
 import (
@@ -21,6 +22,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/excavador/mail-mcp/internal/accounts"
+	"github.com/excavador/mail-mcp/internal/cache"
 )
 
 // Actions. What each does depends on the provider; callers state the intent
@@ -28,6 +30,11 @@ import (
 const (
 	ActionMove  = "move"  // leave the source folder, land in the target
 	ActionLabel = "label" // land in the target, stay in the source
+	// ActionUnlabel is undo of a label: the messages are removed from the
+	// label folder (Folder), and stay wherever else they are. It is only ever
+	// built by undo; preview_intent refuses it. For it Target is the folder the
+	// messages were labelled from, shown to the owner, and nothing is added to it.
+	ActionUnlabel = "unlabel"
 )
 
 // Kinds of preview (and of history records that execute one).
@@ -43,7 +50,8 @@ const maxIntentMessages = 50000
 
 // Criterion selects messages in one folder. Fields are ANDed; at least one of
 // From, ListID, GitHubReason, SubjectContains or To is required, so an intent
-// can never mean "everything in the folder".
+// can never mean "everything in the folder". Tag is a local mail-mcp tag
+// (tag_messages): it selects the cached messages that carry it.
 type Criterion struct {
 	Folder          string    `json:"folder"`
 	From            string    `json:"from,omitempty"`
@@ -51,6 +59,7 @@ type Criterion struct {
 	SubjectContains string    `json:"subject_contains,omitempty"`
 	ListID          string    `json:"list_id,omitempty"`
 	GitHubReason    string    `json:"github_reason,omitempty"`
+	Tag             string    `json:"tag,omitempty"`
 	Since           time.Time `json:"since,omitzero"`
 	Before          time.Time `json:"before,omitzero"`
 }
@@ -72,7 +81,7 @@ func (e SafeError) Error() string { return string(e) }
 
 // Refusals with fixed text.
 var (
-	ErrNoMatcher      = SafeError("criterion needs at least one of from, list_id, github_reason, subject_contains, to")
+	ErrNoMatcher      = SafeError("criterion needs at least one of from, list_id, github_reason, subject_contains, to, tag")
 	ErrTooManyMatched = SafeError("too many messages match (limit 50000); narrow the criterion")
 	ErrUIDValidity    = SafeError("a folder was reset on the server (UIDVALIDITY changed); refresh the cache and preview again")
 	ErrNoMoveCap      = SafeError("the server does not advertise MOVE; refusing to move")
@@ -91,8 +100,16 @@ func (in Intent) Validate(p accounts.Provider) error {
 	if err := checkName(c.Folder); err != nil {
 		return SafeError("source folder: " + err.Error())
 	}
-	if c.From == "" && c.ListID == "" && c.GitHubReason == "" && c.SubjectContains == "" && c.To == "" {
+	if c.From == "" && c.ListID == "" && c.GitHubReason == "" && c.SubjectContains == "" && c.To == "" && c.Tag == "" {
 		return ErrNoMatcher
+	}
+	if c.Tag != "" {
+		if n, err := cache.NormalizeTag(c.Tag); err != nil || n != c.Tag {
+			return SafeError("criterion tag: " + cache.ErrBadTag.Error())
+		}
+	}
+	if in.Action == ActionUnlabel {
+		return SafeError("unlabel is only produced by undo")
 	}
 	for _, s := range []string{c.From, c.To, c.SubjectContains, c.ListID, c.GitHubReason} {
 		if len(s) > 256 || !utf8.ValidString(s) || strings.ContainsFunc(s, unicode.IsControl) {
@@ -106,6 +123,9 @@ func (in Intent) Validate(p accounts.Provider) error {
 // intent. It is separate from Validate because undo builds an intent from an
 // explicit set of ids and has no matcher.
 func (in Intent) CheckMove(p accounts.Provider) error {
+	if in.Action == ActionUnlabel {
+		return in.checkUnlabel(p)
+	}
 	if in.Action != ActionMove && in.Action != ActionLabel {
 		return refusef("action must be %q or %q", ActionMove, ActionLabel)
 	}
@@ -142,6 +162,30 @@ func (in Intent) CheckMove(p accounts.Provider) error {
 			return SafeError("on Proton, move needs a Folders/... target (or INBOX or Archive); use label for Labels/...")
 		case in.Action == ActionLabel && !strings.HasPrefix(dst, "Labels/"):
 			return SafeError("on Proton, label needs a Labels/... target; use move for Folders/...")
+		}
+	}
+	return nil
+}
+
+// checkUnlabel applies the rules of undoing a label: the folder the label is
+// removed from must be a user label (Gmail: not INBOX or [Gmail]/...; Proton:
+// Labels/...). The target is the folder the messages stay in.
+func (in Intent) checkUnlabel(p accounts.Provider) error {
+	lbl := in.Criterion.Folder
+	if err := checkName(lbl); err != nil {
+		return SafeError("label: " + err.Error())
+	}
+	if err := checkName(in.Target); err != nil {
+		return SafeError("target: " + err.Error())
+	}
+	switch p {
+	case accounts.Gmail:
+		if lbl == "INBOX" || strings.HasPrefix(lbl, "[") {
+			return SafeError("only a user label can be removed")
+		}
+	case accounts.Proton:
+		if !strings.HasPrefix(lbl, "Labels/") {
+			return SafeError("on Proton only a Labels/... label can be removed")
 		}
 	}
 	return nil

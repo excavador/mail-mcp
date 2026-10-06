@@ -131,6 +131,14 @@ func main() {
 				Value:   server.DefaultMaxUnelicited,
 				Sources: cli.EnvVars("MAX_UNELICITED_APPLY"),
 			},
+			&cli.IntFlag{
+				Name: "max-unelicited-label",
+				// A label adds and never removes, and its undo removes only
+				// what it added, so the client-approval cap is larger.
+				Usage:   "most messages one label apply (or the undo of one) may change when the client does not support elicitation",
+				Value:   server.DefaultMaxUnelicitedLabel,
+				Sources: cli.EnvVars("MAX_UNELICITED_LABEL"),
+			},
 			&cli.StringFlag{
 				Name: "approval-mode",
 				// client: approval is the client's own tool prompt, capped by
@@ -218,7 +226,7 @@ func run(ctx context.Context, cmd *cli.Command) error {
 		_ = store.Close()
 		return err
 	}
-	opts := []server.Option{server.WithHistory(hist), server.WithOrganiser(org), server.WithMaxUnelicited(cmd.Int("max-unelicited-apply")), server.WithApprovalMode(approval)}
+	opts := []server.Option{server.WithHistory(hist), server.WithOrganiser(org), server.WithMaxUnelicited(cmd.Int("max-unelicited-apply")), server.WithMaxUnelicitedLabel(cmd.Int("max-unelicited-label")), server.WithApprovalMode(approval)}
 	if sock := cmd.String("pdf-extractor-socket"); sock != "" {
 		if d := cmd.String("pdf-stage-dir"); d != "" {
 			store.SetPDFStageDir(d)
@@ -256,7 +264,7 @@ func run(ctx context.Context, cmd *cli.Command) error {
 		defer wg.Done()
 		store.RunSearchLogRetention(ctx, log)
 	}()
-	log.Info("approval", "mode", string(approval), "max_unelicited_apply", cmd.Int("max-unelicited-apply"))
+	log.Info("approval", "mode", string(approval), "max_unelicited_apply", cmd.Int("max-unelicited-apply"), "max_unelicited_label", cmd.Int("max-unelicited-label"))
 	log.Info("history", "dir", cmd.String("history-dir"))
 	log.Info("cache", "dir", cmd.String("cache-dir"), "refresh_interval", cmd.Duration("refresh-interval").String())
 
