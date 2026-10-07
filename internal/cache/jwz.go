@@ -45,7 +45,8 @@ const maxRecipients = 50
 
 // ThreadOpts are the facts about the mailbox BuildThreadsOpts needs.
 type ThreadOpts struct {
-	// Owners are the owner's own addresses: a message from one is never an
+	// Owners are the owner's own addresses (exact, or "@domain" patterns, see
+	// ownerMatcher): a message from one is never an
 	// outsider and may always join a thread by subject.
 	Owners []string
 }
@@ -262,12 +263,7 @@ func countReal(top, skip *container) int {
 //
 // Every assignment says whether the message is an Outsider.
 func BuildThreadsOpts(msgs []ThreadMsg, opts ThreadOpts) []ThreadAssign {
-	owners := map[string]bool{}
-	for _, o := range opts.Owners {
-		if o = strings.ToLower(strings.TrimSpace(o)); o != "" {
-			owners[o] = true
-		}
-	}
+	owners := newOwnerMatcher(opts.Owners)
 	sorted := append([]ThreadMsg(nil), msgs...)
 	sort.SliceStable(sorted, func(i, j int) bool {
 		if ki, kj := sorted[i].key(), sorted[j].key(); ki != kj {
@@ -427,7 +423,7 @@ func BuildThreadsOpts(msgs []ThreadMsg, opts ThreadOpts) []ThreadAssign {
 			if countReal(t, nil) > 1 && countReal(ct, nil) > 1 {
 				continue // never merge two existing multi-message threads
 			}
-			if !owners[m.Sender] {
+			if !owners.match(m.Sender) {
 				addrs, domains := senders(ct)
 				if m.Sender == "" || (!addrs[m.Sender] && !domains[registrableDomain(m.Sender)]) {
 					continue // a stranger does not get into a thread by subject
@@ -479,7 +475,7 @@ func BuildThreadsOpts(msgs []ThreadMsg, opts ThreadOpts) []ThreadAssign {
 		})
 		spoke := map[string]bool{}
 		for k, m := range members {
-			if k > 0 && m.Sender != "" && !spoke[m.Sender] && !owners[m.Sender] {
+			if k > 0 && m.Sender != "" && !spoke[m.Sender] && !owners.match(m.Sender) {
 				out[idx[m.StableID]].Outsider = true
 			}
 			if m.Sender != "" {

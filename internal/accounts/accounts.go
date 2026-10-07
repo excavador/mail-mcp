@@ -59,6 +59,14 @@ type Account struct {
 	// against a CA; the leaf must match this digest exactly. When empty, the
 	// certificate is verified normally against the system roots.
 	PinnedCertSHA256 string `yaml:"pinnedCertSHA256,omitempty"`
+	// Aliases are the other addresses the owner sends from, beside Username
+	// (Proton, for one, sends as an alias, not as the login). Each entry is
+	// an exact address ("me@example.com", compared case-insensitively;
+	// "me+tag@example.com" is also taken as me@example.com) or a domain
+	// pattern ("@example.com": any local part at that domain). Mail from an
+	// owner address counts as the owner's own: sent-mail detection,
+	// n_replied_by_me, outsider flags.
+	Aliases []string `yaml:"aliases,omitempty"`
 
 	password string
 }
@@ -124,6 +132,47 @@ func Load(path string) ([]Account, error) {
 	return f.Accounts, nil
 }
 
+// OwnerAddrs returns every address that is the owner's own on this account:
+// the lowercase username first, then the normalised aliases (exact addresses
+// and "@domain" patterns), without duplicates.
+func (a Account) OwnerAddrs() []string {
+	out := []string{strings.ToLower(strings.TrimSpace(a.Username))}
+	seen := map[string]bool{out[0]: true}
+	for _, x := range a.Aliases {
+		n, err := NormalizeAlias(x)
+		if err != nil || seen[n] {
+			continue
+		}
+		seen[n] = true
+		out = append(out, n)
+	}
+	return out
+}
+
+var domainRE = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$`)
+
+// NormalizeAlias validates one aliases entry and returns it lowercase:
+// "local@domain" or "@domain". Anything else is an error, so a typo (a missing
+// "@", a stray space, a wildcard like "*@example.com") fails at startup and is
+// never silently ignored.
+func NormalizeAlias(raw string) (string, error) {
+	s := strings.ToLower(strings.TrimSpace(raw))
+	if s == "" {
+		return "", errors.New("empty alias")
+	}
+	if strings.ContainsAny(s, " \t\r\n<>,;\"*") {
+		return "", fmt.Errorf("alias %q: contains a space or one of < > , ; \" *", raw)
+	}
+	local, domain, ok := strings.Cut(s, "@")
+	if !ok || strings.Contains(domain, "@") {
+		return "", fmt.Errorf("alias %q: want an address (me@example.com) or a domain pattern (@example.com)", raw)
+	}
+	if !domainRE.MatchString(domain) {
+		return "", fmt.Errorf("alias %q: %q is not a domain name", raw, domain)
+	}
+	return local + "@" + domain, nil
+}
+
 func (a Account) validate() error {
 	switch {
 	case !nameRE.MatchString(a.Name):
@@ -140,6 +189,11 @@ func (a Account) validate() error {
 		return errors.New("username is required")
 	case a.PasswordFile == "":
 		return errors.New("passwordFile is required; a password is never written in this file")
+	}
+	for _, x := range a.Aliases {
+		if _, err := NormalizeAlias(x); err != nil {
+			return fmt.Errorf("aliases: %w", err)
+		}
 	}
 	if a.PinnedCertSHA256 != "" {
 		b, err := hex.DecodeString(a.PinnedCertSHA256)

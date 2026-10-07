@@ -476,7 +476,7 @@ func TestParentLookupRefusesAmbiguousAndLateParents(t *testing.T) {
 
 func TestToMeIsExactAndAddressesAreValidated(t *testing.T) {
 	b := thrOpen(t).newSenderBatch()
-	b.owners["acc"] = []string{"me@home.test"}
+	b.owners["acc"] = newOwnerMatcher([]string{"me@home.test"})
 	b.add("acc", "A <a@x.example>", "Bob <notme@home.test>, c@x.example", "s", 0, 1, "", false, false)
 	b.add("acc", "B <b@x.example>", "Me <ME@home.test>", "s", 0, 1, "", false, false)
 	if d := b.deltas[senderKey{"acc", "a@x.example"}]; d.toMe != 0 {

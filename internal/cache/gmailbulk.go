@@ -190,10 +190,7 @@ WHERE t.tid IS NULL OR t.n_msgs <> g.n ORDER BY g.account, g.tid`)
 // outsider is, as in JWZ threads, a sender (not the owner) who is not the
 // From, To or Cc of any earlier message of the thread.
 func refreshGmailThreads(ctx context.Context, tx *sql.Tx, account string, tids []string, owners []string) error {
-	own := map[string]bool{}
-	for _, o := range owners {
-		own[o] = true
-	}
+	own := newOwnerMatcher(owners)
 	for _, part := range chunks(tids, idChunk) {
 		rows, err := tx.QueryContext(ctx, `
 SELECT t.tid, m.stable_id, m.from_addr, m.to_addr, m.cc_addr, m.subject, `+arrivalCol+`
@@ -230,7 +227,7 @@ WHERE t.account = ? AND t.tid IN (`+inList(len(part))+`) ORDER BY t.tid, `+arriv
 				a.people = append(a.people, name)
 			}
 			sender := strings.ToLower(BareAddr(from))
-			if a.n > 0 && sender != "" && !a.spoke[sender] && !own[sender] {
+			if a.n > 0 && sender != "" && !a.spoke[sender] && !own.match(sender) {
 				a.outsiders = append(a.outsiders, sid)
 			}
 			if sender != "" {

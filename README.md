@@ -49,7 +49,39 @@ accounts:
     username: user@protonmail.com
     passwordFile: /secrets/proton-password
     pinnedCertSHA256: ab12cd34...
+    aliases:                       # optional, see below
+      - me@example.com             # exact address
+      - "@example.org"             # any address at this domain
 ```
+
+#### Owner aliases
+
+`username` is the owner's login, but on some accounts (Proton, for one) the owner
+sends as another address. `aliases` lists the addresses that are also the
+owner's own. They count together with `username` for everything that rests on
+"mail from the owner": sent-mail detection, `n_replied_by_me`, `n_from_me` /
+`n_to_me`, the owner-reply rule of sender kinds, and the outsider flag.
+
+- `me@example.com`: an exact address, compared case-insensitively. A
+  plus-tagged address (`me+news@example.com`) also matches its base address.
+- `"@example.org"`: a domain pattern, any local part at exactly that domain
+  (not its subdomains). Quote it in YAML.
+
+A malformed entry (no `@`, a wildcard such as `*@example.com`, a display name,
+an invalid domain) stops startup with an error naming it. Use only addresses
+the owner controls: a domain pattern makes every address at that domain count
+as the owner.
+
+When the set of usernames and aliases changes (and on the first start of a
+version that knows about aliases), the owner-derived counts are recomputed in
+the background: startup resets the counts and restarts the senders job (as the
+senders recount of an upgrade does; this is a short step before the server
+starts), then the background job clears the outsider flag of owner-sent
+messages in batches and counts every message again, keeping owner and LLM
+sender kinds, resumable across restarts. Search and
+other tools keep working; selections by sender kind answer "being recounted"
+until it finishes. The log lines "owner set changed" and "owner recount done"
+mark the start and the end.
 
 To compute the Bridge certificate pin:
 
