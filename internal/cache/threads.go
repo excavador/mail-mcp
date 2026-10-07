@@ -23,6 +23,7 @@ import (
 	"log/slog"
 	"net/mail"
 	"os"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -439,26 +440,41 @@ func gatherComponent(ctx context.Context, tx dbq, account, seed string, visited 
 			}
 		}
 		for _, part := range chunks(fresh, idChunk) {
-			rs, err := tx.QueryContext(ctx, `SELECT DISTINCT stable_id FROM message_ref WHERE account = ? AND ref_id IN (`+inList(len(part))+`) LIMIT ?`,
-				append(strArgs(account, part), maxComponent+1)...)
+			// No DISTINCT and no LIMIT in SQL: with them SQLite prefers a covering
+			// scan of message_ref_by_msg (it yields stable_id in order) over the
+			// primary-key lookups by ref_id, which makes every component cost a
+			// walk of the whole account's id index. Deduplicate and cut in Go;
+			// the result is the same: the first maxComponent+1 distinct ids in
+			// stable_id order.
+			rs, err := tx.QueryContext(ctx, `SELECT stable_id FROM message_ref WHERE account = ? AND ref_id IN (`+inList(len(part))+`)`,
+				strArgs(account, part)...)
 			if err != nil {
 				return nil, false, fmt.Errorf("gather thread: %w", err)
 			}
+			var sids []string
 			for rs.Next() {
 				var sid string
 				if err := rs.Scan(&sid); err != nil {
 					_ = rs.Close()
 					return nil, false, fmt.Errorf("gather thread: %w", err)
 				}
-				if _, ok := set[sid]; !ok {
-					queue = append(queue, sid)
-				}
+				sids = append(sids, sid)
 			}
 			if err := rs.Err(); err != nil {
 				_ = rs.Close()
 				return nil, false, fmt.Errorf("gather thread: %w", err)
 			}
 			_ = rs.Close()
+			sort.Strings(sids)
+			sids = slices.Compact(sids)
+			if len(sids) > maxComponent+1 {
+				sids = sids[:maxComponent+1]
+			}
+			for _, sid := range sids {
+				if _, ok := set[sid]; !ok {
+					queue = append(queue, sid)
+				}
+			}
 		}
 		for _, sid := range extra {
 			if _, ok := set[sid]; !ok {
@@ -766,9 +782,12 @@ func refreshAggregates(ctx context.Context, tx *sql.Tx, account string, tids []s
 			continue
 		}
 		seen[tid] = true
+		// INDEXED BY: without table statistics SQLite walks every row of the
+		// account in the primary key and filters on tid, which makes each thread
+		// cost a pass over message_thread (and the backfill slower as it fills it).
 		rows, err := tx.QueryContext(ctx, `
 SELECT m.stable_id, m.from_addr, m.subject, `+arrivalCol+`, t.depth
-FROM message_thread t JOIN messages m ON m.account = t.account AND m.stable_id = t.stable_id
+FROM message_thread t INDEXED BY message_thread_by_tid JOIN messages m ON m.account = t.account AND m.stable_id = t.stable_id
 WHERE t.account = ? AND t.tid = ? ORDER BY `+arrivalCol+`, m.stable_id`, account, tid)
 		if err != nil {
 			return fmt.Errorf("thread aggregate: %w", err)
@@ -1220,7 +1239,7 @@ func (c *Cache) ThreadMessages(ctx context.Context, account, tid string) ([]Thre
 WHERE m.account = ? AND m.stable_id = ?`, account, id)
 	} else {
 		rows, err = c.db.QueryContext(ctx, `SELECT m.stable_id, `+dateCol+`, m.from_addr, m.subject, t.depth, t.outsider
-FROM message_thread t JOIN messages m ON m.account = t.account AND m.stable_id = t.stable_id
+FROM message_thread t INDEXED BY message_thread_by_tid JOIN messages m ON m.account = t.account AND m.stable_id = t.stable_id
 WHERE t.account = ? AND t.tid = ? ORDER BY `+dateCol+`, m.stable_id`, account, tid)
 	}
 	if err != nil {
