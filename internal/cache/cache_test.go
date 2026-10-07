@@ -159,8 +159,8 @@ func TestMoveChangesOnlyMembership(t *testing.T) {
 	if n := e.count(`SELECT COUNT(*) FROM messages`); n != 1 {
 		t.Errorf("messages rows = %d", n)
 	}
-	if n := e.count(`SELECT COUNT(*) FROM message_fts`); n != 1 {
-		t.Errorf("message_fts rows = %d, want exactly 1", n)
+	if n := e.count(`SELECT COUNT(*) FROM message_fts2`); n != 1 {
+		t.Errorf("message_fts2 rows = %d, want exactly 1", n)
 	}
 	if n := e.count(`SELECT COUNT(*) FROM membership WHERE folder = 'A'`); n != 0 {
 		t.Errorf("membership in A = %d", n)
@@ -185,7 +185,7 @@ func TestSameMessageInTwoFoldersIsOneRowTwoMemberships(t *testing.T) {
 	if n := e.count(`SELECT COUNT(*) FROM membership`); n != 2 {
 		t.Errorf("membership = %d, want 2", n)
 	}
-	if n := e.count(`SELECT COUNT(*) FROM message_fts`); n != 1 {
+	if n := e.count(`SELECT COUNT(*) FROM message_fts2`); n != 1 {
 		t.Errorf("fts = %d, want 1", n)
 	}
 }
@@ -283,7 +283,7 @@ func TestMessageLeavingFolderKeepsBlobAndIndex(t *testing.T) {
 	if _, err := os.Stat(e.cache.BlobPath(sum)); err != nil {
 		t.Errorf("blob removed: %v", err)
 	}
-	if n := e.count(`SELECT COUNT(*) FROM message_fts WHERE message_fts MATCH 'needle'`); n != 1 {
+	if n := e.count(`SELECT COUNT(*) FROM message_fts2 WHERE message_fts2 MATCH 'needle'`); n != 1 {
 		t.Errorf("departed message no longer searchable")
 	}
 }
@@ -473,7 +473,7 @@ func TestIndexedFieldsAndFTS(t *testing.T) {
 		`brown`:               1, // body
 		`carol`:               1, // cc column
 		`"quick brown"`:       1,
-		`body:fox`:            1,
+		`body_new:fox`:        1,
 		`absentword`:          0,
 		`subject:fox`:         0,
 		`nothing OR zebra`:    2,
@@ -482,7 +482,7 @@ func TestIndexedFieldsAndFTS(t *testing.T) {
 		`unrelated AND zebra`: 0,
 		`brow*`:               1,
 	} {
-		if n := e.count(`SELECT COUNT(*) FROM message_fts WHERE message_fts MATCH ?`, q); n != want {
+		if n := e.count(`SELECT COUNT(*) FROM message_fts2 WHERE message_fts2 MATCH ?`, q); n != want {
 			t.Errorf("MATCH %q = %d rows, want %d", q, n, want)
 		}
 	}

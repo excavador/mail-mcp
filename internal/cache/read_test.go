@@ -50,15 +50,10 @@ func ins(t *testing.T, c *Cache, account, id, from, subject, body string, date t
 	if err != nil {
 		t.Fatal(err)
 	}
-	// message_fts2 is what search reads once the backfill is complete (always,
-	// on a fresh test cache), so helper rows go to both tables.
+	// message_fts2 is what search reads.
 	rid, _ := res.LastInsertId()
 	if _, err := c.db.Exec(`INSERT INTO message_fts2 (rowid, subject, from_addr, to_addr, cc_addr, body_new, body_full, account, stable_id) VALUES (?,?,?,?,?,?,?,?,?)`,
 		rid, subject, from, "", "", CleanBody(body), "", account, id); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := c.db.Exec(`INSERT INTO message_fts (subject, from_addr, to_addr, cc_addr, body, account, stable_id) VALUES (?,?,?,?,?,?,?)`,
-		subject, from, "", "", body, account, id); err != nil {
 		t.Fatal(err)
 	}
 	for _, f := range folders {

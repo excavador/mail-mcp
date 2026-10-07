@@ -260,30 +260,7 @@ func (c *Cache) Search(ctx context.Context, q SearchQuery) ([]SearchHit, bool, e
 			` ORDER BY ` + dateCol + ` DESC, m.account, m.stable_id LIMIT ?`
 		args = append(append(args, fa...), limit+1)
 	} else {
-		table, fts2 := c.FTSTable()
-		if fts2 {
-			query, args = fts2Query(expr, q.FTSSyntax, and, fa, limit)
-		} else {
-			// The FTS table is the base of the inner query so that MATCH drives
-			// the scan; starting from messages would walk every message and test
-			// MATCH per row. The inner query picks the surviving rows (by rowid,
-			// with one extra to detect truncation) and only then does the outer
-			// query pay for snippet() and the wide columns, looking each row up
-			// by rowid. One extra row tells "exactly limit" from "more than limit".
-			query = `WITH hit AS (
-	SELECT ` + table + `.rowid AS rid, m.account AS account, m.stable_id AS stable_id, ` + dateCol + ` AS d
-	FROM ` + table + ` JOIN messages m ON m.account = ` + table + `.account AND m.stable_id = ` + table + `.stable_id
-	WHERE ` + table + ` MATCH ?` + and + `
-	ORDER BY d DESC, m.account, m.stable_id LIMIT ?
-)
-SELECT hit.account, hit.stable_id, hit.d, m.from_addr, m.subject, snippet(` + table + `, 4, '[', ']', '…', 20)
-FROM hit
-JOIN ` + table + ` ON ` + table + `.rowid = hit.rid
-JOIN messages m ON m.account = hit.account AND m.stable_id = hit.stable_id
-WHERE ` + table + ` MATCH ?
-ORDER BY hit.d DESC, hit.account, hit.stable_id`
-			args = append(append([]any{expr}, fa...), limit+1, expr)
-		}
+		query, args = fts2Query(expr, q.FTSSyntax, and, fa, limit)
 	}
 
 	queryErr := func(err error) error {

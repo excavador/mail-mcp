@@ -177,19 +177,14 @@ CREATE TABLE IF NOT EXISTS messages (
 );
 CREATE INDEX IF NOT EXISTS messages_by_blob ON messages (blob_sha256);
 
-CREATE VIRTUAL TABLE IF NOT EXISTS message_fts USING fts5 (
-	subject, from_addr, to_addr, cc_addr, body,
-	account UNINDEXED, stable_id UNINDEXED
-);
-
 -- Added after v0.2.6, additively (IF NOT EXISTS, no schemaVersion bump: a bump
 -- discards the index and re-fetches every mailbox). message_fts2 splits the
 -- body: body_new is the text with quotes, reply headers and signatures
 -- stripped (CleanBody), body_full is the whole text, left empty when it equals
 -- body_new so the common case is not stored twice. Its rowid is the rowid of
 -- the messages row, so joins are O(1) and the backfill can tell what is done.
--- message_fts stays written as the fallback until the backfill is complete and
--- search has proven itself on fts2; TODO: drop message_fts then.
+-- The original message_fts table is gone: it is no longer written or read, and
+-- ensureSchema drops it from older files (dropLegacyFTS).
 CREATE VIRTUAL TABLE IF NOT EXISTS message_fts2 USING fts5 (
 	subject, from_addr, to_addr, cc_addr, body_new, body_full,
 	account UNINDEXED, stable_id UNINDEXED,
@@ -393,7 +388,7 @@ const schemaVersion = 2
 
 // indexTables are the tables the index owns, FTS first (dropping the virtual
 // table removes its shadow tables).
-var indexTables = []string{"message_fts", "message_fts2", "attachment_fts", "attachments", "backfill", "messages", "membership", "folders", "refreshes", "threads", "message_thread", "message_ref", "pdf_text"}
+var indexTables = []string{"message_fts2", "attachment_fts", "attachments", "backfill", "messages", "membership", "folders", "refreshes", "threads", "message_thread", "message_ref", "pdf_text"}
 
 // ensureSchema creates the schema, first wiping the index tables when the
 // database carries a different user_version (0 for a fresh or pre-versioned
@@ -428,10 +423,25 @@ func ensureSchema(db *sql.DB) error {
 	if err := addMissingColumns(db); err != nil {
 		return err
 	}
+	if err := dropLegacyFTS(db); err != nil {
+		return err
+	}
 	if have != schemaVersion {
 		if _, err := db.Exec(fmt.Sprintf(`PRAGMA user_version = %d`, schemaVersion)); err != nil {
 			return fmt.Errorf("set schema version: %w", err)
 		}
+	}
+	return nil
+}
+
+// dropLegacyFTS removes the original message_fts table (and its shadow tables)
+// from a file written before it was retired. It is idempotent and needs no
+// schemaVersion bump: message_fts2 holds everything it did. The freed pages go
+// to SQLite's freelist and are reused by later writes; the file does not shrink
+// (auto_vacuum is off, and a VACUUM at startup would block on a large file).
+func dropLegacyFTS(db *sql.DB) error {
+	if _, err := db.Exec(`DROP TABLE IF EXISTS message_fts`); err != nil {
+		return fmt.Errorf("drop message_fts: %w", err)
 	}
 	return nil
 }

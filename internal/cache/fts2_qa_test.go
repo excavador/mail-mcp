@@ -53,7 +53,7 @@ func partBin(name string, data []byte) string {
 }
 
 // indexRaw stores raw as a blob and indexes it the way refresh does (one
-// transaction: message, message_fts, message_fts2, attachments).
+// transaction: message, message_fts2, attachments).
 func indexRaw(t *testing.T, c *Cache, account, id string, raw []byte, folders ...string) {
 	t.Helper()
 	sum, err := c.putBlob(raw)
@@ -88,8 +88,8 @@ func addFolders(t *testing.T, c *Cache, account, id string, folders ...string) {
 	}
 }
 
-// legacyInsert writes a message the way a pre-fts2 version did: messages and
-// message_fts only, blob on disk.
+// legacyInsert writes a message the way a pre-fts2 version did: a messages row
+// with its blob on disk and no message_fts2 row (the backfill indexes it).
 func legacyInsert(t *testing.T, c *Cache, account, id string, raw []byte) {
 	t.Helper()
 	sum, err := c.putBlob(raw)
@@ -99,10 +99,6 @@ func legacyInsert(t *testing.T, c *Cache, account, id string, raw []byte) {
 	p := parseMessage(raw)
 	if _, err := c.db.Exec(`INSERT INTO messages (account, stable_id, blob_sha256, from_addr, to_addr, cc_addr, subject, date_unix, internal_date) VALUES (?,?,?,?,?,?,?,?,?)`,
 		account, id, sum, p.From, p.To, p.Cc, p.Subject, p.Date.Unix(), p.Date.Unix()); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := c.db.Exec(`INSERT INTO message_fts (subject, from_addr, to_addr, cc_addr, body, account, stable_id) VALUES (?,?,?,?,?,?,?)`,
-		p.Subject, p.From, p.To, p.Cc, p.Body, account, id); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -191,8 +187,8 @@ var d0 = time.Date(2026, 1, 10, 12, 0, 0, 0, time.UTC)
 
 func TestQAFreshDBIsReadyImmediately(t *testing.T) {
 	c := openCache(t)
-	if tb, ready := c.FTSTable(); tb != "message_fts2" || !ready {
-		t.Fatalf("FTSTable = %s %v", tb, ready)
+	if !isReady(c) {
+		t.Fatal("fresh DB must be ready")
 	}
 	st, err := c.BackfillStatus(context.Background())
 	if err != nil || !st.Complete || st.Done != 0 || st.Total != 0 {
@@ -206,8 +202,8 @@ func TestQAPreexistingDBNotReadyUntilBackfillFinishes(t *testing.T) {
 		legacyInsert(t, c, "a", fmt.Sprintf("m%d", i), msgHdr("Bob <bob@example.com>", "Hello", d0, partText("body "+fmt.Sprint(i))))
 	}
 	c = reopenAsPreUpgrade(t, c)
-	if tb, ready := c.FTSTable(); tb != "message_fts" || ready {
-		t.Fatalf("pre-existing DB must not be ready: %s %v", tb, ready)
+	if isReady(c) {
+		t.Fatal("pre-existing DB must not be ready")
 	}
 	st, _ := c.BackfillStatus(context.Background())
 	if st.Complete || st.Total != 3 || st.Done != 0 {
@@ -215,23 +211,23 @@ func TestQAPreexistingDBNotReadyUntilBackfillFinishes(t *testing.T) {
 	}
 	// A reopen without finishing does not make it ready.
 	c = reopen(t, c, c.dir)
-	if _, ready := c.FTSTable(); ready {
+	if isReady(c) {
 		t.Fatal("reopen alone must not mark ready")
 	}
 	ctx := tctx(t)
 	c.RunBackfill(ctx, quiet())
-	if tb, ready := c.FTSTable(); tb != "message_fts2" || !ready {
-		t.Fatalf("after backfill: %s %v", tb, ready)
+	if !isReady(c) {
+		t.Fatal("after backfill: not ready")
 	}
 	assertAligned(t, c, 3)
 	// Completion is durable: a reopen is ready at once.
 	c = reopen(t, c, c.dir)
-	if _, ready := c.FTSTable(); !ready {
+	if !isReady(c) {
 		t.Fatal("completed backfill must survive reopen as ready")
 	}
 }
 
-func TestQASearchUnchangedWhileOnMessageFTSThenFlips(t *testing.T) {
+func TestQASearchReadsOnlyFTS2WhileBackfillRuns(t *testing.T) {
 	c := openCache(t)
 	legacyInsert(t, c, "a", "L1", msgHdr("Bob <bob@example.com>", "Quarterly", d0,
 		partText("zanzibar spice order"), partPDF("offer.pdf", miniPDF("Thermostat Quotation 4711"))))
@@ -239,44 +235,83 @@ func TestQASearchUnchangedWhileOnMessageFTSThenFlips(t *testing.T) {
 	c = reopenAsPreUpgrade(t, c)
 	ctx := tctx(t)
 
-	if tb, ready := c.FTSTable(); tb != "message_fts" || ready {
-		t.Fatalf("want fallback, got %s %v", tb, ready)
+	if isReady(c) {
+		t.Fatal("backfill must be pending")
 	}
-	// Old behaviour: body search works, with a plain "[term]" snippet.
-	hits, _, err := c.Search(ctx, SearchQuery{Text: "zanzibar"})
-	if err != nil || len(hits) != 1 || hits[0].StableID != "L1" || !strings.Contains(hits[0].Snippet, "[zanzibar]") {
-		t.Fatalf("fallback body search: %+v %v", hits, err)
-	}
-	// Old behaviour: attachment text is not searchable.
-	if hits, _, _ := c.Search(ctx, SearchQuery{Text: "Thermostat"}); len(hits) != 0 {
-		t.Fatalf("attachment text must not be searched while on message_fts: %+v", hits)
-	}
-	// Old behaviour: raw FTS5 syntax with the original "body" column.
-	if hits, _, err := c.Search(ctx, SearchQuery{Text: "body:zanzibar", FTSSyntax: true}); err != nil || len(hits) != 1 {
-		t.Fatalf("fallback FTS syntax: %+v %v", hits, err)
-	}
-	// Old behaviour: filters.
-	if hits, _, _ := c.Search(ctx, SearchQuery{Text: "cafe", From: "carol"}); len(hits) != 1 || hits[0].StableID != "L2" {
-		t.Fatalf("fallback from filter: %+v", hits)
-	}
-	if hits, _, _ := c.Search(ctx, SearchQuery{Text: "cafe", From: "bob"}); len(hits) != 0 {
-		t.Fatalf("fallback from filter excluded: %+v", hits)
+	// No message_fts fallback: until the backfill reaches a message, search
+	// does not see it (and does not fail).
+	if hits, _, err := c.Search(ctx, SearchQuery{Text: "zanzibar"}); err != nil || len(hits) != 0 {
+		t.Fatalf("pending backfill: %+v %v", hits, err)
 	}
 
 	c.RunBackfill(ctx, quiet())
 
-	if tb, ready := c.FTSTable(); tb != "message_fts2" || !ready {
-		t.Fatalf("want fts2 after flip, got %s %v", tb, ready)
+	if !isReady(c) {
+		t.Fatal("want ready after backfill")
 	}
 	if hits, _, err := c.Search(ctx, SearchQuery{Text: "zanzibar"}); err != nil || len(hits) != 1 || !strings.Contains(hits[0].Snippet, "[zanzibar]") {
 		t.Fatalf("fts2 body search: %+v %v", hits, err)
 	}
-	hits, _, err = c.Search(ctx, SearchQuery{Text: "pdf"})
+	hits, _, err := c.Search(ctx, SearchQuery{Text: "pdf"})
 	if err != nil || len(hits) != 1 || hits[0].StableID != "L1" || hits[0].Snippet != "attachment: offer.[pdf]" {
 		t.Fatalf("fts2 attachment search: %+v %v", hits, err)
 	}
 	if hits, _, err := c.Search(ctx, SearchQuery{Text: "body:zanzibar", FTSSyntax: true}); err != nil || len(hits) != 1 {
 		t.Fatalf("fts2 FTS syntax body: %+v %v", hits, err)
+	}
+	if hits, _, _ := c.Search(ctx, SearchQuery{Text: "cafe", From: "bob"}); len(hits) != 0 {
+		t.Fatalf("from filter excluded: %+v", hits)
+	}
+}
+
+// ---- message_fts is retired ----
+
+func tableExists(t *testing.T, c *Cache, name string) bool {
+	t.Helper()
+	return qaCount(t, c, `SELECT COUNT(*) FROM sqlite_master WHERE name = '`+name+`'`) > 0
+}
+
+func TestOpenDropsLegacyMessageFTSIdempotently(t *testing.T) {
+	c := openCache(t)
+	if tableExists(t, c, "message_fts") {
+		t.Fatal("fresh DB must not create message_fts")
+	}
+	// An old file: message_fts present and populated, fts2 complete.
+	if _, err := c.db.Exec(`CREATE VIRTUAL TABLE message_fts USING fts5 (subject, from_addr, to_addr, cc_addr, body, account UNINDEXED, stable_id UNINDEXED)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.db.Exec(`INSERT INTO message_fts (subject, from_addr, to_addr, cc_addr, body, account, stable_id) VALUES ('s','f','t','c','b','a','x')`); err != nil {
+		t.Fatal(err)
+	}
+	indexRaw(t, c, "a", "k1", msgHdr("Bob <bob@example.com>", "Keep", d0, partText("kept words")))
+	dir := c.dir
+	for i := range 2 { // second pass: nothing left to drop, no error
+		c = reopen(t, c, dir)
+		if tableExists(t, c, "message_fts") || qaCount(t, c, `SELECT COUNT(*) FROM sqlite_master WHERE substr(name, 1, 12) = 'message_fts_'`) != 0 {
+			t.Fatalf("open %d: message_fts or its shadow tables remain", i)
+		}
+	}
+	if !isReady(c) {
+		t.Fatal("dropping message_fts must not touch the fts2 state")
+	}
+	if hits, _, err := c.Search(context.Background(), SearchQuery{Text: "kept"}); err != nil || len(hits) != 1 {
+		t.Fatalf("search after drop: %+v %v", hits, err)
+	}
+}
+
+func TestInsertPathDoesNotWriteMessageFTS(t *testing.T) {
+	c := openCache(t)
+	// A rolled-back-to-old-version file would have the table; prove the insert
+	// path leaves even an existing one untouched.
+	if _, err := c.db.Exec(`CREATE VIRTUAL TABLE message_fts USING fts5 (subject, from_addr, to_addr, cc_addr, body, account UNINDEXED, stable_id UNINDEXED)`); err != nil {
+		t.Fatal(err)
+	}
+	indexRaw(t, c, "a", "w1", msgHdr("Bob <bob@example.com>", "Hello", d0, partText("fresh words")))
+	if n := qaCount(t, c, `SELECT COUNT(*) FROM message_fts`); n != 0 {
+		t.Fatalf("insert wrote %d message_fts rows", n)
+	}
+	if n := qaCount(t, c, `SELECT COUNT(*) FROM message_fts2`); n != 1 {
+		t.Fatalf("message_fts2 rows = %d, want 1", n)
 	}
 }
 
@@ -345,7 +380,7 @@ func TestQABackfillKillAndRestartMidRunHasNoDuplicatesOrMisses(t *testing.T) {
 	if st.Complete || st.Done == 0 || st.Done >= n {
 		t.Fatalf("expected a partial run, got %+v", st)
 	}
-	if _, ready := c.FTSTable(); ready {
+	if isReady(c) {
 		t.Fatal("must not be ready after a killed run")
 	}
 	if got := qaCount(t, c, `SELECT COUNT(*) FROM message_fts2`); got != st.Done {
@@ -354,7 +389,7 @@ func TestQABackfillKillAndRestartMidRunHasNoDuplicatesOrMisses(t *testing.T) {
 
 	// Restart (new process): resumes, and is killed again at random points.
 	c = reopen(t, c, dir)
-	if _, ready := c.FTSTable(); ready {
+	if isReady(c) {
 		t.Fatal("reopen mid-run must not be ready")
 	}
 	for i := 1; i <= 6 && !isReady(c); i++ {
@@ -381,7 +416,7 @@ func TestQABackfillKillAndRestartMidRunHasNoDuplicatesOrMisses(t *testing.T) {
 	}
 }
 
-func isReady(c *Cache) bool { _, r := c.FTSTable(); return r }
+func isReady(c *Cache) bool { return c.fts2Ready.Load() }
 
 func TestQABackfillIgnoresMessagesInsertedAfterSnapshot(t *testing.T) {
 	// Deterministic interleaving: one batch, then "refresh" writes new messages
@@ -501,7 +536,7 @@ func TestQAFailedTransactionLeavesNoFts2OrAttachmentRows(t *testing.T) {
 	if err := tx.Rollback(); err != nil {
 		t.Fatal(err)
 	}
-	for _, tbl := range []string{"messages", "message_fts", "message_fts2", "attachments", "attachment_fts"} {
+	for _, tbl := range []string{"messages", "message_fts2", "attachments", "attachment_fts"} {
 		if n := qaCount(t, c, `SELECT COUNT(*) FROM `+tbl); n != 0 {
 			t.Errorf("%s has %d rows after rollback", tbl, n)
 		}
@@ -523,7 +558,7 @@ func TestQARefreshWritesMessageFts2AndAttachmentsInOneTransaction(t *testing.T) 
 	defer func() { _ = c.Close() }()
 	_, rerr := e.cache.Refresh(e.ctx(), e.acct, c)
 	t.Logf("Refresh err (expected): %v", rerr)
-	for _, tbl := range []string{"messages", "message_fts", "message_fts2", "attachments"} {
+	for _, tbl := range []string{"messages", "message_fts2", "attachments"} {
 		if n := e.count(`SELECT COUNT(*) FROM ` + tbl); n != 0 {
 			t.Errorf("%s has %d rows after a failed transaction (partial write)", tbl, n)
 		}

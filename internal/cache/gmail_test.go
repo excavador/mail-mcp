@@ -207,7 +207,7 @@ func TestEnsureSchemaVersion(t *testing.T) {
 			`INSERT INTO membership (account, stable_id, folder, uid, uidvalidity) VALUES ('a', 'mid:x', 'INBOX', 1, 1)`,
 			`INSERT INTO folders (account, folder, uidvalidity) VALUES ('a', 'INBOX', 1)`,
 			`INSERT INTO refreshes (account, at, ok) VALUES ('a', 1, 1)`,
-			`INSERT INTO message_fts (subject, from_addr, to_addr, cc_addr, body, account, stable_id) VALUES ('s','f','t','c','b','a','mid:x')`,
+			`INSERT INTO message_fts2 (rowid, subject, from_addr, to_addr, cc_addr, body_new, body_full, account, stable_id) VALUES (1,'s','f','t','c','b','','a','mid:x')`,
 		} {
 			if _, err := c.db.Exec(q); err != nil {
 				t.Fatalf("%s: %v", q, err)
@@ -216,7 +216,7 @@ func TestEnsureSchemaVersion(t *testing.T) {
 	}
 	rows := func(c *Cache) int {
 		n := 0
-		for _, tb := range []string{"messages", "membership", "folders", "refreshes", "message_fts"} {
+		for _, tb := range []string{"messages", "membership", "folders", "refreshes", "message_fts2"} {
 			n += count(t, c, `SELECT COUNT(*) FROM `+tb)
 		}
 		return n
