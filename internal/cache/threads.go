@@ -367,6 +367,9 @@ func distinctTids(ctx context.Context, tx *sql.Tx, q string, args ...any) ([]str
 	return out, rows.Err()
 }
 
+// refMembersSQL lists the messages indexed under one id, in stable_id order.
+const refMembersSQL = `SELECT stable_id FROM message_ref WHERE account = ? AND ref_id = ? ORDER BY stable_id LIMIT ?`
+
 // gatherComponent loads the connected component of seed: every unthreadable-
 // by-Gmail message that shares an id with a member, transitively, plus the
 // threads a header-less reply could join by subject. Members are marked
@@ -378,6 +381,7 @@ func gatherComponent(ctx context.Context, tx dbq, account, seed string, visited 
 	set := map[string]threadRow{}
 	var order []string
 	idsSeen := map[string]bool{}
+	var refStmt *sql.Stmt
 	queue := []string{seed}
 	for len(queue) > 0 && len(set) < maxComponent {
 		rows, err := loadThreadRows(ctx, tx, account, queue)
@@ -440,31 +444,40 @@ func gatherComponent(ctx context.Context, tx dbq, account, seed string, visited 
 			}
 		}
 		for _, part := range chunks(fresh, idChunk) {
-			// No DISTINCT and no LIMIT in SQL: with them SQLite prefers a covering
-			// scan of message_ref_by_msg (it yields stable_id in order) over the
-			// primary-key lookups by ref_id, which makes every component cost a
-			// walk of the whole account's id index. Deduplicate and cut in Go;
-			// the result is the same: the first maxComponent+1 distinct ids in
-			// stable_id order.
-			rs, err := tx.QueryContext(ctx, `SELECT stable_id FROM message_ref WHERE account = ? AND ref_id IN (`+inList(len(part))+`)`,
-				strArgs(account, part)...)
-			if err != nil {
-				return nil, false, fmt.Errorf("gather thread: %w", err)
+			// One bounded lookup per id, served in order by the primary key
+			// (account, ref_id, stable_id), so a hot id (a shared "subj:" key)
+			// costs at most maxComponent+1 rows. A single IN (...) query with
+			// DISTINCT and LIMIT makes SQLite prefer a covering scan of
+			// message_ref_by_msg, a walk of the whole account per component.
+			// The first maxComponent+1 distinct ids of the union are within the
+			// union of each id's first maxComponent+1, so merging in Go gives
+			// the answer the single query gave.
+			if refStmt == nil {
+				if refStmt, err = tx.PrepareContext(ctx, refMembersSQL); err != nil {
+					return nil, false, fmt.Errorf("gather thread: %w", err)
+				}
+				defer refStmt.Close()
 			}
 			var sids []string
-			for rs.Next() {
-				var sid string
-				if err := rs.Scan(&sid); err != nil {
+			for _, ref := range part {
+				rs, err := refStmt.QueryContext(ctx, account, ref, maxComponent+1)
+				if err != nil {
+					return nil, false, fmt.Errorf("gather thread: %w", err)
+				}
+				for rs.Next() {
+					var sid string
+					if err := rs.Scan(&sid); err != nil {
+						_ = rs.Close()
+						return nil, false, fmt.Errorf("gather thread: %w", err)
+					}
+					sids = append(sids, sid)
+				}
+				if err := rs.Err(); err != nil {
 					_ = rs.Close()
 					return nil, false, fmt.Errorf("gather thread: %w", err)
 				}
-				sids = append(sids, sid)
-			}
-			if err := rs.Err(); err != nil {
 				_ = rs.Close()
-				return nil, false, fmt.Errorf("gather thread: %w", err)
 			}
-			_ = rs.Close()
 			sort.Strings(sids)
 			sids = slices.Compact(sids)
 			if len(sids) > maxComponent+1 {
@@ -529,6 +542,7 @@ func applyComponent(ctx context.Context, tx *sql.Tx, account string, comp []thre
 // dbq is what the read side of threading needs: a *sql.DB (a plan computed
 // outside any transaction) or a *sql.Tx.
 type dbq interface {
+	PrepareContext(ctx context.Context, query string) (*sql.Stmt, error)
 	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
 	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
 }

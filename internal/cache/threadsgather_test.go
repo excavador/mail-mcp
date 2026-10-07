@@ -171,11 +171,43 @@ func TestThreadQueriesUseIndexes(t *testing.T) {
 		}
 		return out
 	}
-	if p := plan(`SELECT stable_id FROM message_ref WHERE account = ? AND ref_id IN (?,?)`, "p", "a", "b"); !strings.Contains(p, "PRIMARY KEY (account=? AND ref_id=?)") && !strings.Contains(p, "(account=? AND ref_id=?)") {
-		t.Fatalf("id lookup does not search by ref_id:\n%s", p)
+	if p := plan(refMembersSQL, "p", "a", 11); !strings.Contains(p, "USING PRIMARY KEY (account=? AND ref_id=?)") || strings.Contains(p, "TEMP B-TREE") || strings.Contains(p, "message_ref_by_msg") {
+		t.Fatalf("per-id lookup is not an ordered primary-key search:\n%s", p)
 	}
 	agg := plan(`SELECT m.stable_id FROM message_thread t INDEXED BY message_thread_by_tid JOIN messages m ON m.account = t.account AND m.stable_id = t.stable_id WHERE t.account = ? AND t.tid = ?`, "p", "x")
 	if !strings.Contains(agg, "message_thread_by_tid (account=? AND tid=?)") {
 		t.Fatalf("thread aggregate does not search by tid:\n%s", agg)
+	}
+}
+
+// One id shared by thousands of messages (a "subj:" key of automated mail)
+// must gather the same component as the old query, reading at most
+// maxComponent+1 rows of it.
+func TestGatherHotRefMatchesReference(t *testing.T) {
+	ctx := context.Background()
+	c := thrOpen(t)
+	var ms []synthMsg
+	for i := 0; i < 5000; i++ {
+		ms = append(ms, synthMsg{id: fmt.Sprintf("pm:%07d", i), msgID: fmt.Sprintf("h%d@x", i), irt: "hot@x", refs: []string{"hot@x"},
+			subject: "Re: hot", from: "a@x.example", to: "me@example.com", arrival: int64(1000 + i)})
+	}
+	loadSynth(t, c, "p", ms)
+	old := maxComponent
+	maxComponent = 10
+	defer func() { maxComponent = old }()
+	for _, seed := range []string{"pm:0000000", "pm:0002500", "pm:0004999"} {
+		got, gc, err1 := gatherComponent(ctx, c.db, "p", seed, map[string]bool{})
+		want, wc, err2 := gatherComponentRef(ctx, c.db, "p", seed, map[string]bool{})
+		if err1 != nil || err2 != nil {
+			t.Fatal(err1, err2)
+		}
+		if !gc || !wc || len(got) != len(want) {
+			t.Fatalf("seed %s: capped %v/%v, size %d/%d", seed, gc, wc, len(got), len(want))
+		}
+		for k := range got {
+			if got[k].stableID != want[k].stableID {
+				t.Fatalf("seed %s: member %d is %s, want %s", seed, k, got[k].stableID, want[k].stableID)
+			}
+		}
 	}
 }
