@@ -23,6 +23,7 @@ import (
 	"log/slog"
 	"net/mail"
 	"os"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -366,6 +367,9 @@ func distinctTids(ctx context.Context, tx *sql.Tx, q string, args ...any) ([]str
 	return out, rows.Err()
 }
 
+// refMembersSQL lists the messages indexed under one id, in stable_id order.
+const refMembersSQL = `SELECT stable_id FROM message_ref WHERE account = ? AND ref_id = ? ORDER BY stable_id LIMIT ?`
+
 // gatherComponent loads the connected component of seed: every unthreadable-
 // by-Gmail message that shares an id with a member, transitively, plus the
 // threads a header-less reply could join by subject. Members are marked
@@ -377,6 +381,7 @@ func gatherComponent(ctx context.Context, tx dbq, account, seed string, visited 
 	set := map[string]threadRow{}
 	var order []string
 	idsSeen := map[string]bool{}
+	var refStmt *sql.Stmt
 	queue := []string{seed}
 	for len(queue) > 0 && len(set) < maxComponent {
 		rows, err := loadThreadRows(ctx, tx, account, queue)
@@ -439,26 +444,50 @@ func gatherComponent(ctx context.Context, tx dbq, account, seed string, visited 
 			}
 		}
 		for _, part := range chunks(fresh, idChunk) {
-			rs, err := tx.QueryContext(ctx, `SELECT DISTINCT stable_id FROM message_ref WHERE account = ? AND ref_id IN (`+inList(len(part))+`) LIMIT ?`,
-				append(strArgs(account, part), maxComponent+1)...)
-			if err != nil {
-				return nil, false, fmt.Errorf("gather thread: %w", err)
+			// One bounded lookup per id, served in order by the primary key
+			// (account, ref_id, stable_id), so a hot id (a shared "subj:" key)
+			// costs at most maxComponent+1 rows. A single IN (...) query with
+			// DISTINCT and LIMIT makes SQLite prefer a covering scan of
+			// message_ref_by_msg, a walk of the whole account per component.
+			// The first maxComponent+1 distinct ids of the union are within the
+			// union of each id's first maxComponent+1, so merging in Go gives
+			// the answer the single query gave.
+			if refStmt == nil {
+				if refStmt, err = tx.PrepareContext(ctx, refMembersSQL); err != nil {
+					return nil, false, fmt.Errorf("gather thread: %w", err)
+				}
+				defer refStmt.Close()
 			}
-			for rs.Next() {
-				var sid string
-				if err := rs.Scan(&sid); err != nil {
+			var sids []string
+			for _, ref := range part {
+				rs, err := refStmt.QueryContext(ctx, account, ref, maxComponent+1)
+				if err != nil {
+					return nil, false, fmt.Errorf("gather thread: %w", err)
+				}
+				for rs.Next() {
+					var sid string
+					if err := rs.Scan(&sid); err != nil {
+						_ = rs.Close()
+						return nil, false, fmt.Errorf("gather thread: %w", err)
+					}
+					sids = append(sids, sid)
+				}
+				if err := rs.Err(); err != nil {
 					_ = rs.Close()
 					return nil, false, fmt.Errorf("gather thread: %w", err)
 				}
+				_ = rs.Close()
+			}
+			sort.Strings(sids)
+			sids = slices.Compact(sids)
+			if len(sids) > maxComponent+1 {
+				sids = sids[:maxComponent+1]
+			}
+			for _, sid := range sids {
 				if _, ok := set[sid]; !ok {
 					queue = append(queue, sid)
 				}
 			}
-			if err := rs.Err(); err != nil {
-				_ = rs.Close()
-				return nil, false, fmt.Errorf("gather thread: %w", err)
-			}
-			_ = rs.Close()
 		}
 		for _, sid := range extra {
 			if _, ok := set[sid]; !ok {
@@ -513,6 +542,7 @@ func applyComponent(ctx context.Context, tx *sql.Tx, account string, comp []thre
 // dbq is what the read side of threading needs: a *sql.DB (a plan computed
 // outside any transaction) or a *sql.Tx.
 type dbq interface {
+	PrepareContext(ctx context.Context, query string) (*sql.Stmt, error)
 	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
 	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
 }
@@ -766,9 +796,12 @@ func refreshAggregates(ctx context.Context, tx *sql.Tx, account string, tids []s
 			continue
 		}
 		seen[tid] = true
+		// INDEXED BY: without table statistics SQLite walks every row of the
+		// account in the primary key and filters on tid, which makes each thread
+		// cost a pass over message_thread (and the backfill slower as it fills it).
 		rows, err := tx.QueryContext(ctx, `
 SELECT m.stable_id, m.from_addr, m.subject, `+arrivalCol+`, t.depth
-FROM message_thread t JOIN messages m ON m.account = t.account AND m.stable_id = t.stable_id
+FROM message_thread t INDEXED BY message_thread_by_tid JOIN messages m ON m.account = t.account AND m.stable_id = t.stable_id
 WHERE t.account = ? AND t.tid = ? ORDER BY `+arrivalCol+`, m.stable_id`, account, tid)
 		if err != nil {
 			return fmt.Errorf("thread aggregate: %w", err)
@@ -1220,7 +1253,7 @@ func (c *Cache) ThreadMessages(ctx context.Context, account, tid string) ([]Thre
 WHERE m.account = ? AND m.stable_id = ?`, account, id)
 	} else {
 		rows, err = c.db.QueryContext(ctx, `SELECT m.stable_id, `+dateCol+`, m.from_addr, m.subject, t.depth, t.outsider
-FROM message_thread t JOIN messages m ON m.account = t.account AND m.stable_id = t.stable_id
+FROM message_thread t INDEXED BY message_thread_by_tid JOIN messages m ON m.account = t.account AND m.stable_id = t.stable_id
 WHERE t.account = ? AND t.tid = ? ORDER BY `+dateCol+`, m.stable_id`, account, tid)
 	}
 	if err != nil {
