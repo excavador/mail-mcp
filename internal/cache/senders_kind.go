@@ -51,13 +51,13 @@ var (
 	// ends, so "piano.reply" does not match.
 	noreplyRE = regexp.MustCompile(`(?i)(^|[._+-])(no[-_.]?reply|do[-_.]?not[-_.]?reply)($|[._+0-9-])`)
 	// marketingRE matches a local part that names a bulk campaign stream
-	// (newsletter@, promotion5@, store-news@, ae-newsletter05.a0@, email.campaign@),
+	// (newsletter@, promotion5@, store-news@, ae-market.ae3@, ae-newsletter05.a0@, email.campaign@),
 	// each word delimited by separators, digits or the ends.
-	marketingRE = regexp.MustCompile(`(?i)(^|[._+=-])(newsletters?|news|nieuwsbrief|promo|promos|promotions?|promotional|deals?|offers?|offerte|aanbiedingen|marketing|campaigns?|digest|mailings?)($|[._+0-9=-])`)
+	marketingRE = regexp.MustCompile(`(?i)(^|[._+=-])(newsletters?|news|nieuwsbrief|promo|promos|promotions?|promotional|deals?|market|offers?|offerte|aanbiedingen|marketing|campaigns?|digest|mailings?)($|[._+0-9=-])`)
 	txnSubjRE   = regexp.MustCompile(`(?i)\b(order|orders|invoice|receipt|shipping|shipped|shipment|delivery|delivered|payment|paid|refund|tracking|bestell\w*|factuur|bezorg\w*|betaling|pakket|verzonden|unterwegs|versand\w*|rechnung|commande|facture|livraison|booking|reservation|reservering|tickets?|trip|confirmed|confirmation|purchase|bevestiging|levering|bestätigung|boarding)\b`)
 	// promoSubjRE marks a subject that sells ("Free shipping on your order",
 	// "Delivery deals"): it only counts as order mail with an order number.
-	promoSubjRE = regexp.MustCompile(`(?i)\b(free|gratis|deals?|sale|discount|korting|coupons?|promo\w*|save|offers?|aanbieding\w*|now|nu|win|new)\b|\d+ ?% ?off`)
+	promoSubjRE = regexp.MustCompile(`(?i)\b(free|gratis|deals?|sale|off|discount|korting|coupons?|promo\w*|save|offers?|aanbieding\w*|now|nu|win|new)\b|\d+ ?% ?off`)
 	// orderNumRE is order evidence in a subject: #12345, an Amazon 3-7-7 id, "order no".
 	orderNumRE = regexp.MustCompile(`(?i)#\d{5,}|\b\d{3}-\d{7}-\d{7}\b|\b(order|bestelling|bestelnummer)\s*(no|nr|number|nummer)\b`)
 
@@ -131,8 +131,7 @@ func isShop(domain string) bool {
 //
 //   - a campaign-style local part (newsletter@, promotion@, deals@) with bulk
 //     evidence: any List-Id or List-Unsubscribe at an unknown domain; at a known
-//     shop, carrier or payment domain a List-Id or List-Unsubscribe on most
-//     messages; or
+//     shop, carrier or payment domain the address alone (no header needed); or
 //   - List-Unsubscribe on most of at least 3 messages of a non-noreply address;
 //     at a known shop also with no order-shaped subject (or a List-Id).
 //
@@ -146,9 +145,10 @@ func IsMarketing(in KindInputs, shop bool) bool {
 	unsubMajority := in.NMsgs > 0 && in.NUnsub*2 > in.NMsgs
 	if marketingRE.MatchString(lp) {
 		if shop {
-			if in.NList > 0 || unsubMajority {
-				return true
-			}
+			// A campaign-style address at a shop says marketing by itself: the
+			// shop's order mail does not come from promotion@ or store-news@,
+			// and these streams often carry no List-Unsubscribe header.
+			return true
 		} else if in.NList > 0 || in.NUnsub > 0 {
 			return true
 		}
