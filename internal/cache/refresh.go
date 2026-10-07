@@ -758,11 +758,6 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		if err != nil {
 			return 0, false, fmt.Errorf("index message: %w", err)
 		}
-		if _, err := tx.ExecContext(ctx,
-			`INSERT INTO message_fts (subject, from_addr, to_addr, cc_addr, body, account, stable_id) VALUES (?, ?, ?, ?, ?, ?, ?)`,
-			p.Subject, p.From, p.To, p.Cc, p.Body, account, info.stableID); err != nil {
-			return 0, false, fmt.Errorf("index text: %w", err)
-		}
 		if err := indexText2Tx(ctx, tx, rid, account, info.stableID, p); err != nil {
 			return 0, false, err
 		}

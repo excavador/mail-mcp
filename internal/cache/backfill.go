@@ -67,16 +67,6 @@ SELECT ?, 0, CASE WHEN COUNT(*) = 0 THEN 1 ELSE 0 END, ?, COALESCE(MAX(rowid), 0
 	return nil
 }
 
-// FTSTable names the full-text table search should use and whether it is the
-// new one. It is message_fts2 once the backfill has indexed every message that
-// existed before it, otherwise message_fts (the original, still written).
-func (c *Cache) FTSTable() (table string, ready bool) {
-	if c.fts2Ready.Load() {
-		return "message_fts2", true
-	}
-	return "message_fts", false
-}
-
 // BackfillStatus reports the progress of the message_fts2 backfill.
 func (c *Cache) BackfillStatus(ctx context.Context) (BackfillStatus, error) {
 	var (

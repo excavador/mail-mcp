@@ -40,7 +40,7 @@ type parsed struct {
 	Date                  time.Time
 	ListID, GitHubReason  string
 	ListUnsub             bool   // a List-Unsubscribe header is present
-	Body                  string // whole text, quotes included (message_fts)
+	Body                  string // whole text, quotes included (message_fts2.body_full)
 	BodyNew               string // CleanBody(Body) (message_fts2.body_new)
 	Atts                  []AttachmentMeta
 	Thr                   threadHeaders // Message-ID, In-Reply-To, References, from the same parse

@@ -51,10 +51,7 @@ func TestQASearchV2PagesAreDisjointAndCoverEverything(t *testing.T) {
 		t.Run(fmt.Sprintf("fts2ready=%v", ready), func(t *testing.T) {
 			c := thrOpen(t)
 			nA := qaSearchCorpus(t, c)
-			c.fts2Ready.Store(ready)
-			if _, r := c.FTSTable(); r != ready {
-				t.Fatal("seam")
-			}
+			c.fts2Ready.Store(ready) // search reads fts2 either way
 			for _, mode := range []string{"thread", "message"} {
 				seen := map[string]int{}
 				total := -1

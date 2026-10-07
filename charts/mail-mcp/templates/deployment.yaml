@@ -71,6 +71,13 @@ spec:
           # /healthz is liveness only and does NOT call external services:
           # a readiness probe that fails when a dependency blips would take
           # the pod out of service for something it cannot fix by restarting.
+          # Open can run one-time work before the server listens (the drop of the
+          # retired message_fts table, backfill init). Liveness only starts once
+          # this passes: up to 10s x 30 = 300s for a first start.
+          startupProbe:
+            httpGet: {path: /healthz, port: http}
+            periodSeconds: 10
+            failureThreshold: 30
           livenessProbe:
             httpGet: {path: /healthz, port: http}
             initialDelaySeconds: 5

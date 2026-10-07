@@ -487,7 +487,7 @@ func snapshot(t *testing.T, e *wenv) (rows string, blobs map[string]blobSnap) {
 		return sb.String()
 	}
 	rows = dump(`SELECT * FROM messages ORDER BY account, stable_id`) + "--\n" +
-		dump(`SELECT rowid, subject, from_addr, to_addr, cc_addr, body, account, stable_id FROM message_fts ORDER BY rowid`)
+		dump(`SELECT rowid, subject, from_addr, to_addr, cc_addr, body_new, body_full, account, stable_id FROM message_fts2 ORDER BY rowid`)
 	blobs = map[string]blobSnap{}
 	err := filepath.WalkDir(filepath.Join(e.dir, "cache", "blobs"), func(p string, d fs.DirEntry, err error) error {
 		if err != nil || d.IsDir() {
@@ -520,7 +520,7 @@ func TestMoveChangesMembershipButNotMessagesIndexOrBlobs(t *testing.T) {
 	sameSet(t, "INBOX", e.members("acct", "INBOX"), "b1")
 	rows1, blobs1 := snapshot(t, e)
 	if rows0 != rows1 {
-		t.Errorf("messages or message_fts changed by a move:\n%s\n---\n%s", rows0, rows1)
+		t.Errorf("messages or message_fts2 changed by a move:\n%s\n---\n%s", rows0, rows1)
 	}
 	if len(blobs0) != len(blobs1) {
 		t.Errorf("blob count %d -> %d", len(blobs0), len(blobs1))

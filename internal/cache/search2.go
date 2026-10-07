@@ -74,9 +74,7 @@ type matchPlan struct {
 	args   []any
 	empty  bool   // nothing searchable in the query: nothing matches
 	expr   string // the full-text expression, "" when the query has no text
-	fts2   bool
-	table  string
-	hasAtt bool // the attachment branch is part of the set
+	hasAtt bool   // the attachment branch is part of the set
 }
 
 // ValidateExclusions checks the exclusion lists of a search or saved query:
@@ -225,14 +223,6 @@ func (c *Cache) matchSQL(q SearchQuery) (matchPlan, error) {
 		p.args = fa
 		return p, nil
 	}
-	table, fts2 := c.FTSTable()
-	p.table, p.fts2 = table, fts2
-	if !fts2 {
-		p.ctes = `match AS (SELECT ` + table + `.rowid AS rid, ` + cols + `, 0 AS att FROM ` + table + ` JOIN messages m ON m.account = ` + table + `.account AND m.stable_id = ` + table + `.stable_id
-WHERE ` + table + ` MATCH ?` + and + `)`
-		p.args = append([]any{p.expr}, fa...)
-		return p, nil
-	}
 	if q.FTSSyntax {
 		// The user's own column filters would break on attachment_fts, so the
 		// attachment branch is left out; "body:" maps to both body columns.
@@ -294,16 +284,11 @@ func (c *Cache) snippets(ctx context.Context, p matchPlan, rows []snipRef) map[i
 			msg = append(msg, r.rid)
 		}
 	}
-	if p.fts2 {
-		run(`SELECT rowid, replace(replace(CASE WHEN instr(a, char(1)) > 0 OR instr(b, char(1)) = 0 THEN a ELSE b END, char(1), '['), char(2), ']') -- msg
+	run(`SELECT rowid, replace(replace(CASE WHEN instr(a, char(1)) > 0 OR instr(b, char(1)) = 0 THEN a ELSE b END, char(1), '['), char(2), ']') -- msg
 FROM (SELECT rowid, snippet(message_fts2, 4, char(1), char(2), '…', 20) AS a, snippet(message_fts2, 5, char(1), char(2), '…', 20) AS b
       FROM message_fts2 WHERE message_fts2 MATCH ? AND rowid IN (?IDS))`, msg)
-		run(`SELECT rowid, 'attachment: ' || replace(replace(snippet(attachment_fts, -1, char(1), char(2), '…', 20), char(1), '['), char(2), ']') -- att
+	run(`SELECT rowid, 'attachment: ' || replace(replace(snippet(attachment_fts, -1, char(1), char(2), '…', 20), char(1), '['), char(2), ']') -- att
 FROM attachment_fts WHERE attachment_fts MATCH ? AND rowid IN (?IDS)`, att)
-	} else {
-		run(`SELECT rowid, snippet(`+p.table+`, 4, '[', ']', '…', 20) -- msg
-FROM `+p.table+` WHERE `+p.table+` MATCH ? AND rowid IN (?IDS)`, msg)
-	}
 	return out
 }
 
