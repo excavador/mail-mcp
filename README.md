@@ -52,6 +52,8 @@ accounts:
     aliases:                       # optional, see below
       - me@example.com             # exact address
       - "@example.org"             # any address at this domain
+    displayName: Oleg Tsarev       # optional: name on the From line of drafts
+    drafts: true                   # optional, default true; false turns draft creation off
 ```
 
 #### Owner aliases
@@ -125,6 +127,31 @@ v1 will add organising tools and history, guarded by intent approval:
 - **`fetch_message`** — retrieve one message for reading or forwarding
 - **`sender_stats`** — when was the last message from a person, how many have you sent to them
 - **`create_folder`**, **`apply`**, **`undo`**, **`reapply`** — move and label messages with a history of intents, so a mistake can be rolled back
+
+### Drafts
+
+`preview_draft` and `create_draft` write a message into the account's **Drafts folder** for you to review and send yourself. **mail-mcp never sends mail**: there is no SMTP code in it and no send tool. The only mailbox write drafts add is one IMAP `APPEND` of the previewed message, flagged `\Draft \Seen`. It works the same way for Gmail and for Proton.
+
+| tool | |
+|---|---|
+| `preview_draft` | `account`; `reply_to` (stable id of a cached message), `reply_all`, `to`, `cc`, `bcc`, `subject`, `body` (plain UTF-8, at most 100 KB), `from`, `quote_original`. Returns the whole rendered message (headers and body) exactly as it would be saved, the Drafts folder, and a preview token (15 minutes, like `preview_intent`). Nothing is saved. |
+| `create_draft` | `preview_token`, `approved: true`, and the echo fields `expect_account`, `expect_from`, `expect_to_count`, `expect_subject`, which must restate the preview (so the client's approval prompt shows what is being saved). Appends the previewed bytes to Drafts and returns the folder, the Message-ID and the UID (`APPENDUID`) when the server reports one. Recorded in the history (account, folder, Message-ID, UID, sender, recipients, subject, the answered message; never the body). |
+
+Both are on the admin endpoint only. A draft cannot be undone from mail-mcp, which deletes nothing: discard it in Gmail or Proton.
+
+**Reviewing and sending.** Open the account's Drafts in Gmail or Proton (or any client), read the draft, edit it if you like, and press Send there. Bcc recipients are kept in the draft's headers so the client shows them.
+
+**Replies.** With `reply_to` the draft carries `In-Reply-To` and `References` built from the original, goes to the original's `Reply-To` (else `From`), and with `reply_all` also to everyone else on its To and Cc, minus every address of yours (username and aliases) and minus duplicates. A reply to a message you sent goes to the people it was sent to. An explicit `to` replaces the computed To; `cc` and `bcc` are added. The subject defaults to `Re: <original subject>` (an existing `Re:` is not repeated). Unless `quote_original` is false the original is appended as `On <date>, <from> wrote:` and the text quoted with `> `, capped at 20 KB. The original is third-party content: it is quoted as text and never interpreted.
+
+**Sender.** `from` must be the account's `username`, one of its `aliases`, or, for an `"@domain"` alias, any address at that domain; anything else is refused. Without `from`, the address the original was sent to (in To, then Cc, then Delivered-To) is used when it is one of yours, else the username. `displayName` of the account, if set, is the name on the From line. The username must be an e-mail address for the default to work.
+
+**Proton.** Proton Bridge accepts the draft only from an address of the Proton account; for any other sender the `APPEND` is refused and the Bridge's own words are returned in the tool error (nothing is saved). Use `from` (or an alias in the configuration) to choose among the account's addresses.
+
+**Drafts folder.** The folder the server marks with the `\Drafts` special-use attribute (Gmail: `[Gmail]/Drafts`), else a folder named exactly `Drafts` (Proton Bridge); with neither, the tools refuse. `preview_draft` reads the folder list the cache already holds; `create_draft` looks it up again on the server and refuses if it is not the previewed one.
+
+**Safety switch.** `drafts: false` on an account turns both tools off for it.
+
+**Shape of the message.** `Date`, `From`, `To`, `Cc`, `Bcc`, `Subject` (RFC 2047 when not ASCII), a generated `Message-ID` at the sender's domain, `In-Reply-To`/`References`, `MIME-Version: 1.0`, `Content-Type: text/plain; charset=utf-8`, `Content-Transfer-Encoding: quoted-printable`, CRLF line ends. CR, LF and NUL in any header value are refused, addresses must parse (`net/mail`) and be plain ASCII, and a draft has at most 50 recipients.
 
 ### Approval mode
 
@@ -259,6 +286,8 @@ from <https://poppler.freedesktop.org/>.
 ## What it will not do
 
 **There is no delete tool, and there will not be one.** Moves are reversible; deletes are not. The only way to throw a message away is to move it, so you can undo it later.
+
+**It never sends mail.** There is no SMTP code and no send tool. Drafts are saved in the Drafts folder ([above](#drafts)); sending is yours, from your own mail client.
 
 ## Two things to know before deploying it
 

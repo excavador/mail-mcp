@@ -61,6 +61,7 @@ func addWriteTools(s *mcp.Server, d writeDeps) {
 	addTagMessages(s, d)
 	addUntagMessages(s, d)
 	addSaveQuery(s, d)
+	addDraftTools(s, d)
 }
 
 // --- create_folder ----------------------------------------------------------
@@ -575,8 +576,21 @@ type listHistoryIn struct {
 }
 
 type historyUntrusted struct {
-	Intent *organise.Intent `json:"intent,omitempty"`
-	Target string           `json:"target,omitempty"`
+	Intent *organise.Intent   `json:"intent,omitempty"`
+	Target string             `json:"target,omitempty"`
+	Draft  *history.DraftInfo `json:"draft,omitempty"`
+}
+
+// cleanDraft sanitises a recorded draft for display: its recipients and subject
+// were partly taken from third-party mail.
+func cleanDraft(in *history.DraftInfo) *history.DraftInfo {
+	if in == nil {
+		return nil
+	}
+	c := *in
+	c.Folder, c.MessageID, c.From, c.Subject, c.ReplyToID = field(c.Folder), field(c.MessageID), field(c.From), field(c.Subject), field(c.ReplyToID)
+	c.To, c.Cc, c.Bcc = fieldAll(c.To), fieldAll(c.Cc), fieldAll(c.Bcc)
+	return &c
 }
 
 type historyView struct {
@@ -645,7 +659,7 @@ func cleanIntent(in *organise.Intent) *organise.Intent {
 func addListHistory(s *mcp.Server, byName map[string]accounts.Account, hist *history.Store) {
 	mcp.AddTool(s, &mcp.Tool{
 		Name: "list_history",
-		Description: "List what mail-mcp changed in the mailboxes, newest first: folders created, intents applied, " +
+		Description: "List what mail-mcp changed in the mailboxes, newest first: folders created, drafts saved, intents applied, " +
 			"undone and reapplied, with the record id to pass to undo or reapply, how many messages each touched, " +
 			"and how it was approved.",
 		Annotations: readOnly(),
@@ -672,7 +686,7 @@ func addListHistory(s *mcp.Server, byName map[string]accounts.Account, hist *his
 				OldKind: field(r.OldKind), NewKind: field(r.NewKind),
 				TouchedCount: touchedCount(r), AlreadyInTarget: countIDs(r.AlreadyInTarget), CopiedBack: countIDs(r.CopiedBack), Skipped: r.Skipped, NotPreviewed: r.NotPreviewed,
 				Error: field(r.Error), Undoes: field(r.Undoes), Reapplies: field(r.Reapplies),
-				Untrusted: historyUntrusted{Intent: cleanIntent(r.Intent), Target: field(r.Target)},
+				Untrusted: historyUntrusted{Intent: cleanIntent(r.Intent), Target: field(r.Target), Draft: cleanDraft(r.Draft)},
 			})
 		}
 		out.Count = len(out.Records)
@@ -706,6 +720,8 @@ func addUndo(s *mcp.Server, d writeDeps) {
 			return nil, nil, errors.New("no such history record")
 		}
 		switch rec.Kind {
+		case history.KindCreateDraft:
+			return nil, nil, errors.New("a draft cannot be undone from here (mail-mcp deletes nothing): discard it in your mail client")
 		case history.KindSetSenderKind, history.KindTagMessages, history.KindUntagMessages:
 			out, err := undoLocal(ctx, d, rec)
 			return nil, out, err

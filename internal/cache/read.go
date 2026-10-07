@@ -502,12 +502,9 @@ type Message struct {
 // maxAttachments bounds the attachment listing for a hostile MIME tree.
 const maxAttachments = 200
 
-// ReadMessage loads one message from the cache. The blob is located from the
-// index row for (account, stableID) and from nothing else, so a stable id
-// that belongs to another account, or to no message, is ErrNotFound and no
-// caller-supplied string ever becomes a path. The text body is cut to
-// maxBody bytes on a UTF-8 boundary.
-func (c *Cache) ReadMessage(ctx context.Context, account, stableID string, maxBody int) (*Message, error) {
+// readBlob loads the raw bytes of one message, located from the index row for
+// (account, stableID) and from nothing else.
+func (c *Cache) readBlob(ctx context.Context, account, stableID string) ([]byte, error) {
 	var sum string
 	err := c.db.QueryRowContext(ctx,
 		`SELECT blob_sha256 FROM messages WHERE account = ? AND stable_id = ?`, account, stableID).Scan(&sum)
@@ -527,6 +524,19 @@ func (c *Cache) ReadMessage(ctx context.Context, account, stableID string, maxBo
 			return nil, ErrBlobMissing
 		}
 		return nil, fmt.Errorf("cache: read blob: %w", err)
+	}
+	return raw, nil
+}
+
+// ReadMessage loads one message from the cache. The blob is located from the
+// index row for (account, stableID) and from nothing else, so a stable id
+// that belongs to another account, or to no message, is ErrNotFound and no
+// caller-supplied string ever becomes a path. The text body is cut to
+// maxBody bytes on a UTF-8 boundary.
+func (c *Cache) ReadMessage(ctx context.Context, account, stableID string, maxBody int) (*Message, error) {
+	raw, err := c.readBlob(ctx, account, stableID)
+	if err != nil {
+		return nil, err
 	}
 	fm, err := c.foldersByID(ctx, account, []string{stableID})
 	if err != nil {

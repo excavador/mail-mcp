@@ -75,6 +75,12 @@ type Organiser struct {
 	order    []string // tokens, oldest first
 
 	slots sync.Map // account -> chan struct{} (capacity 1)
+
+	// drafts are the previews of preview_draft, kept apart from the intents: a
+	// draft token never opens apply_intent and an intent token never opens
+	// create_draft. They share the signing key, the lifetime and the cap.
+	drafts     map[string]*DraftPreview
+	draftOrder []string
 }
 
 // New returns an Organiser over store with a fresh random signing key.
@@ -83,7 +89,7 @@ func New(store *cache.Cache) (*Organiser, error) {
 	if _, err := rand.Read(key); err != nil {
 		return nil, fmt.Errorf("organise: signing key: %w", err)
 	}
-	return &Organiser{store: store, key: key, previews: map[string]*Preview{}}, nil
+	return &Organiser{store: store, key: key, previews: map[string]*Preview{}, drafts: map[string]*DraftPreview{}}, nil
 }
 
 // Acquire takes the account's write slot. A second caller does not wait: it is
