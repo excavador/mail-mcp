@@ -47,6 +47,49 @@ func TestClassifySender(t *testing.T) {
 	}
 }
 
+func TestClassifyMarketing(t *testing.T) {
+	cases := []struct {
+		name string
+		in   KindInputs
+		want string
+	}{
+		// Marketing that read as transactional (shop domain) or human.
+		{"shop promotion@, unsub", KindInputs{Addr: "promotion@aliexpress.com", NMsgs: 60, NUnsub: 60}, KindList},
+		{"shop campaign address, unsub majority", KindInputs{Addr: "ae-market.ae3@deals.aliexpress.com", NMsgs: 17, NUnsub: 17}, KindList},
+		{"shop store-news@ with no headers", KindInputs{Addr: "store-news@amazon.nl", NMsgs: 247}, KindList},
+		{"shop offers@ any tld", KindInputs{Addr: "amazon-offers@amazon.co.uk", NMsgs: 21}, KindList},
+		{"shop promotionN@", KindInputs{Addr: "promotion5@amazon.de", NMsgs: 12, NUnsub: 12}, KindList},
+		{"shop newsletter@ with list id", KindInputs{Addr: "newsletter@update.thuisbezorgd.nl", NMsgs: 48, NList: 48, NUnsub: 48}, KindList},
+		{"shop email.campaign@", KindInputs{Addr: "email.campaign@sg.booking.com", NMsgs: 89, NUnsub: 80}, KindList},
+		{"newsletters-noreply@", KindInputs{Addr: "newsletters-noreply@social.example", NMsgs: 133, NUnsub: 133, NTxn: 2}, KindList},
+		{"unsub majority, plain address", KindInputs{Addr: "info@mail.shop.example", NMsgs: 65, NUnsub: 60, NTxn: 3}, KindList},
+		{"newsletter@ with unsub", KindInputs{Addr: "newsletter@gamerant.example", NMsgs: 115, NUnsub: 115}, KindList},
+		{"news@ with unsub", KindInputs{Addr: "news@studio.example", NMsgs: 185, NUnsub: 185}, KindList},
+		{"hello@ with unsub majority", KindInputs{Addr: "hello@app.example", NMsgs: 74, NUnsub: 74}, KindList},
+		{"digest sender with unsub", KindInputs{Addr: "digest@quora.example", NMsgs: 476, NUnsub: 476}, KindList},
+		// Must not change.
+		{"order confirmation at shop", KindInputs{Addr: "auto-bevestiging@amazon.nl", NMsgs: 234, NTxn: 230}, KindTransactional},
+		{"shipping at shop, no headers", KindInputs{Addr: "verzending-volgen@amazon.nl", NMsgs: 556, NTxn: 540}, KindTransactional},
+		{"shop order mail with stray unsub", KindInputs{Addr: "automail@bol.com", NMsgs: 272, NTxn: 250, NUnsub: 272}, KindTransactional},
+		{"carrier", KindInputs{Addr: "noreply@dhlparcel.nl", NMsgs: 98, NTxn: 90}, KindTransactional},
+		{"carrier with list-id and parcel subjects", KindInputs{Addr: "notificatie@edm.postnl.nl", NMsgs: 49, NList: 49, NUnsub: 49, NTxn: 40}, KindTransactional},
+		{"payment processor", KindInputs{Addr: "service@paypal.com", NMsgs: 1046, NTxn: 900}, KindTransactional},
+		{"shop transaction@ no unsub", KindInputs{Addr: "transaction@notice.aliexpress.com", NMsgs: 46, NTxn: 20}, KindTransactional},
+		{"noreply with unsub stays notification", KindInputs{Addr: "notifications-noreply@social.example", NMsgs: 300, NUnsub: 300}, KindNotification},
+		{"noreply with order subjects", KindInputs{Addr: "noreply@brand.example", NMsgs: 10, NTxn: 8, NUnsub: 10}, KindTransactional},
+		{"newsletter-like address without bulk evidence at unknown domain", KindInputs{Addr: "news@home.example", NMsgs: 3}, KindHuman},
+		{"a person with an occasional unsub", KindInputs{Addr: "alice@home.example", NMsgs: 20, NUnsub: 2}, KindHuman},
+		{"newsletter@ but mostly invoices", KindInputs{Addr: "newsletter@shop.example", NMsgs: 10, NUnsub: 10, NTxn: 8}, KindHuman},
+		{"owner replied beats marketing", KindInputs{Addr: "newsletter@shop.example", NMsgs: 10, NUnsub: 10, NReplied: 1}, KindHuman},
+		{"renewsletter is not the word newsletter", KindInputs{Addr: "renewsletter@x.example", NMsgs: 3, NUnsub: 1}, KindHuman},
+	}
+	for _, c := range cases {
+		if got := ClassifySender(c.in); got != c.want {
+			t.Errorf("%s: got %s, want %s", c.name, got, c.want)
+		}
+	}
+}
+
 func TestRegistrableDomain(t *testing.T) {
 	for in, want := range map[string]string{
 		"a@mail.github.com":  "github.com",
@@ -404,5 +447,46 @@ func TestToMeIsExactAndAddressesAreValidated(t *testing.T) {
 	}
 	if len(b.deltas) != 2 {
 		t.Errorf("invalid addresses were stored: %d keys", len(b.deltas))
+	}
+}
+
+func TestReclassifySendersOnlyRuleDerived(t *testing.T) {
+	c := thrOpen(t)
+	ins := func(addr, kind, source string) {
+		t.Helper()
+		if _, err := c.db.Exec(`INSERT INTO senders (account, addr, domain, n_msgs, n_unsub, kind, kind_source) VALUES ('acc', ?, ?, 10, 10, ?, ?)`,
+			addr, RegistrableDomain(addr), kind, source); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ins("promotion@aliexpress.com", KindTransactional, SourceRule)
+	ins("newsletter@brand.example", KindHuman, SourceRule)
+	ins("promotion@amazon.nl", KindTransactional, SourceOwner)
+	ins("news@other.example", KindHuman, SourceLLM)
+	if _, err := c.db.Exec(`DELETE FROM backfill WHERE name = ?`, sendersRulesMarker); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.reclassifySenders(); err != nil {
+		t.Fatal(err)
+	}
+	for addr, want := range map[string]string{
+		"promotion@aliexpress.com": KindList,
+		"newsletter@brand.example": KindList,
+		"promotion@amazon.nl":      KindTransactional, // owner-set: untouched
+		"news@other.example":       KindHuman,         // llm-set: untouched
+	} {
+		if got := sndRow(t, c, addr).Kind; got != want {
+			t.Errorf("%s: got %s, want %s", addr, got, want)
+		}
+	}
+	// Once per rules version: an owner-visible rule row edited later stays put.
+	if _, err := c.db.Exec(`UPDATE senders SET kind = 'human' WHERE addr = 'newsletter@brand.example'`); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.reclassifySenders(); err != nil {
+		t.Fatal(err)
+	}
+	if got := sndRow(t, c, "newsletter@brand.example").Kind; got != KindHuman {
+		t.Errorf("second run reclassified: %s", got)
 	}
 }

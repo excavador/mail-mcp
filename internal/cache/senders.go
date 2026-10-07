@@ -570,7 +570,65 @@ SELECT ?, 0, CASE WHEN COUNT(*) = 0 THEN 1 ELSE 0 END, ?, COALESCE(MAX(rowid), 0
 		return fmt.Errorf("init senders: %w", err)
 	}
 	c.sendersMax.Store(max)
-	return nil
+	return c.reclassifySenders()
+}
+
+// sendersRulesMarker is the backfill row that records which version of the
+// kind rules classified the senders table. A new version changes the name, so
+// the first start after an upgrade re-runs the rules once.
+const sendersRulesMarker = "senders_rules_2"
+
+// reclassifySenders re-runs ClassifySender on every rule-derived sender from
+// its stored counts, once per rules version. Owner decisions (kind_source
+// owner, and llm) are never touched.
+func (c *Cache) reclassifySenders() error {
+	res, err := c.db.Exec(`INSERT OR IGNORE INTO backfill (name, last_rowid, done, updated_at) VALUES (?, 0, 1, ?)`,
+		sendersRulesMarker, c.now().Unix())
+	if err != nil {
+		return fmt.Errorf("reclassify senders: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n != 1 {
+		return nil
+	}
+	tx, err := c.db.Begin()
+	if err != nil {
+		return fmt.Errorf("reclassify senders: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	rows, err := tx.Query(`SELECT account, addr, domain, kind, n_msgs, n_replied_by_me, n_list, n_unsub, n_gh, n_txn_subj, n_auto
+FROM senders WHERE kind_source = 'rule'`)
+	if err != nil {
+		return fmt.Errorf("reclassify senders: %w", err)
+	}
+	type change struct{ account, addr, kind string }
+	var changes []change
+	for rows.Next() {
+		var (
+			account, addr, domain, kind                 string
+			n, replied, nList, nUnsub, nGH, nTxn, nAuto int
+		)
+		if err := rows.Scan(&account, &addr, &domain, &kind, &n, &replied, &nList, &nUnsub, &nGH, &nTxn, &nAuto); err != nil {
+			_ = rows.Close()
+			return fmt.Errorf("reclassify senders: %w", err)
+		}
+		nk := ClassifySender(KindInputs{Addr: addr, Domain: domain, NMsgs: n, NReplied: replied, NList: nList, NUnsub: nUnsub, NGH: nGH, NTxn: nTxn, NAuto: nAuto})
+		if nk != kind {
+			changes = append(changes, change{account, addr, nk})
+		}
+	}
+	err = rows.Err()
+	_ = rows.Close()
+	if err != nil {
+		return fmt.Errorf("reclassify senders: %w", err)
+	}
+	now := c.now().Unix()
+	for _, ch := range changes {
+		if _, err := tx.Exec(`UPDATE senders SET kind = ?, kind_updated_at = ? WHERE account = ? AND addr = ? AND kind_source = 'rule'`,
+			ch.kind, now, ch.account, ch.addr); err != nil {
+			return fmt.Errorf("reclassify senders: %w", err)
+		}
+	}
+	return tx.Commit()
 }
 
 func (c *Cache) resetSenders() error {
