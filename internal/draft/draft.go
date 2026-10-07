@@ -37,6 +37,11 @@ const (
 	// maxReferences is how many Message-IDs References keeps: the first (the
 	// root of the thread) and the most recent ones.
 	maxReferences = 20
+	// maxIDLen caps one Message-ID token; maxHeaderLine caps a header line
+	// (RFC 5322 section 2.1.1).
+	maxIDLen      = 255
+	maxHeaderLine = 998
+	maxNameRunes  = 100
 )
 
 // Original is the message a reply answers, as the cache holds it. Every field
@@ -92,6 +97,11 @@ type Message struct {
 	InReplyTo   string
 	// Body is the plain text of the message (the typed text plus any quote).
 	Body string
+	// ToAddrs, CcAddrs and BccAddrs are the bare, lowercase addresses.
+	ToAddrs, CcAddrs, BccAddrs []string
+	// ReplyToRedirect: the recipients come from a Reply-To that names someone
+	// other than the original's sender.
+	ReplyToRedirect bool
 }
 
 // Error is a refusal whose text is safe to show the caller.
@@ -143,6 +153,9 @@ func checkAddr(field string, a *mail.Address) (*mail.Address, error) {
 		return nil, refusef("%s: %q is not a plain ASCII address (name@domain)", field, trunc(a.Address))
 	}
 	a.Name = cleanName(a.Name)
+	if r := []rune(a.Name); len(r) > maxNameRunes {
+		a.Name = string(r[:maxNameRunes])
+	}
 	return a, nil
 }
 
@@ -271,17 +284,19 @@ func ReplySubject(orig string) string {
 
 var msgIDTokenRE = regexp.MustCompile(`^<[!-;=?-~]+>$`)
 
+func validMsgID(t string) bool { return len(t) <= maxIDLen && msgIDTokenRE.MatchString(t) }
+
 // threadHeaders builds In-Reply-To and References from the original's
 // Message-ID and References: the original's chain plus the original, without
 // duplicates, the first and the most recent maxReferences-1 kept.
 func threadHeaders(o *Original) (inReplyTo string, refs []string) {
 	id := strings.TrimSpace(o.MessageID)
-	if !msgIDTokenRE.MatchString(id) {
+	if !validMsgID(id) {
 		return "", nil
 	}
 	seen := map[string]bool{}
 	for _, t := range append(strings.Fields(o.References), id) {
-		if msgIDTokenRE.MatchString(t) && !seen[t] {
+		if validMsgID(t) && !seen[t] {
 			seen[t] = true
 			refs = append(refs, t)
 		}
@@ -340,6 +355,25 @@ func stripControls(s string) string {
 		}
 		return -1
 	}, s)
+}
+
+// replyToRedirects reports whether the original's Reply-To names an address
+// that is not among its From addresses: a reply would go somewhere the
+// sender's own address is not.
+func replyToRedirects(o *Original) bool {
+	if len(o.ReplyTo) == 0 {
+		return false
+	}
+	from := map[string]bool{}
+	for _, f := range o.From {
+		from[strings.ToLower(strings.TrimSpace(f.Address))] = true
+	}
+	for _, r := range o.ReplyTo {
+		if !from[strings.ToLower(strings.TrimSpace(r.Address))] {
+			return true
+		}
+	}
+	return false
 }
 
 func formatAddr(a *mail.Address) string { return a.String() }
@@ -402,6 +436,7 @@ func Compose(in Input) (*Message, error) {
 	}
 
 	// Recipients.
+	redirect := false
 	to, err := parseAll("to", in.To)
 	if err != nil {
 		return nil, err
@@ -423,6 +458,9 @@ func Compose(in Input) (*Message, error) {
 			to = rto
 		}
 		cc = append(rcc, cc...)
+		if len(in.To) == 0 && replyToRedirects(o) {
+			redirect = true
+		}
 	}
 	if len(to) == 0 {
 		return nil, refusef("to is required when there is no reply_to")
@@ -484,6 +522,14 @@ func Compose(in Input) (*Message, error) {
 	for _, p := range bcc {
 		m.Bcc = append(m.Bcc, formatAddr(p))
 	}
+	bare := func(l []*mail.Address) []string {
+		var out []string
+		for _, p := range l {
+			out = append(out, strings.ToLower(p.Address))
+		}
+		return out
+	}
+	m.ToAddrs, m.CcAddrs, m.BccAddrs, m.ReplyToRedirect = bare(to), bare(cc), bare(bcc), redirect
 
 	var b strings.Builder
 	hdr := func(name, value string) error {
@@ -520,6 +566,11 @@ func Compose(in Input) (*Message, error) {
 			return nil, err
 		}
 	}
+	for _, ln := range strings.Split(b.String(), "\r\n") {
+		if len(ln) > maxHeaderLine {
+			return nil, refusef("a header line is longer than %d bytes", maxHeaderLine)
+		}
+	}
 	b.WriteString("\r\n")
 	var qp strings.Builder
 	w := quotedprintable.NewWriter(&qp)
@@ -547,7 +598,36 @@ func normalizeNewlines(s string) string {
 func joinAddrs(l []string) string { return strings.Join(l, ", ") }
 
 // encodeSubject RFC 2047-encodes a subject that is not plain ASCII.
-func encodeSubject(s string) string { return mime.QEncoding.Encode("utf-8", s) }
+//
+// A plain ASCII subject that itself looks like an encoded word ("=?...?=") is
+// encoded too, so a client shows the subject that was previewed and does not
+// decode it into something else.
+func encodeSubject(s string) string {
+	if strings.Contains(s, "=?") && strings.Contains(s, "?=") && mime.QEncoding.Encode("utf-8", s) == s {
+		return forceQ(s)
+	}
+	return mime.QEncoding.Encode("utf-8", s)
+}
+
+// forceQ Q-encodes an ASCII string in encoded words of at most 30 source bytes.
+func forceQ(s string) string {
+	var words []string
+	for len(s) > 0 {
+		n := min(30, len(s))
+		var b strings.Builder
+		for i := 0; i < n; i++ {
+			c := s[i]
+			if c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' {
+				b.WriteByte(c)
+			} else {
+				fmt.Fprintf(&b, "=%02X", c)
+			}
+		}
+		words = append(words, "=?utf-8?q?"+b.String()+"?=")
+		s = s[n:]
+	}
+	return strings.Join(words, "\r\n ")
+}
 
 const foldAt = 76
 

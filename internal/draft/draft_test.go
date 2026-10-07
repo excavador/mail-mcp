@@ -419,3 +419,63 @@ func TestBodyIsQuotedPrintableCRLF(t *testing.T) {
 func TestMain(m *testing.M) { os.Exit(m.Run()) }
 
 type wordDecoder = mimeWordDecoder
+
+func TestEncodedWordLookalikeSubjectIsEncoded(t *testing.T) {
+	subj := "Invoice =?utf-8?q?paid?= now"
+	m := compose(t, Input{To: []string{"bob@x.test"}, Subject: subj, Body: "x"})
+	head, _, _ := strings.Cut(string(m.Raw), "\r\n\r\n")
+	if strings.Contains(head, "Subject: Invoice =?utf-8?q?paid") {
+		t.Fatalf("lookalike subject sent literally:\n%s", head)
+	}
+	msg, err := mail.ReadMessage(bytes.NewReader(m.Raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := new(wordDecoder).DecodeHeader(msg.Header.Get("Subject"))
+	if err != nil || got != subj {
+		t.Errorf("decoded subject = %q, %v; want %q", got, err, subj)
+	}
+}
+
+func TestOverlongIDsAndNamesAreHandled(t *testing.T) {
+	o := orig()
+	long := "<" + strings.Repeat("a", 300) + "@x.test>"
+	o.References = long + " <m1@x.test>"
+	_, refs := threadHeaders(o)
+	for _, r := range refs {
+		if len(r) > maxIDLen {
+			t.Errorf("over-long token kept: %d", len(r))
+		}
+	}
+	o.MessageID = long
+	if irt, refs := threadHeaders(o); irt != "" || refs != nil {
+		t.Error("over-long Message-ID used")
+	}
+	o = orig()
+	o.From = []Addr{{strings.Repeat("N", 5000), "alice@x.test"}}
+	m := compose(t, Input{Original: o, Body: "x"})
+	for _, ln := range strings.Split(string(m.Raw), "\r\n") {
+		if len(ln) > 998 {
+			t.Fatalf("header line of %d bytes", len(ln))
+		}
+	}
+}
+
+func TestReplyToRedirectAndBareAddresses(t *testing.T) {
+	o := orig()
+	o.ReplyTo = []Addr{{"", "alice@x.test"}} // same as From: not a redirect
+	m := compose(t, Input{Original: o, Body: "x"})
+	if m.ReplyToRedirect {
+		t.Error("same-address Reply-To flagged")
+	}
+	o.ReplyTo = []Addr{{"", "Attacker@Evil.test"}}
+	m = compose(t, Input{Original: o, Body: "x"})
+	if !m.ReplyToRedirect || strings.Join(m.ToAddrs, ",") != "attacker@evil.test" {
+		t.Errorf("redirect %v to %v", m.ReplyToRedirect, m.ToAddrs)
+	}
+	// An explicit To is not a redirect.
+	m = compose(t, Input{Original: o, To: []string{"bob@x.test"}, Body: "x"})
+	if m.ReplyToRedirect {
+		t.Error("explicit To flagged as redirect")
+	}
+}

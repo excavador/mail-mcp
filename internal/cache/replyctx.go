@@ -7,6 +7,8 @@ package cache
 import (
 	"bytes"
 	"context"
+	"errors"
+	"regexp"
 	"strings"
 	"time"
 
@@ -60,6 +62,24 @@ func addrList(h gomail.Header, key string) []Addr {
 	return out
 }
 
+// hiddenEl matches a simple (non-nested) element that is hidden from the
+// reader: display:none, visibility:hidden, font-size:0 or the hidden attribute.
+// Best effort: nested same-name elements and CSS classes are not understood.
+var hiddenEls = func() []*regexp.Regexp {
+	var out []*regexp.Regexp
+	for _, tag := range []string{"span", "div", "p", "td", "font", "b", "i", "u", "a", "li", "em", "strong"} {
+		out = append(out, regexp.MustCompile(`(?is)<`+tag+`\b[^>]*(display\s*:\s*none|visibility\s*:\s*hidden|font-size\s*:\s*0(px|pt|em|%)?\s*([;"']|$)|\shidden\b)[^>]*>.*?</`+tag+`\s*>`))
+	}
+	return out
+}()
+
+func dropHidden(s string) string {
+	for _, re := range hiddenEls {
+		s = re.ReplaceAllString(s, " ")
+	}
+	return s
+}
+
 // ReadReplyContext loads the reply context of one cached message. A message
 // that cannot be parsed is returned with no headers and no body, as
 // ReadMessage returns it: the caller decides whether that is enough.
@@ -98,7 +118,7 @@ func (c *Cache) ReadReplyContext(ctx context.Context, account, stableID string, 
 	collectText(e, &plain, &htm, 0)
 	body := strings.TrimSpace(plain.String())
 	if body == "" {
-		body = stripHTML(htm.String())
+		body = stripHTML(dropHidden(htm.String()))
 	}
 	if maxBody > 0 && len(body) > maxBody {
 		body = strings.ToValidUTF8(body[:maxBody], "")
@@ -108,9 +128,14 @@ func (c *Cache) ReadReplyContext(ctx context.Context, account, stableID string, 
 	return rc, nil
 }
 
+// ErrAmbiguousDrafts means more than one folder carries \Drafts.
+var ErrAmbiguousDrafts = errors.New("ambiguous Drafts folder: more than one folder is marked \\Drafts")
+
 // DraftsFolder names the account's Drafts folder from what the last refresh
-// saw of LIST: the folder carrying the \Drafts special-use attribute, else a
-// folder named exactly "Drafts". ok is false when there is neither.
+// saw of LIST: the one folder carrying the \Drafts special-use attribute, else
+// a folder named exactly "Drafts". Folders that cannot be selected or do not
+// exist are skipped. ok is false when there is none; more than one \Drafts
+// folder is ErrAmbiguousDrafts.
 func (c *Cache) DraftsFolder(ctx context.Context, account string) (name string, ok bool, err error) {
 	rows, err := c.db.QueryContext(ctx, `SELECT folder, attrs FROM folders WHERE account = ? ORDER BY folder`, account)
 	if err != nil {
@@ -118,22 +143,31 @@ func (c *Cache) DraftsFolder(ctx context.Context, account string) (name string, 
 	}
 	defer rows.Close()
 	var byName bool
+	var marked []string
 	for rows.Next() {
 		var f, attrs string
 		if err := rows.Scan(&f, &attrs); err != nil {
 			return "", false, err
 		}
-		if strings.Contains(" "+attrs+" ", ` \Drafts `) {
-			return f, true, nil
+		pad := " " + strings.ToLower(attrs) + " "
+		if strings.Contains(pad, ` \noselect `) || strings.Contains(pad, ` \nonexistent `) {
+			continue
 		}
-		if f == "Drafts" {
+		if strings.Contains(pad, ` \drafts `) {
+			marked = append(marked, f)
+		} else if f == "Drafts" {
 			byName = true
 		}
 	}
 	if err := rows.Err(); err != nil {
 		return "", false, err
 	}
-	if byName {
+	switch {
+	case len(marked) > 1:
+		return "", false, ErrAmbiguousDrafts
+	case len(marked) == 1:
+		return marked[0], true, nil
+	case byName:
 		return "Drafts", true, nil
 	}
 	return "", false, nil

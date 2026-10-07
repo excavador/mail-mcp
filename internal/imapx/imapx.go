@@ -410,6 +410,9 @@ func examineAndSearch(ctx context.Context, c *imapclient.Client, folder, query s
 // ErrNoDrafts means the account has no Drafts folder to write a draft into.
 var ErrNoDrafts = errors.New("no Drafts folder found (no \\Drafts special-use folder, and none named Drafts)")
 
+// ErrAmbiguousDrafts means more than one folder carries \\Drafts.
+var ErrAmbiguousDrafts = errors.New("ambiguous Drafts folder: more than one folder is marked \\Drafts")
+
 // draftsFallback is the folder used when LIST marks none \Drafts: Proton
 // Bridge's own name for it.
 const draftsFallback = "Drafts"
@@ -424,16 +427,22 @@ func DraftsFolder(ctx context.Context, c *imapclient.Client) (string, error) {
 		return "", fmt.Errorf("list: %w", err)
 	}
 	byName := false
+	var marked []string
 	for _, m := range list {
 		if hasAttr(m.Attrs, imap.MailboxAttrNonExistent) || hasAttr(m.Attrs, imap.MailboxAttrNoSelect) {
 			continue
 		}
 		if hasAttr(m.Attrs, imap.MailboxAttrDrafts) {
-			return m.Mailbox, nil
-		}
-		if m.Mailbox == draftsFallback {
+			marked = append(marked, m.Mailbox)
+		} else if m.Mailbox == draftsFallback {
 			byName = true
 		}
+	}
+	if len(marked) > 1 {
+		return "", ErrAmbiguousDrafts
+	}
+	if len(marked) == 1 {
+		return marked[0], nil
 	}
 	if byName {
 		return draftsFallback, nil

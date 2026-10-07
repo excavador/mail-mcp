@@ -16,9 +16,10 @@ import (
 // create_draft will append, and what the owner is shown about them. It lives in
 // memory only, for PreviewTTL.
 type DraftPreview struct {
-	Token   string
-	Expires time.Time
-	Nonce   [16]byte
+	Token    string
+	Expires  time.Time
+	Nonce    [16]byte
+	question [16]byte // see Preview.question
 
 	Account string
 	Folder  string // the Drafts folder, as found when previewed
@@ -28,7 +29,10 @@ type DraftPreview struct {
 
 	// What the echo fields restate and the history records (never the body).
 	From, Subject, MessageID, ReplyToID string
-	To, Cc, Bcc                         []string
+	To, Cc, Bcc                         []string // header values
+	ToAddrs                             string   // bare lowercase To addresses, comma-joined: what expect_to restates
+	CcCount, BccCount                   int
+	Redirect                            bool
 }
 
 type draftCanonical struct {
@@ -112,4 +116,40 @@ func (o *Organiser) ConsumeDraft(token string) bool {
 		}
 	}
 	return live
+}
+
+// QuestionKeyDraft names the input request that asks the owner about p.
+func (o *Organiser) QuestionKeyDraft(p *DraftPreview) string {
+	sum := sha256.Sum256([]byte(p.Token + hex.EncodeToString(p.Nonce[:])))
+	return "approve-" + hex.EncodeToString(sum[:])[:16]
+}
+
+const (
+	// UnelicitedDraftsPerHour is how many drafts one account may have created
+	// on the client's tool approval alone (no elicitation) in an hour.
+	UnelicitedDraftsPerHour = 10
+	unelicitedWindow        = time.Hour
+)
+
+// TakeUnelicitedDraft counts one draft created without elicitation against the
+// account's hourly cap and reports whether it was within it.
+func (o *Organiser) TakeUnelicitedDraft(account string) bool {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.draftTimes == nil {
+		o.draftTimes = map[string][]time.Time{}
+	}
+	now := time.Now()
+	kept := o.draftTimes[account][:0]
+	for _, t := range o.draftTimes[account] {
+		if now.Sub(t) < unelicitedWindow {
+			kept = append(kept, t)
+		}
+	}
+	if len(kept) >= UnelicitedDraftsPerHour {
+		o.draftTimes[account] = kept
+		return false
+	}
+	o.draftTimes[account] = append(kept, now)
+	return true
 }

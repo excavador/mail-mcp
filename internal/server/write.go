@@ -331,20 +331,40 @@ func clientElicits(req *mcp.CallToolRequest) bool {
 // readable. That is weaker (the model fills in "approved"), so it is capped at
 // maxUnelicited messages and recorded as "client-tool-approval".
 func approve(ctx context.Context, req *mcp.CallToolRequest, d writeDeps, p *organise.Preview) (by string, pending *mcp.CallToolResult, err error) {
+	return approveSpec(ctx, req, d, approvalSpec{
+		token: p.Token, key: d.org.QuestionKey(p), message: elicitMessage(d, p), title: "Apply this change",
+		unelicited: func() error {
+			if limit := d.unelicitedLimit(p.Intent.Action, d.byName[p.Account].Provider); p.Matched > limit {
+				return organise.SafeError(fmt.Sprintf(
+					"more than %d messages cannot be applied on the client's tool approval alone (%s)", limit, p.Intent.Action))
+			}
+			return nil
+		},
+	})
+}
+
+// approvalSpec is what approveSpec needs to know about the thing being approved:
+// its token, the key and text of the question, and the check that applies when
+// the client's own tool approval is the only gate.
+type approvalSpec struct {
+	token, key, message, title string
+	unelicited                 func() error
+}
+
+func approveSpec(ctx context.Context, req *mcp.CallToolRequest, d writeDeps, sp approvalSpec) (by string, pending *mcp.CallToolResult, err error) {
 	if d.approvalMode != ApprovalElicitation || !clientElicits(req) {
-		if limit := d.unelicitedLimit(p.Intent.Action, d.byName[p.Account].Provider); p.Matched > limit {
-			return "", nil, organise.SafeError(fmt.Sprintf(
-				"more than %d messages cannot be applied on the client's tool approval alone (%s)", limit, p.Intent.Action))
+		if err := sp.unelicited(); err != nil {
+			return "", nil, err
 		}
 		return history.ApprovedClientTool, nil, nil
 	}
 	params := &mcp.ElicitParams{
 		Mode:    "form",
-		Message: elicitMessage(d, p),
+		Message: sp.message,
 		RequestedSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
-				"confirm": map[string]any{"type": "boolean", "title": "Apply this change", "default": false},
+				"confirm": map[string]any{"type": "boolean", "title": sp.title, "default": false},
 			},
 			"required": []string{"confirm"},
 		},
@@ -358,10 +378,10 @@ func approve(ctx context.Context, req *mcp.CallToolRequest, d writeDeps, p *orga
 		// used. Anything else (an answer given for another token, a forged or
 		// replayed one, none) is not an answer: a new question is asked, and
 		// nothing is applied on it.
-		key := d.org.QuestionKey(p)
+		key := sp.key
 		got, answered := req.Params.InputResponses[key]
-		if !answered || !d.org.TakeQuestion(p.Token, req.Params.RequestState) {
-			state, err := d.org.NewQuestion(p.Token)
+		if !answered || !d.org.TakeQuestion(sp.token, req.Params.RequestState) {
+			state, err := d.org.NewQuestion(sp.token)
 			if err != nil {
 				return "", nil, organise.ErrExpired
 			}
