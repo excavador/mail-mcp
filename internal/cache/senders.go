@@ -822,6 +822,11 @@ func (c *Cache) RunSenders(ctx context.Context, log *slog.Logger) error {
 	if log == nil {
 		log = slog.Default()
 	}
+	// After an owner-set change the outsider clear goes first; the recount's
+	// end (which writes the owner-set done marker) comes after it.
+	if err := c.RunOwnerOutsiders(ctx, log); err != nil {
+		return err
+	}
 	if err := c.countSenders(ctx, log); err != nil {
 		return err
 	}

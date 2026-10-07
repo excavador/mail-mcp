@@ -181,3 +181,64 @@ func TestOwnerSetOnEmptyCacheJustRecords(t *testing.T) {
 		t.Fatal("owner set not recorded")
 	}
 }
+
+func TestOwnerOutsiderClearResumesAfterInterruptedBatch(t *testing.T) {
+	ctx := context.Background()
+	c := ownerFixture(t)
+	t0 := time.Date(2026, 3, 2, 9, 0, 0, 0, time.UTC)
+	for _, id := range []string{"r2", "r3"} {
+		sndAdd(t, c, id, id+"@x", "Me <me@alias.test>", "alice@x.example", "Re: hello", t0)
+		if _, err := c.db.Exec(`INSERT INTO message_thread (account, stable_id, tid, parent_stable_id, depth, outsider) VALUES ('acc', ?, 't1', '', 0, 1)`, id); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// A stranger's flag must survive.
+	sndAdd(t, c, "s1", "s1@x", "Eve <eve@x.example>", "me@home.test", "hi", t0)
+	if _, err := c.db.Exec(`INSERT INTO message_thread (account, stable_id, tid, parent_stable_id, depth, outsider) VALUES ('acc', 's1', 't2', '', 0, 1)`); err != nil {
+		t.Fatal(err)
+	}
+	old := ownerOutsiderBatch
+	ownerOutsiderBatch = 1
+	t.Cleanup(func() { ownerOutsiderBatch = old })
+
+	ownerRecount(t, c, map[string][]string{"acc": {"me@home.test"}})
+	ownerRecount(t, c, map[string][]string{"acc": {"me@home.test", "me@alias.test"}})
+	flagged := func() int {
+		var n int
+		_ = c.db.QueryRow(`SELECT COUNT(*) FROM message_thread WHERE outsider = 1`).Scan(&n)
+		return n
+	}
+	if flagged() != 4 {
+		t.Fatalf("startup cleared flags itself: %d flagged", flagged())
+	}
+	// One batch, then the process "dies".
+	if more, err := c.ownerOutsiderStep(ctx); err != nil || !more {
+		t.Fatalf("first step: more=%v err=%v", more, err)
+	}
+	if n := flagged(); n != 3 {
+		t.Fatalf("after one batch %d flagged, want 3", n)
+	}
+	var cursor int64
+	_ = c.db.QueryRow(`SELECT last_rowid FROM backfill WHERE name = ?`, ownersOutsidersCursor).Scan(&cursor)
+	if cursor == 0 {
+		t.Fatal("cursor not advanced")
+	}
+	// A restart with the same set resumes at the cursor.
+	ownerRecount(t, c, map[string][]string{"acc": {"me@home.test", "me@alias.test"}})
+	var after int64
+	_ = c.db.QueryRow(`SELECT last_rowid FROM backfill WHERE name = ?`, ownersOutsidersCursor).Scan(&after)
+	if after != cursor {
+		t.Fatalf("restart moved the cursor %d -> %d", cursor, after)
+	}
+	if err := c.RunSenders(ctx, nil); err != nil {
+		t.Fatal(err)
+	}
+	if n := flagged(); n != 1 {
+		t.Fatalf("%d flagged after the job, want only the stranger's", n)
+	}
+	var done int
+	_ = c.db.QueryRow(`SELECT done FROM backfill WHERE name = ?`, ownersOutsidersCursor).Scan(&done)
+	if done != 1 || recountMarker(t, c, ownersDonePrefix+ownersFingerprint(map[string][]string{"acc": {"me@home.test", "me@alias.test"}})) != 1 {
+		t.Fatal("clear or done marker incomplete")
+	}
+}

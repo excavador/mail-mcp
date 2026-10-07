@@ -89,10 +89,12 @@ const (
 // they differ restarts the senders recount: n_replied_by_me, replied_counted
 // and the senders kinds that rest on the owner-reply rule are rebuilt by the
 // background senders job (RunBackfills), and the outsider flag of messages sent
-// from an owner address is cleared. It only flips markers and returns; it does
-// not wait for the job, so it never delays startup. Call it after SetOwners and
-// before RunBackfills. An unchanged set does nothing; an interrupted recount
-// for the same set resumes.
+// from an owner address is cleared. Synchronously it does only what the
+// v0.5.3 recount start does (reset counts, restart the job, write markers) and
+// a cursor row for the outsider clear; the counting and the outsider clear run
+// in the background job (RunSenders). Call it after SetOwners and before
+// RunBackfills. An unchanged set does nothing; an interrupted recount for the
+// same set resumes.
 func (c *Cache) ReconcileOwners(log *slog.Logger) error {
 	if log == nil {
 		log = slog.Default()
@@ -145,7 +147,7 @@ func (c *Cache) ReconcileOwners(log *slog.Logger) error {
 	for a, es := range by {
 		counts[a] = len(es)
 	}
-	log.Info("owner set changed: recounting owner-derived data in the background (counts reset, owner and llm sender kinds kept)",
+	log.Info("owner set changed: owner-derived data is recounted in the background (counts reset, owner and llm sender kinds kept)",
 		"owners_fingerprint", fp, "addresses_per_account", fmt.Sprint(counts), "messages", msgs)
 	return c.restartSendersRecount(false, func(tx *sql.Tx) error {
 		if err := dropOwnerMarkers(tx); err != nil {
@@ -158,38 +160,73 @@ func (c *Cache) ReconcileOwners(log *slog.Logger) error {
 		if _, err := tx.Exec(`INSERT OR REPLACE INTO backfill (name, last_rowid, done, updated_at) VALUES (?, 0, 1, ?)`, ownersStartedPrefix+fp, now); err != nil {
 			return fmt.Errorf("owners: %w", err)
 		}
-		return c.clearOwnerOutsiders(tx, by)
+		// The outsider clear is background work with a cursor (see
+		// RunOwnerOutsiders); only its cursor row is created here.
+		if _, err := tx.Exec(`INSERT OR REPLACE INTO backfill (name, last_rowid, done, updated_at) VALUES (?, 0, 0, ?)`, ownersOutsidersCursor, now); err != nil {
+			return fmt.Errorf("owners: %w", err)
+		}
+		return nil
 	})
 }
 
 func dropOwnerMarkers(tx *sql.Tx) error {
-	if _, err := tx.Exec(`DELETE FROM backfill WHERE name LIKE ? OR name LIKE ?`, ownersStartedPrefix+"%", ownersDonePrefix+"%"); err != nil {
+	// Prefix compared with substr, not LIKE: "_" is a wildcard in LIKE.
+	if _, err := tx.Exec(`DELETE FROM backfill WHERE substr(name, 1, ?) = ? OR substr(name, 1, ?) = ? OR name = ?`,
+		len(ownersStartedPrefix), ownersStartedPrefix, len(ownersDonePrefix), ownersDonePrefix, ownersOutsidersCursor); err != nil {
 		return fmt.Errorf("owners: %w", err)
 	}
 	return nil
 }
 
-// clearOwnerOutsiders clears the outsider flag of messages sent from an owner
-// address: the owner is never an outsider in their own thread. (Adding an alias
-// can only clear flags; a removed alias leaves existing flags as they were.)
-func (c *Cache) clearOwnerOutsiders(tx *sql.Tx, by map[string][]string) error {
-	rows, err := tx.Query(`SELECT t.account, t.stable_id, m.from_addr FROM message_thread t
-JOIN messages m ON m.account = t.account AND m.stable_id = t.stable_id WHERE t.outsider = 1`)
-	if err != nil {
-		return fmt.Errorf("owners: outsiders: %w", err)
+// ownersOutsidersCursor is the backfill row of the outsider clear: last_rowid
+// is the highest messages.rowid looked at, done = 1 when it has finished.
+const ownersOutsidersCursor = "owners_outsiders_cursor"
+
+// ownerOutsiderBatch is how many flagged messages one transaction looks at.
+var ownerOutsiderBatch = 2000
+
+// ownerOutsiderStep looks at the next batch of outsider-flagged messages after
+// the cursor, clears the flag of those sent from an owner address and advances
+// the cursor, in one short transaction. more is false when the clear is done
+// (or was never scheduled).
+func (c *Cache) ownerOutsiderStep(ctx context.Context) (more bool, err error) {
+	var cursor int64
+	var done int
+	err = c.db.QueryRowContext(ctx, `SELECT last_rowid, done FROM backfill WHERE name = ?`, ownersOutsidersCursor).Scan(&cursor, &done)
+	if err == sql.ErrNoRows || (err == nil && done == 1) {
+		return false, nil
 	}
-	matchers := map[string]*ownerMatcher{}
+	if err != nil {
+		return false, fmt.Errorf("owners: outsiders: %w", err)
+	}
+	tx, err := c.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, fmt.Errorf("owners: outsiders: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	rows, err := tx.QueryContext(ctx, `SELECT m.rowid, t.account, t.stable_id, m.from_addr FROM message_thread t
+JOIN messages m ON m.account = t.account AND m.stable_id = t.stable_id
+WHERE t.outsider = 1 AND m.rowid > ? ORDER BY m.rowid LIMIT ?`, cursor, ownerOutsiderBatch)
+	if err != nil {
+		return false, fmt.Errorf("owners: outsiders: %w", err)
+	}
 	type key struct{ account, id string }
 	var clear []key
+	matchers := map[string]*ownerMatcher{}
+	n := 0
+	last := cursor
 	for rows.Next() {
+		var rid int64
 		var a, id, from string
-		if err := rows.Scan(&a, &id, &from); err != nil {
+		if err := rows.Scan(&rid, &a, &id, &from); err != nil {
 			_ = rows.Close()
-			return fmt.Errorf("owners: outsiders: %w", err)
+			return false, fmt.Errorf("owners: outsiders: %w", err)
 		}
+		n++
+		last = rid
 		m, ok := matchers[a]
 		if !ok {
-			m = newOwnerMatcher(by[a])
+			m = newOwnerMatcher(c.threadOpts(a).Owners)
 			matchers[a] = m
 		}
 		if addr, _ := parseFrom(from); m.match(addr) {
@@ -199,27 +236,59 @@ JOIN messages m ON m.account = t.account AND m.stable_id = t.stable_id WHERE t.o
 	err = rows.Err()
 	_ = rows.Close()
 	if err != nil {
-		return fmt.Errorf("owners: outsiders: %w", err)
+		return false, fmt.Errorf("owners: outsiders: %w", err)
 	}
 	for _, k := range clear {
-		if _, err := tx.Exec(`UPDATE message_thread SET outsider = 0 WHERE account = ? AND stable_id = ?`, k.account, k.id); err != nil {
-			return fmt.Errorf("owners: outsiders: %w", err)
+		if _, err := tx.ExecContext(ctx, `UPDATE message_thread SET outsider = 0 WHERE account = ? AND stable_id = ?`, k.account, k.id); err != nil {
+			return false, fmt.Errorf("owners: outsiders: %w", err)
 		}
 	}
-	return nil
+	finished := n < ownerOutsiderBatch
+	if _, err := tx.ExecContext(ctx, `UPDATE backfill SET last_rowid = ?, done = ?, updated_at = ? WHERE name = ?`,
+		last, flagInt(finished), c.now().Unix(), ownersOutsidersCursor); err != nil {
+		return false, fmt.Errorf("owners: outsiders: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return false, fmt.Errorf("owners: outsiders: %w", err)
+	}
+	return !finished, nil
+}
+
+// RunOwnerOutsiders is the background half of ReconcileOwners: it clears the
+// outsider flag of messages sent from an owner address (the owner is never an
+// outsider in their own thread), in batches, resumable by its cursor. It runs
+// before the senders recount can finish, so the owner-derived done marker means
+// both are complete. Adding an alias can only clear flags; a removed alias
+// leaves existing flags as they were.
+func (c *Cache) RunOwnerOutsiders(ctx context.Context, log *slog.Logger) error {
+	if log == nil {
+		log = slog.Default()
+	}
+	for {
+		more, err := c.ownerOutsiderStep(ctx)
+		if err != nil {
+			return err
+		}
+		if !more {
+			return nil
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+	}
 }
 
 // finishOwnersTx promotes the started markers to done ones; it runs in the
 // transaction that writes the senders recount marker.
 func finishOwnersTx(ctx context.Context, tx *sql.Tx) (int, error) {
 	res, err := tx.ExecContext(ctx, `INSERT OR REPLACE INTO backfill (name, last_rowid, done, updated_at)
-SELECT ? || substr(name, ?), 0, 1, updated_at FROM backfill WHERE name LIKE ?`,
-		ownersDonePrefix, len(ownersStartedPrefix)+1, ownersStartedPrefix+"%")
+SELECT ? || substr(name, ?), 0, 1, updated_at FROM backfill WHERE substr(name, 1, ?) = ?`,
+		ownersDonePrefix, len(ownersStartedPrefix)+1, len(ownersStartedPrefix), ownersStartedPrefix)
 	if err != nil {
 		return 0, fmt.Errorf("owners: %w", err)
 	}
 	n, _ := res.RowsAffected()
-	if _, err := tx.ExecContext(ctx, `DELETE FROM backfill WHERE name LIKE ?`, ownersStartedPrefix+"%"); err != nil {
+	if _, err := tx.ExecContext(ctx, `DELETE FROM backfill WHERE substr(name, 1, ?) = ?`, len(ownersStartedPrefix), ownersStartedPrefix); err != nil {
 		return 0, fmt.Errorf("owners: %w", err)
 	}
 	return int(n), nil

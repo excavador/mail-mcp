@@ -74,8 +74,11 @@ as the owner.
 
 When the set of usernames and aliases changes (and on the first start of a
 version that knows about aliases), the owner-derived counts are recomputed in
-the background: the senders recount resets the counts, keeps owner and LLM sender
-kinds, and counts every message again, resumable across restarts. Search and
+the background: startup resets the counts and restarts the senders job (as the
+senders recount of an upgrade does; this is a short step before the server
+starts), then the background job clears the outsider flag of owner-sent
+messages in batches and counts every message again, keeping owner and LLM
+sender kinds, resumable across restarts. Search and
 other tools keep working; selections by sender kind answer "being recounted"
 until it finishes. The log lines "owner set changed" and "owner recount done"
 mark the start and the end.
