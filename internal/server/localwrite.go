@@ -166,7 +166,7 @@ func resolveTagTargets(ctx context.Context, d writeDeps, account string, in tagI
 		Since: since, Until: until, Tag: requireTag,
 	}, cache.MaxTagTargets)
 	switch {
-	case errors.Is(err, cache.ErrQueryLimit):
+	case errors.Is(err, cache.ErrQueryLimit), errors.Is(err, cache.ErrSendersRecounting):
 		return nil, err
 	case errors.Is(err, cache.ErrQuerySyntax):
 		slog.Warn("tool failed", "tool", "tag", "msg", "invalid full-text query", "err", err)

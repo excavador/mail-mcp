@@ -549,9 +549,17 @@ ON CONFLICT(account, addr) DO UPDATE SET
 
 // initSenders creates the senders job row on first start, snapshotting the
 // highest messages rowid (refresh counts every later message itself), and
-// publishes that snapshot. A job row that is new while senders rows already
-// exist (a schema bump dropped the backfill table) resets the counts first,
-// keeping only the owner's kind decisions, so nothing is counted twice.
+// publishes that snapshot.
+//
+// The counts a sender row holds depend on the rules that counted them (which
+// subjects are order-shaped, which headers count), so a new rules version
+// recounts instead of re-classifying stored counts: while the sendersRecount
+// marker is absent, the first start resets the counts (keeping the owner's and
+// the LLM's kind decisions), restarts the job from the first message and notes
+// that in sendersRecountStarted. Later starts resume the job. The job writes
+// the sendersRecount marker only after it counted everything. A job row that is
+// new while senders rows already exist (a schema bump dropped the backfill
+// table) resets the counts the same way.
 func (c *Cache) initSenders() error {
 	res, err := c.db.Exec(`
 INSERT OR IGNORE INTO backfill (name, last_rowid, done, updated_at, max_rowid, total, processed)
@@ -560,122 +568,213 @@ SELECT ?, 0, CASE WHEN COUNT(*) = 0 THEN 1 ELSE 0 END, ?, COALESCE(MAX(rowid), 0
 	if err != nil {
 		return fmt.Errorf("init senders: %w", err)
 	}
+	newRow := false
 	if n, _ := res.RowsAffected(); n == 1 {
-		if err := c.resetSenders(); err != nil {
+		newRow = true
+	}
+	var started, marked int
+	if err := c.db.QueryRow(`SELECT COUNT(*) FROM backfill WHERE name = ?`, sendersRecountStarted).Scan(&started); err != nil {
+		return fmt.Errorf("init senders: %w", err)
+	}
+	if err := c.db.QueryRow(`SELECT COUNT(*) FROM backfill WHERE name = ?`, sendersRecount).Scan(&marked); err != nil {
+		return fmt.Errorf("init senders: %w", err)
+	}
+	if newRow || (started == 0 && marked == 0) {
+		if err := c.restartSendersRecount(newRow); err != nil {
 			return err
 		}
+	} else if marked == 0 {
+		c.logger().Info("senders recount resumes after a restart")
 	}
 	var max int64
 	if err := c.db.QueryRow(`SELECT max_rowid FROM backfill WHERE name = ?`, sendersJobName).Scan(&max); err != nil {
 		return fmt.Errorf("init senders: %w", err)
 	}
 	c.sendersMax.Store(max)
-	return c.reclassifySenders()
+	return nil
 }
 
-// sendersRulesMarker is the backfill row that records which version of the
-// kind rules classified the senders table. A new version changes the name, so
-// the first start after an upgrade re-runs the rules once.
-const sendersRulesMarker = "senders_rules_2"
+const (
+	// sendersRecount is the backfill row that records which version of the
+	// kind rules the senders table was counted and classified with. A new
+	// version changes the name, so the first start after an upgrade recounts.
+	// It is written when the recount has finished, not before.
+	sendersRecount = "senders_recount_3"
+	// sendersRecountStarted records that the recount of that version has been
+	// started (counts reset, job restarted), so a restart resumes it.
+	sendersRecountStarted = "senders_recount_3_started"
+)
 
-// reclassifySenders re-runs ClassifySender on every rule-derived sender from
-// its stored counts, once per rules version. Owner decisions (kind_source
-// owner, and llm) are never touched.
-func (c *Cache) reclassifySenders() error {
-	return c.reclassifySendersWith(nil)
-}
+func (c *Cache) logger() *slog.Logger { return slog.Default() }
 
-// reclassifySendersWith is reclassifySenders with a hook run after the rows are
-// read and before anything is written (tests inject a failure there). The
-// marker is the last statement of the transaction, so a failure or crash leaves
-// it absent and the next start runs the pass again.
-func (c *Cache) reclassifySendersWith(afterRead func() error) error {
+// restartSendersRecount snapshots the rule-derived kinds, resets the counts and
+// restarts the senders job over the messages that exist now, in one transaction
+// so a crash leaves either the old state (the next start does it again) or the
+// whole new one.
+func (c *Cache) restartSendersRecount(fresh bool) error {
 	tx, err := c.db.Begin()
 	if err != nil {
-		return fmt.Errorf("reclassify senders: %w", err)
+		return fmt.Errorf("senders recount: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
+	for _, q := range []string{
+		`CREATE TABLE IF NOT EXISTS senders_prev_kind (account TEXT NOT NULL, addr TEXT NOT NULL, kind TEXT NOT NULL, PRIMARY KEY (account, addr))`,
+		`DELETE FROM senders_prev_kind`,
+		`INSERT INTO senders_prev_kind SELECT account, addr, kind FROM senders WHERE kind_source = 'rule'`,
+	} {
+		if _, err := tx.Exec(q); err != nil {
+			return fmt.Errorf("senders recount: %w", err)
+		}
+	}
+	if err := resetSendersTx(tx); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`
+UPDATE backfill SET last_rowid = 0, updated_at = ?, processed = 0,
+	max_rowid = (SELECT COALESCE(MAX(rowid), 0) FROM messages),
+	total = (SELECT COUNT(*) FROM messages),
+	done = CASE WHEN (SELECT COUNT(*) FROM messages) = 0 THEN 1 ELSE 0 END
+WHERE name = ?`, c.now().Unix(), sendersJobName); err != nil {
+		return fmt.Errorf("senders recount: %w", err)
+	}
+	if _, err := tx.Exec(`INSERT OR REPLACE INTO backfill (name, last_rowid, done, updated_at) VALUES (?, 0, 1, ?)`, sendersRecountStarted, c.now().Unix()); err != nil {
+		return fmt.Errorf("senders recount: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("senders recount: %w", err)
+	}
+	if !fresh {
+		c.logger().Info("senders recount started: counts reset, owner and llm kinds kept; senders fill in again in the background")
+	}
+	return nil
+}
+
+// finishSendersRecount runs after the job counted every message: it logs, per
+// account, how many rule-derived senders changed kind against the snapshot,
+// then drops the snapshot and writes the marker in one transaction. It does
+// nothing when the recount is already marked.
+func (c *Cache) finishSendersRecount(ctx context.Context, log *slog.Logger) error {
 	var marked int
-	if err := tx.QueryRow(`SELECT COUNT(*) FROM backfill WHERE name = ?`, sendersRulesMarker).Scan(&marked); err != nil {
-		return fmt.Errorf("reclassify senders: %w", err)
+	if err := c.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM backfill WHERE name = ?`, sendersRecount).Scan(&marked); err != nil {
+		return fmt.Errorf("senders recount: %w", err)
 	}
 	if marked > 0 {
 		return nil
 	}
-	rows, err := tx.Query(`SELECT account, addr, domain, kind, n_msgs, n_replied_by_me, n_list, n_unsub, n_gh, n_txn_subj, n_auto
-FROM senders WHERE kind_source = 'rule'`)
+	changed := map[string]map[string]int{}
+	var total, rules int
+	if err := c.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'senders_prev_kind'`).Scan(&rules); err != nil {
+		return fmt.Errorf("senders recount: %w", err)
+	}
+	if rules > 0 {
+		rows, err := c.db.QueryContext(ctx, `
+SELECT s.account, p.kind, s.kind, COUNT(*) FROM senders s JOIN senders_prev_kind p ON p.account = s.account AND p.addr = s.addr
+WHERE s.kind_source = 'rule' AND s.kind <> p.kind GROUP BY s.account, p.kind, s.kind`)
+		if err != nil {
+			return fmt.Errorf("senders recount: %w", err)
+		}
+		for rows.Next() {
+			var acct, from, to string
+			var n int
+			if err := rows.Scan(&acct, &from, &to, &n); err != nil {
+				_ = rows.Close()
+				return fmt.Errorf("senders recount: %w", err)
+			}
+			if changed[acct] == nil {
+				changed[acct] = map[string]int{}
+			}
+			changed[acct][from+"->"+to] += n
+			total += n
+		}
+		err = rows.Err()
+		_ = rows.Close()
+		if err != nil {
+			return fmt.Errorf("senders recount: %w", err)
+		}
+	}
+	tx, err := c.db.BeginTx(ctx, nil)
 	if err != nil {
-		return fmt.Errorf("reclassify senders: %w", err)
-	}
-	type change struct{ account, addr, kind string }
-	var changes []change
-	for rows.Next() {
-		var (
-			account, addr, domain, kind                 string
-			n, replied, nList, nUnsub, nGH, nTxn, nAuto int
-		)
-		if err := rows.Scan(&account, &addr, &domain, &kind, &n, &replied, &nList, &nUnsub, &nGH, &nTxn, &nAuto); err != nil {
-			_ = rows.Close()
-			return fmt.Errorf("reclassify senders: %w", err)
-		}
-		nk := ClassifySender(KindInputs{Addr: addr, Domain: domain, NMsgs: n, NReplied: replied, NList: nList, NUnsub: nUnsub, NGH: nGH, NTxn: nTxn, NAuto: nAuto})
-		if nk != kind {
-			changes = append(changes, change{account, addr, nk})
-		}
-	}
-	err = rows.Err()
-	_ = rows.Close()
-	if err != nil {
-		return fmt.Errorf("reclassify senders: %w", err)
-	}
-	if afterRead != nil {
-		if err := afterRead(); err != nil {
-			return fmt.Errorf("reclassify senders: %w", err)
-		}
-	}
-	now := c.now().Unix()
-	for _, ch := range changes {
-		if _, err := tx.Exec(`UPDATE senders SET kind = ?, kind_updated_at = ? WHERE account = ? AND addr = ? AND kind_source = 'rule'`,
-			ch.kind, now, ch.account, ch.addr); err != nil {
-			return fmt.Errorf("reclassify senders: %w", err)
-		}
-	}
-	if _, err := tx.Exec(`INSERT INTO backfill (name, last_rowid, done, updated_at) VALUES (?, 0, 1, ?)`, sendersRulesMarker, now); err != nil {
-		return fmt.Errorf("reclassify senders: %w", err)
-	}
-	return tx.Commit()
-}
-
-func (c *Cache) resetSenders() error {
-	tx, err := c.db.Begin()
-	if err != nil {
-		return fmt.Errorf("reset senders: %w", err)
+		return fmt.Errorf("senders recount: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
-	if _, err := tx.Exec(`
-CREATE TEMP TABLE IF NOT EXISTS senders_keep AS SELECT account, addr, domain, kind, kind_updated_at FROM senders WHERE 0`); err != nil {
-		return fmt.Errorf("reset senders: %w", err)
+	if _, err := tx.ExecContext(ctx, `DROP TABLE IF EXISTS senders_prev_kind`); err != nil {
+		return fmt.Errorf("senders recount: %w", err)
 	}
-	if _, err := tx.Exec(`DELETE FROM senders_keep`); err != nil {
-		return fmt.Errorf("reset senders: %w", err)
+	if _, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO backfill (name, last_rowid, done, updated_at) VALUES (?, 0, 1, ?)`, sendersRecount, c.now().Unix()); err != nil {
+		return fmt.Errorf("senders recount: %w", err)
 	}
-	if _, err := tx.Exec(`INSERT INTO senders_keep SELECT account, addr, domain, kind, kind_updated_at FROM senders WHERE kind_source = 'owner'`); err != nil {
-		return fmt.Errorf("reset senders: %w", err)
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("senders recount: %w", err)
 	}
-	if _, err := tx.Exec(`DELETE FROM senders`); err != nil {
-		return fmt.Errorf("reset senders: %w", err)
+	log.Info("senders recount done", "kinds_changed", total)
+	accts := make([]string, 0, len(changed))
+	for a := range changed {
+		accts = append(accts, a)
 	}
-	if _, err := tx.Exec(`UPDATE messages SET replied_counted = 0 WHERE replied_counted <> 0`); err != nil {
-		return fmt.Errorf("reset senders: %w", err)
+	sort.Strings(accts)
+	for _, a := range accts {
+		n := 0
+		for _, v := range changed[a] {
+			n += v
+		}
+		log.Info("senders recount changed kinds", "account", a, "changed", n, "transitions", fmt.Sprint(changed[a]))
 	}
-	if _, err := tx.Exec(`INSERT INTO senders (account, addr, domain, kind, kind_source, kind_updated_at)
-SELECT account, addr, domain, kind, 'owner', kind_updated_at FROM senders_keep`); err != nil {
-		return fmt.Errorf("reset senders: %w", err)
+	return nil
+}
+
+// resetSendersTx deletes the counts of every sender, keeping the kind decisions
+// of the owner and of the LLM (with their source), and marks every message as
+// not yet looked at for replies, so a recount counts each message once.
+func resetSendersTx(tx *sql.Tx) error {
+	for _, q := range []string{
+		`CREATE TEMP TABLE IF NOT EXISTS senders_keep AS SELECT account, addr, domain, kind, kind_source, kind_updated_at FROM senders WHERE 0`,
+		`DELETE FROM senders_keep`,
+		`INSERT INTO senders_keep SELECT account, addr, domain, kind, kind_source, kind_updated_at FROM senders WHERE kind_source IN ('owner', 'llm')`,
+		`DELETE FROM senders`,
+		`UPDATE messages SET replied_counted = 0 WHERE replied_counted <> 0`,
+		`INSERT INTO senders (account, addr, domain, kind, kind_source, kind_updated_at)
+SELECT account, addr, domain, kind, kind_source, kind_updated_at FROM senders_keep`,
+		`DROP TABLE senders_keep`,
+	} {
+		if _, err := tx.Exec(q); err != nil {
+			return fmt.Errorf("reset senders: %w", err)
+		}
 	}
-	if _, err := tx.Exec(`DROP TABLE senders_keep`); err != nil {
-		return fmt.Errorf("reset senders: %w", err)
+	return nil
+}
+
+// ErrSendersRecounting is returned by selections that rest on sender kinds while
+// the senders job (a recount after a rules change) is incomplete.
+var ErrSendersRecounting = errors.New("sender kinds are being recounted")
+
+// requireKindsComplete returns ErrSendersRecounting, with the progress, unless
+// the senders job is complete.
+func (c *Cache) requireKindsComplete(ctx context.Context) error {
+	st, err := c.SendersStatus(ctx)
+	if err != nil {
+		return err
 	}
-	return tx.Commit()
+	if st.Complete {
+		return nil
+	}
+	return fmt.Errorf("%w (%d%% done); retry later or drop exclude_kind", ErrSendersRecounting, sendersPercent(st))
+}
+
+func sendersPercent(st BackfillStatus) int {
+	if st.Total <= 0 {
+		return 0
+	}
+	return st.Done * 100 / st.Total
+}
+
+// KindsPartial reports whether sender kinds are still being counted, with the
+// percentage done.
+func (c *Cache) KindsPartial(ctx context.Context) (bool, int) {
+	st, err := c.SendersStatus(ctx)
+	if err != nil || st.Complete {
+		return false, 100
+	}
+	return true, sendersPercent(st)
 }
 
 // SendersStatus is the progress of the senders job.
@@ -732,7 +831,7 @@ func (c *Cache) RunSenders(ctx context.Context, log *slog.Logger) error {
 			return err
 		}
 	}
-	return nil
+	return c.finishSendersRecount(ctx, log)
 }
 
 func (c *Cache) countSenders(ctx context.Context, log *slog.Logger) error {

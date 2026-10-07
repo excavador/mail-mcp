@@ -315,6 +315,11 @@ func runSearch(ctx context.Context, byName map[string]accounts.Account, store *c
 			return searchOut{}, fail("search", "search failed", err)
 		}
 		out.Total, out.Facets, threads, messages = res.Total, res.Facets, res.Threads, res.Messages
+		if len(in.ExcludeKind) > 0 {
+			if partial, pct := store.KindsPartial(ctx); partial {
+				out.Note = strings.TrimSpace(out.Note + fmt.Sprintf(" Sender kinds are being recounted (%d%% done): exclude_kind is partial, senders not counted yet are kept and some may read as human.", pct))
+			}
+		}
 		more = offset+len(threads)+len(messages) < res.Total
 		if res.FacetNote != "" {
 			out.Note = res.FacetNote

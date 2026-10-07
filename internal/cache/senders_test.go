@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -82,7 +83,12 @@ func TestClassifyMarketing(t *testing.T) {
 		{"a person with an occasional unsub", KindInputs{Addr: "alice@home.example", NMsgs: 20, NUnsub: 2}, KindHuman},
 		{"newsletter@ but mostly invoices", KindInputs{Addr: "newsletter@shop.example", NMsgs: 10, NUnsub: 10, NTxn: 8}, KindHuman},
 		{"owner replied beats marketing", KindInputs{Addr: "newsletter@shop.example", NMsgs: 10, NUnsub: 10, NReplied: 1}, KindHuman},
-		{"shop campaign local part without bulk evidence", KindInputs{Addr: "store-news@amazon.nl", NMsgs: 20}, KindTransactional},
+		{"shop campaign local part without bulk evidence", KindInputs{Addr: "store-news@amazon.nl", NMsgs: 20}, KindList},
+		{"shop campaign local part, mostly order subjects", KindInputs{Addr: "store-news@amazon.nl", NMsgs: 20, NTxn: 15}, KindTransactional},
+		{"shop campaign address, 1 of 3 order-shaped, no headers", KindInputs{Addr: "news@ikea.nl", NMsgs: 3, NTxn: 1}, KindTransactional},
+		{"shop campaign address, single message, no headers", KindInputs{Addr: "news@ikea.nl", NMsgs: 1}, KindTransactional},
+		{"shop campaign address, 1 of 3 order-shaped, unsub majority", KindInputs{Addr: "news@ikea.nl", NMsgs: 3, NTxn: 1, NUnsub: 3}, KindList},
+		{"shop market stream, no headers", KindInputs{Addr: "ae-market.ae6@mail.aliexpress.com", NMsgs: 22}, KindList},
 		{"booking confirmed with unsub at a shop domain", KindInputs{Addr: "customer.service@booking.com", NMsgs: 12, NTxn: 12, NUnsub: 12}, KindTransactional},
 		{"shop unsub majority with a few order subjects, no list-id", KindInputs{Addr: "service@mail.shop.example", NMsgs: 5, NTxn: 1, NUnsub: 5}, KindList},
 		{"carrier unsub majority with an order subject", KindInputs{Addr: "info@dhl.com", NMsgs: 5, NTxn: 1, NUnsub: 5}, KindTransactional},
@@ -113,6 +119,13 @@ func TestIsTransactionalSubject(t *testing.T) {
 		"Delivery deals this week":                 false,
 		"Order now and save 20% off":               false,
 		"Free delivery, order 171-1234567-1234567": true,
+		"Get US $8.00 off your order":              false,
+		"Take 20% off your order":                  false,
+		"Off your order: everything":               false,
+		"Your order was dropped off":               true,
+		"Delivered: package dropped off":           true,
+		"Order shipped, signed off at the door":    true,
+		"Get €5 off your next order":               false,
 		"Weekly digest":                            false,
 	} {
 		if got := IsTransactionalSubject(subj); got != want {
@@ -481,72 +494,169 @@ func TestToMeIsExactAndAddressesAreValidated(t *testing.T) {
 	}
 }
 
-func TestReclassifySendersOnlyRuleDerived(t *testing.T) {
-	c := thrOpen(t)
-	ins := func(addr, kind, source string) {
-		t.Helper()
-		if _, err := c.db.Exec(`INSERT INTO senders (account, addr, domain, n_msgs, n_unsub, kind, kind_source) VALUES ('acc', ?, ?, 10, 10, ?, ?)`,
-			addr, RegistrableDomain(addr), kind, source); err != nil {
+// recountFixture is a cache whose senders table was counted by older rules: a
+// promo sender whose subjects were all counted as order mail, plus an owner row
+// and an llm row, with the recount marker absent.
+func recountFixture(t *testing.T, dir string) *Cache {
+	t.Helper()
+	c, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = c.Close() })
+	t0 := time.Date(2026, 3, 1, 9, 0, 0, 0, time.UTC)
+	for i := 0; i < 2*sendersBatch+30; i++ {
+		sndAdd(t, c, fmt.Sprintf("p%d", i), fmt.Sprintf("p%d@x", i), "Shop <promotion@ebay.de>", "me@home.test", "Get US $8.00 off your order", t0.Add(time.Duration(i)*time.Minute), "List-Unsubscribe: <mailto:u@x.example>")
+		sndAdd(t, c, fmt.Sprintf("q%d", i), fmt.Sprintf("q%d@x", i), "Store <store-news@ikea.nl>", "me@home.test", "Deals for you", t0.Add(time.Duration(i)*time.Minute))
+	}
+	sndAdd(t, c, "o1", "o1@x", "Own <owned@x.example>", "me@home.test", "hi", t0)
+	sndAdd(t, c, "l1", "l1@x", "Llm <llm@x.example>", "me@home.test", "hi", t0)
+	// Stale rows, as the old rules left them.
+	for _, q := range []string{
+		`DELETE FROM senders`,
+		`INSERT INTO senders (account, addr, domain, n_msgs, n_unsub, n_txn_subj, kind, kind_source) VALUES ('acc', 'promotion@ebay.de', 'ebay.de', 260, 260, 260, 'transactional', 'rule')`,
+		`INSERT INTO senders (account, addr, domain, n_msgs, kind, kind_source) VALUES ('acc', 'owned@x.example', 'x.example', 1, 'list', 'owner')`,
+		`INSERT INTO senders (account, addr, domain, n_msgs, kind, kind_source) VALUES ('acc', 'llm@x.example', 'x.example', 1, 'notification', 'llm')`,
+		`DELETE FROM backfill WHERE name IN ('senders_recount_3', 'senders_recount_3_started')`,
+		`UPDATE backfill SET done = 1 WHERE name = 'senders'`,
+	} {
+		if _, err := c.db.Exec(q); err != nil {
 			t.Fatal(err)
 		}
 	}
-	ins("promotion@aliexpress.com", KindTransactional, SourceRule)
-	ins("newsletter@brand.example", KindHuman, SourceRule)
-	ins("promotion@amazon.nl", KindTransactional, SourceOwner)
-	ins("news@other.example", KindHuman, SourceLLM)
-	if _, err := c.db.Exec(`DELETE FROM backfill WHERE name = ?`, sendersRulesMarker); err != nil {
+	return c
+}
+
+func recountMarker(t *testing.T, c *Cache, name string) int {
+	t.Helper()
+	var n int
+	if err := c.db.QueryRow(`SELECT COUNT(*) FROM backfill WHERE name = ?`, name).Scan(&n); err != nil {
 		t.Fatal(err)
 	}
-	if err := c.reclassifySenders(); err != nil {
+	return n
+}
+
+func TestRecountFixesStaleCountsAndKeepsOwnerAndLLM(t *testing.T) {
+	c := recountFixture(t, t.TempDir())
+	if err := c.initSenders(); err != nil {
 		t.Fatal(err)
 	}
-	for addr, want := range map[string]string{
-		"promotion@aliexpress.com": KindList,
-		"newsletter@brand.example": KindList,
-		"promotion@amazon.nl":      KindTransactional, // owner-set: untouched
-		"news@other.example":       KindHuman,         // llm-set: untouched
-	} {
-		if got := sndRow(t, c, addr).Kind; got != want {
-			t.Errorf("%s: got %s, want %s", addr, got, want)
-		}
+	// Until the job has run: restarted, not marked, search tables untouched.
+	if st, _ := c.SendersStatus(context.Background()); st.Complete {
+		t.Error("recount not pending after the rules changed")
 	}
-	// Once per rules version: an owner-visible rule row edited later stays put.
-	if _, err := c.db.Exec(`UPDATE senders SET kind = 'human' WHERE addr = 'newsletter@brand.example'`); err != nil {
+	if recountMarker(t, c, sendersRecount) != 0 {
+		t.Fatal("marker written before the recount")
+	}
+	if err := c.RunSenders(context.Background(), nil); err != nil {
 		t.Fatal(err)
 	}
-	if err := c.reclassifySenders(); err != nil {
+	p := sndRow(t, c, "promotion@ebay.de")
+	if p.Kind != KindList || p.NMsgs != 2*sendersBatch+30 {
+		t.Errorf("promo sender: %+v", p)
+	}
+	var txn int
+	if err := c.db.QueryRow(`SELECT n_txn_subj FROM senders WHERE addr = 'promotion@ebay.de'`).Scan(&txn); err != nil || txn != 0 {
+		t.Errorf("n_txn_subj = %d (%v), want 0 with the new subject rule", txn, err)
+	}
+	if r := sndRow(t, c, "store-news@ikea.nl"); r.Kind != KindList {
+		t.Errorf("store-news: %+v", r)
+	}
+	if r := sndRow(t, c, "owned@x.example"); r.Kind != KindList || r.KindSource != SourceOwner {
+		t.Errorf("owner row lost: %+v", r)
+	}
+	if r := sndRow(t, c, "llm@x.example"); r.Kind != KindNotification || r.KindSource != SourceLLM {
+		t.Errorf("llm row lost: %+v", r)
+	}
+	if recountMarker(t, c, sendersRecount) != 1 {
+		t.Error("marker missing after success")
+	}
+	if func() bool {
+		var n int
+		_ = c.db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE name = 'senders_prev_kind'`).Scan(&n)
+		return n != 0
+	}() {
+		t.Error("snapshot table left behind")
+	}
+	// Idempotent: a later start does not recount again.
+	if err := c.initSenders(); err != nil {
 		t.Fatal(err)
 	}
-	if got := sndRow(t, c, "newsletter@brand.example").Kind; got != KindHuman {
-		t.Errorf("second run reclassified: %s", got)
+	if st, _ := c.SendersStatus(context.Background()); !st.Complete {
+		t.Error("recounted again after the marker was written")
 	}
 }
 
-func TestReclassifySendersMarkerWrittenOnlyOnSuccess(t *testing.T) {
-	c := thrOpen(t)
-	if _, err := c.db.Exec(`INSERT INTO senders (account, addr, domain, n_msgs, n_unsub, kind, kind_source) VALUES ('acc', 'newsletter@brand.example', 'brand.example', 10, 10, 'human', 'rule')`); err != nil {
+func TestRecountResumesAfterRestartAndMarksOnlyAtTheEnd(t *testing.T) {
+	dir := t.TempDir()
+	c := recountFixture(t, dir)
+	if err := c.initSenders(); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := c.db.Exec(`DELETE FROM backfill WHERE name = ?`, sendersRulesMarker); err != nil {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var calls atomic.Int64
+	real := c.now
+	c.now = func() time.Time {
+		if calls.Add(1) == 3 {
+			cancel()
+		}
+		return real()
+	}
+	if err := c.RunSenders(ctx, nil); err == nil {
+		t.Fatal("RunSenders was not interrupted")
+	}
+	c.now = real
+	if recountMarker(t, c, sendersRecount) != 0 {
+		t.Fatal("marker written by an interrupted recount")
+	}
+	var processed int
+	if err := c.db.QueryRow(`SELECT processed FROM backfill WHERE name = 'senders'`).Scan(&processed); err != nil || processed == 0 {
+		t.Fatalf("no progress to resume: %d %v", processed, err)
+	}
+	if err := c.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if err := c.reclassifySendersWith(func() error { return errors.New("boom") }); err == nil {
-		t.Fatal("want the injected error")
-	}
-	var n int
-	if err := c.db.QueryRow(`SELECT COUNT(*) FROM backfill WHERE name = ?`, sendersRulesMarker).Scan(&n); err != nil || n != 0 {
-		t.Fatalf("marker after failure: n=%d err=%v", n, err)
-	}
-	if got := sndRow(t, c, "newsletter@brand.example").Kind; got != KindHuman {
-		t.Fatalf("failed pass changed the row: %s", got)
-	}
-	if err := c.reclassifySenders(); err != nil {
+	c2, err := Open(dir)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if got := sndRow(t, c, "newsletter@brand.example").Kind; got != KindList {
-		t.Fatalf("retry did not reclassify: %s", got)
+	t.Cleanup(func() { _ = c2.Close() })
+	var after int
+	if err := c2.db.QueryRow(`SELECT processed FROM backfill WHERE name = 'senders'`).Scan(&after); err != nil || after != processed {
+		t.Fatalf("restart did not resume: processed %d -> %d (%v)", processed, after, err)
 	}
-	if err := c.db.QueryRow(`SELECT COUNT(*) FROM backfill WHERE name = ?`, sendersRulesMarker).Scan(&n); err != nil || n != 1 {
-		t.Fatalf("marker after success: n=%d err=%v", n, err)
+	if err := c2.RunSenders(context.Background(), nil); err != nil {
+		t.Fatal(err)
+	}
+	if p := sndRow(t, c2, "promotion@ebay.de"); p.Kind != KindList || p.NMsgs != 2*sendersBatch+30 {
+		t.Errorf("after resume: %+v", p)
+	}
+	if recountMarker(t, c2, sendersRecount) != 1 {
+		t.Error("marker missing after the resumed recount")
+	}
+}
+
+func TestKindExclusionsRefusedWhileRecounting(t *testing.T) {
+	c := recountFixture(t, t.TempDir())
+	if err := c.initSenders(); err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	_, err := c.ResolveSearch(ctx, SearchQuery{Account: "acc", ExcludeKind: []string{KindList}}, 10)
+	if !errors.Is(err, ErrSendersRecounting) || !strings.Contains(err.Error(), "retry later or drop exclude_kind") {
+		t.Fatalf("resolve with exclude_kind while recounting: %v", err)
+	}
+	if _, err := c.ResolveSearch(ctx, SearchQuery{Account: "acc", ExcludeFrom: []string{"x"}}, 10); err != nil {
+		t.Errorf("exclude_from alone must still work: %v", err)
+	}
+	if partial, _ := c.KindsPartial(ctx); !partial {
+		t.Error("KindsPartial false while recounting")
+	}
+	if err := c.RunSenders(ctx, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.ResolveSearch(ctx, SearchQuery{Account: "acc", ExcludeKind: []string{KindList}}, 10); err != nil {
+		t.Errorf("after the recount: %v", err)
 	}
 }
