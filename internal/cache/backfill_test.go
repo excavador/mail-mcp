@@ -61,10 +61,10 @@ func TestExtractAttachmentsMetadataOnly(t *testing.T) {
 
 func TestBackfillIndexesExistingMessagesAndSwitchesOver(t *testing.T) {
 	c := openCache(t)
-	if tb, ready := c.FTSTable(); tb != "message_fts2" || !ready {
-		t.Fatalf("fresh cache should be ready, got %s %v", tb, ready)
+	if !c.fts2Ready.Load() {
+		t.Fatal("fresh cache should be ready")
 	}
-	// Simulate a pre-upgrade cache: messages and message_fts only.
+	// Simulate a pre-upgrade cache: messages without message_fts2 rows.
 	raw := mimeWithPDF("see attached", miniPDF("Thermostat Quotation 4711"))
 	sum, err := c.putBlob(raw)
 	if err != nil {
@@ -79,17 +79,11 @@ func TestBackfillIndexesExistingMessagesAndSwitchesOver(t *testing.T) {
 		if _, err := c.db.Exec(`INSERT INTO messages (account, stable_id, blob_sha256, from_addr, subject, date_unix) VALUES ('a', ?, ?, 'Bob <bob@example.com>', 'Offer', ?)`, id, blob, 1700000000+i); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := c.db.Exec(`INSERT INTO message_fts (subject, from_addr, to_addr, cc_addr, body, account, stable_id) VALUES ('Offer','Bob','','','see attached','a',?)`, id); err != nil {
-			t.Fatal(err)
-		}
 	}
 	if _, err := c.db.Exec(`UPDATE backfill SET done = 0, last_rowid = 0, processed = 0, total = 3, max_rowid = (SELECT MAX(rowid) FROM messages)`); err != nil {
 		t.Fatal(err)
 	}
 	c.fts2Ready.Store(false)
-	if tb, ready := c.FTSTable(); tb != "message_fts" || ready {
-		t.Fatalf("want fallback, got %s %v", tb, ready)
-	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
@@ -99,8 +93,8 @@ func TestBackfillIndexesExistingMessagesAndSwitchesOver(t *testing.T) {
 	if err != nil || !st.Complete || st.Done != 3 || st.Total != 3 {
 		t.Fatalf("status %+v err %v", st, err)
 	}
-	if tb, ready := c.FTSTable(); tb != "message_fts2" || !ready {
-		t.Fatalf("want fts2, got %s %v", tb, ready)
+	if !c.fts2Ready.Load() {
+		t.Fatal("backfill should leave fts2 ready")
 	}
 	// A file-name-only match still returns the message, marked as an attachment hit.
 	hits, _, err := c.Search(ctx, SearchQuery{Text: "pdf"})

@@ -493,8 +493,8 @@ func thrAttMsg(mid, from, subj, body, filename string, when time.Time) string {
 func TestSearchV2UsesFTS2AndAttachmentFilenames(t *testing.T) {
 	c := thrOpen(t)
 	ctx := context.Background()
-	if tbl, ready := c.FTSTable(); !ready || tbl != "message_fts2" {
-		t.Fatalf("fresh cache must search message_fts2, got %s %v", tbl, ready)
+	if !c.fts2Ready.Load() {
+		t.Fatal("fresh cache must be fts2-ready")
 	}
 	thrAdd(t, c, "p", "pm:old", "", thrMsg("old@x", "A <a@x.com>", "terms", "the contract terms are attached", thr0), thr0)
 	// Newer, but found only through a file name: ranks below the body hit.
