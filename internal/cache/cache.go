@@ -440,9 +440,19 @@ func ensureSchema(db *sql.DB) error {
 // to SQLite's freelist and are reused by later writes; the file does not shrink
 // (auto_vacuum is off, and a VACUUM at startup would block on a large file).
 func dropLegacyFTS(db *sql.DB) error {
+	var n int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE name = 'message_fts'`).Scan(&n); err != nil {
+		return fmt.Errorf("inspect message_fts: %w", err)
+	}
+	if n == 0 {
+		return nil
+	}
+	slog.Info("dropping legacy message_fts")
+	start := time.Now()
 	if _, err := db.Exec(`DROP TABLE IF EXISTS message_fts`); err != nil {
 		return fmt.Errorf("drop message_fts: %w", err)
 	}
+	slog.Info("dropped legacy message_fts", "duration_ms", time.Since(start).Milliseconds())
 	return nil
 }
 
