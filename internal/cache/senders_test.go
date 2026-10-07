@@ -2,6 +2,7 @@ package cache
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"slices"
 	"strings"
@@ -84,6 +85,9 @@ func TestClassifyMarketing(t *testing.T) {
 		{"owner replied beats marketing", KindInputs{Addr: "newsletter@shop.example", NMsgs: 10, NUnsub: 10, NReplied: 1}, KindHuman},
 		{"shop campaign local part without bulk evidence", KindInputs{Addr: "store-news@amazon.nl", NMsgs: 20}, KindList},
 		{"shop campaign local part, mostly order subjects", KindInputs{Addr: "store-news@amazon.nl", NMsgs: 20, NTxn: 15}, KindTransactional},
+		{"shop campaign address, 1 of 3 order-shaped, no headers", KindInputs{Addr: "news@ikea.nl", NMsgs: 3, NTxn: 1}, KindTransactional},
+		{"shop campaign address, single message, no headers", KindInputs{Addr: "news@ikea.nl", NMsgs: 1}, KindTransactional},
+		{"shop campaign address, 1 of 3 order-shaped, unsub majority", KindInputs{Addr: "news@ikea.nl", NMsgs: 3, NTxn: 1, NUnsub: 3}, KindList},
 		{"shop market stream, no headers", KindInputs{Addr: "ae-market.ae6@mail.aliexpress.com", NMsgs: 22}, KindList},
 		{"booking confirmed with unsub at a shop domain", KindInputs{Addr: "customer.service@booking.com", NMsgs: 12, NTxn: 12, NUnsub: 12}, KindTransactional},
 		{"shop unsub majority with a few order subjects, no list-id", KindInputs{Addr: "service@mail.shop.example", NMsgs: 5, NTxn: 1, NUnsub: 5}, KindList},
@@ -116,6 +120,12 @@ func TestIsTransactionalSubject(t *testing.T) {
 		"Order now and save 20% off":               false,
 		"Free delivery, order 171-1234567-1234567": true,
 		"Get US $8.00 off your order":              false,
+		"Take 20% off your order":                  false,
+		"Off your order: everything":               false,
+		"Your order was dropped off":               true,
+		"Delivered: package dropped off":           true,
+		"Order shipped, signed off at the door":    true,
+		"Get €5 off your next order":               false,
 		"Weekly digest":                            false,
 	} {
 		if got := IsTransactionalSubject(subj); got != want {
@@ -624,5 +634,29 @@ func TestRecountResumesAfterRestartAndMarksOnlyAtTheEnd(t *testing.T) {
 	}
 	if recountMarker(t, c2, sendersRecount) != 1 {
 		t.Error("marker missing after the resumed recount")
+	}
+}
+
+func TestKindExclusionsRefusedWhileRecounting(t *testing.T) {
+	c := recountFixture(t, t.TempDir())
+	if err := c.initSenders(); err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	_, err := c.ResolveSearch(ctx, SearchQuery{Account: "acc", ExcludeKind: []string{KindList}}, 10)
+	if !errors.Is(err, ErrSendersRecounting) || !strings.Contains(err.Error(), "retry later or drop exclude_kind") {
+		t.Fatalf("resolve with exclude_kind while recounting: %v", err)
+	}
+	if _, err := c.ResolveSearch(ctx, SearchQuery{Account: "acc", ExcludeFrom: []string{"x"}}, 10); err != nil {
+		t.Errorf("exclude_from alone must still work: %v", err)
+	}
+	if partial, _ := c.KindsPartial(ctx); !partial {
+		t.Error("KindsPartial false while recounting")
+	}
+	if err := c.RunSenders(ctx, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.ResolveSearch(ctx, SearchQuery{Account: "acc", ExcludeKind: []string{KindList}}, 10); err != nil {
+		t.Errorf("after the recount: %v", err)
 	}
 }

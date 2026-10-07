@@ -118,7 +118,15 @@ func (c *Cache) ThreadIDs(ctx context.Context, account, tid string, max int) ([]
 // ResolveSearch returns the stable ids a search matches (newest first), at
 // most max+1 so that a caller can tell it is over the cap. It uses the same
 // match set as SearchV2, tag filter included.
+//
+// With ExcludeKind it refuses (ErrSendersRecounting) while the senders job is
+// incomplete: a selection that feeds a write must not rest on partial kinds.
 func (c *Cache) ResolveSearch(ctx context.Context, q SearchQuery, max int) ([]string, error) {
+	if len(q.ExcludeKind) > 0 {
+		if err := c.requireKindsComplete(ctx); err != nil {
+			return nil, err
+		}
+	}
 	plan, err := c.matchSQL(q)
 	if err != nil {
 		return nil, err

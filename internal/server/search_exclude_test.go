@@ -170,3 +170,31 @@ func TestSearchEchoesTheExclusionsItApplied(t *testing.T) {
 		t.Errorf("saved echo %+v", r.Excluded)
 	}
 }
+
+func TestSearchExcludeKindNotesPartialKindsWhileRecounting(t *testing.T) {
+	e := excEnv(t)
+	cs := e.admin()
+	args := func(extra map[string]any) map[string]any {
+		m := map[string]any{"account": "acct", "query": "body", "group_by": "message"}
+		for k, v := range extra {
+			m[k] = v
+		}
+		return m
+	}
+	type noted struct {
+		Note string `json:"note"`
+	}
+	if n, _ := ok[noted](t, cs, "search", args(map[string]any{"exclude_kind": []string{"list"}})); strings.Contains(n.Note, "recounted") {
+		t.Fatalf("note while complete: %q", n.Note)
+	}
+	if _, err := e.db().Exec(`UPDATE backfill SET done = 0, processed = 2, total = 8 WHERE name = 'senders'`); err != nil {
+		t.Fatal(err)
+	}
+	n, _ := ok[noted](t, cs, "search", args(map[string]any{"exclude_kind": []string{"list"}}))
+	if !strings.Contains(n.Note, "recounted (25% done)") {
+		t.Errorf("note while recounting: %q", n.Note)
+	}
+	if n, _ := ok[noted](t, cs, "search", args(map[string]any{"exclude_from": []string{"alice@"}})); strings.Contains(n.Note, "recounted") {
+		t.Errorf("exclude_from alone got the kinds note: %q", n.Note)
+	}
+}

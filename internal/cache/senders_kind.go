@@ -57,7 +57,7 @@ var (
 	txnSubjRE   = regexp.MustCompile(`(?i)\b(order|orders|invoice|receipt|shipping|shipped|shipment|delivery|delivered|payment|paid|refund|tracking|bestell\w*|factuur|bezorg\w*|betaling|pakket|verzonden|unterwegs|versand\w*|rechnung|commande|facture|livraison|booking|reservation|reservering|tickets?|trip|confirmed|confirmation|purchase|bevestiging|levering|bestätigung|boarding)\b`)
 	// promoSubjRE marks a subject that sells ("Free shipping on your order",
 	// "Delivery deals"): it only counts as order mail with an order number.
-	promoSubjRE = regexp.MustCompile(`(?i)\b(free|gratis|deals?|sale|off|discount|korting|coupons?|promo\w*|save|offers?|aanbieding\w*|now|nu|win|new)\b|\d+ ?% ?off`)
+	promoSubjRE = regexp.MustCompile(`(?i)\b(free|gratis|deals?|sale|discount|korting|coupons?|promo\w*|save|offers?|aanbieding\w*|now|nu|win|new)\b|\d+\s?%\s?off|(us\s?)?[$€£]\s?\d+([.,]\d+)?\s?off|\boff (your|all|everything)\b`)
 	// orderNumRE is order evidence in a subject: #12345, an Amazon 3-7-7 id, "order no".
 	orderNumRE = regexp.MustCompile(`(?i)#\d{5,}|\b\d{3}-\d{7}-\d{7}\b|\b(order|bestelling|bestelnummer)\s*(no|nr|number|nummer)\b`)
 
@@ -131,7 +131,8 @@ func isShop(domain string) bool {
 //
 //   - a campaign-style local part (newsletter@, promotion@, deals@) with bulk
 //     evidence: any List-Id or List-Unsubscribe at an unknown domain; at a known
-//     shop, carrier or payment domain the address alone (no header needed); or
+//     shop, carrier or payment domain the address alone (no header needed) when
+//     no subject is order-shaped and there are at least 2 messages; or
 //   - List-Unsubscribe on most of at least 3 messages of a non-noreply address;
 //     at a known shop also with no order-shaped subject (or a List-Id).
 //
@@ -148,7 +149,12 @@ func IsMarketing(in KindInputs, shop bool) bool {
 			// A campaign-style address at a shop says marketing by itself: the
 			// shop's order mail does not come from promotion@ or store-news@,
 			// and these streams often carry no List-Unsubscribe header.
-			return true
+			if in.NTxn == 0 && in.NMsgs >= 2 {
+				return true
+			}
+			if in.NList > 0 || unsubMajority {
+				return true
+			}
 		} else if in.NList > 0 || in.NUnsub > 0 {
 			return true
 		}

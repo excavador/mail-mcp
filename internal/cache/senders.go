@@ -743,6 +743,40 @@ SELECT account, addr, domain, kind, kind_source, kind_updated_at FROM senders_ke
 	return nil
 }
 
+// ErrSendersRecounting is returned by selections that rest on sender kinds while
+// the senders job (a recount after a rules change) is incomplete.
+var ErrSendersRecounting = errors.New("sender kinds are being recounted")
+
+// requireKindsComplete returns ErrSendersRecounting, with the progress, unless
+// the senders job is complete.
+func (c *Cache) requireKindsComplete(ctx context.Context) error {
+	st, err := c.SendersStatus(ctx)
+	if err != nil {
+		return err
+	}
+	if st.Complete {
+		return nil
+	}
+	return fmt.Errorf("%w (%d%% done); retry later or drop exclude_kind", ErrSendersRecounting, sendersPercent(st))
+}
+
+func sendersPercent(st BackfillStatus) int {
+	if st.Total <= 0 {
+		return 0
+	}
+	return st.Done * 100 / st.Total
+}
+
+// KindsPartial reports whether sender kinds are still being counted, with the
+// percentage done.
+func (c *Cache) KindsPartial(ctx context.Context) (bool, int) {
+	st, err := c.SendersStatus(ctx)
+	if err != nil || st.Complete {
+		return false, 100
+	}
+	return true, sendersPercent(st)
+}
+
 // SendersStatus is the progress of the senders job.
 func (c *Cache) SendersStatus(ctx context.Context) (BackfillStatus, error) {
 	var (
