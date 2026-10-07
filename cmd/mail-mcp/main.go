@@ -212,9 +212,18 @@ func run(ctx context.Context, cmd *cli.Command) error {
 	// The owner's own addresses, before anything can thread a message.
 	owners := map[string][]string{}
 	for _, a := range accts {
-		owners[a.Name] = []string{a.Username}
+		owners[a.Name] = a.OwnerAddrs()
+		if len(a.Aliases) > 0 {
+			log.Info("owner aliases", "account", a.Name, "aliases", len(a.Aliases))
+		}
 	}
 	store.SetOwners(owners)
+	// A changed username/alias set restarts the owner-derived recount; the
+	// work itself runs in the background (RunBackfills), not here.
+	if err := store.ReconcileOwners(log); err != nil {
+		_ = store.Close()
+		return err
+	}
 	hist, err := history.Open(cmd.String("history-dir"))
 	if err != nil {
 		_ = store.Close()

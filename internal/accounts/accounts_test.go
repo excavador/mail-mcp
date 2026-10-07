@@ -250,3 +250,61 @@ func TestNameBoundary(t *testing.T) {
 		t.Fatalf("63-char name should be accepted: %v", err)
 	}
 }
+
+func loadAliases(t *testing.T, aliasYAML string) ([]Account, error) {
+	t.Helper()
+	dir := t.TempDir()
+	pw := writeFile(t, dir, "pw", "secret")
+	cfg := writeFile(t, dir, "accounts.yaml", "accounts:\n"+acct(pw, map[string]string{"aliases": aliasYAML}))
+	return Load(cfg)
+}
+
+func TestAliasesAccepted(t *testing.T) {
+	got, err := loadAliases(t, "[\" Me.Alias@Example.COM \", \"@Example.org\", \"me+x@example.com\", \"me.alias@example.com\"]")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"me@example.com", "me.alias@example.com", "@example.org", "me+x@example.com"}
+	if o := got[0].OwnerAddrs(); strings.Join(o, ",") != strings.Join(want, ",") {
+		t.Errorf("OwnerAddrs() = %v, want %v", o, want)
+	}
+}
+
+func TestAliasesOptional(t *testing.T) {
+	dir := t.TempDir()
+	pw := writeFile(t, dir, "pw", "secret")
+	got, err := Load(writeFile(t, dir, "accounts.yaml", "accounts:\n"+acct(pw, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if o := got[0].OwnerAddrs(); len(o) != 1 || o[0] != "me@example.com" {
+		t.Errorf("OwnerAddrs() = %v, want the username only", o)
+	}
+}
+
+func TestAliasesRefused(t *testing.T) {
+	for name, y := range map[string]string{
+		"no at sign":      `["me.example.com"]`,
+		"two at signs":    `["a@b@example.com"]`,
+		"wildcard":        `["*@example.com"]`,
+		"star domain":     `["@*.example.com"]`,
+		"space":           `["me @example.com"]`,
+		"empty":           `[""]`,
+		"bare domain":     `["@localhost"]`,
+		"empty domain":    `["me@"]`,
+		"display name":    `["Me <me@example.com>"]`,
+		"not a list":      `me@example.com`,
+		"leading dot":     `["@.example.com"]`,
+		"trailing hyphen": `["@example-.com"]`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := loadAliases(t, y)
+			if err == nil {
+				t.Fatalf("aliases %s accepted", y)
+			}
+			if name != "not a list" && !strings.Contains(err.Error(), "alias") {
+				t.Errorf("error does not name the alias problem: %v", err)
+			}
+		})
+	}
+}

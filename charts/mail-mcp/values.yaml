@@ -10,6 +10,16 @@ replicaCount: 1
 
 # A Secret holding accounts.yaml plus one key per password file.
 # Mount it read-only at /etc/mail-mcp with ACCOUNTS_FILE=/etc/mail-mcp/accounts.yaml
+#
+# The accounts file is not rendered from these values, so owner aliases live in
+# that Secret's accounts.yaml, per account (see the README, "Owner aliases"):
+#
+#   accounts:
+#     - name: proton-main
+#       ...
+#       aliases:
+#         - me@example.com     # exact address (plus-tags match too)
+#         - "@example.org"     # any address at this domain
 accounts:
   # Required. The accounts file and password files are never literals in values:
   # they would end up in a values file, in git, and in `helm get values` output.

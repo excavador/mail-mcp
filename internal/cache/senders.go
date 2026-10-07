@@ -43,7 +43,6 @@ import (
 	"net/mail"
 	"net/textproto"
 	"os"
-	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -133,29 +132,20 @@ type senderKey struct{ account, addr string }
 type senderBatch struct {
 	c      *Cache
 	deltas map[senderKey]*senderDelta
-	owners map[string][]string
+	owners map[string]*ownerMatcher
 }
 
 func (c *Cache) newSenderBatch() *senderBatch {
-	return &senderBatch{c: c, deltas: map[senderKey]*senderDelta{}, owners: map[string][]string{}}
-}
-
-func (b *senderBatch) ownersOf(account string) []string {
-	if o, ok := b.owners[account]; ok {
-		return o
-	}
-	o := b.c.threadOpts(account).Owners
-	b.owners[account] = o
-	return o
+	return &senderBatch{c: c, deltas: map[senderKey]*senderDelta{}, owners: map[string]*ownerMatcher{}}
 }
 
 func (b *senderBatch) isOwner(account, addr string) bool {
-	for _, o := range b.ownersOf(account) {
-		if o == addr {
-			return true
-		}
+	m, ok := b.owners[account]
+	if !ok {
+		m = newOwnerMatcher(b.c.threadOpts(account).Owners)
+		b.owners[account] = m
 	}
-	return false
+	return m.match(addr)
 }
 
 func (b *senderBatch) get(account, addr string) *senderDelta {
@@ -219,7 +209,7 @@ func (b *senderBatch) add(account, from, to, subject string, date, internal int6
 		return
 	}
 	for _, ta := range toAddrs(to) {
-		if slices.Contains(b.ownersOf(account), ta) {
+		if b.isOwner(account, ta) {
 			d.toMe++
 			break
 		}
@@ -611,17 +601,33 @@ func (c *Cache) logger() *slog.Logger { return slog.Default() }
 // restarts the senders job over the messages that exist now, in one transaction
 // so a crash leaves either the old state (the next start does it again) or the
 // whole new one.
-func (c *Cache) restartSendersRecount(fresh bool) error {
+//
+// Each extra runs in that transaction before it commits.
+func (c *Cache) restartSendersRecount(fresh bool, extra ...func(*sql.Tx) error) error {
 	tx, err := c.db.Begin()
 	if err != nil {
 		return fmt.Errorf("senders recount: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
-	for _, q := range []string{
-		`CREATE TABLE IF NOT EXISTS senders_prev_kind (account TEXT NOT NULL, addr TEXT NOT NULL, kind TEXT NOT NULL, PRIMARY KEY (account, addr))`,
-		`DELETE FROM senders_prev_kind`,
-		`INSERT INTO senders_prev_kind SELECT account, addr, kind FROM senders WHERE kind_source = 'rule'`,
+	// A recount already pending keeps its snapshot: the counts were reset and
+	// nothing counted yet, so a fresh snapshot would only lose the rule kinds.
+	var pendingMarked, pendingStarted, haveSnap int
+	for q, dst := range map[string]*int{
+		`SELECT COUNT(*) FROM backfill WHERE name = '` + sendersRecount + `'`:                    &pendingMarked,
+		`SELECT COUNT(*) FROM backfill WHERE name = '` + sendersRecountStarted + `'`:             &pendingStarted,
+		`SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'senders_prev_kind'`: &haveSnap,
 	} {
+		if err := tx.QueryRow(q).Scan(dst); err != nil {
+			return fmt.Errorf("senders recount: %w", err)
+		}
+	}
+	snap := []string{`CREATE TABLE IF NOT EXISTS senders_prev_kind (account TEXT NOT NULL, addr TEXT NOT NULL, kind TEXT NOT NULL, PRIMARY KEY (account, addr))`}
+	if pendingMarked > 0 || pendingStarted == 0 || haveSnap == 0 {
+		snap = append(snap,
+			`DELETE FROM senders_prev_kind`,
+			`INSERT INTO senders_prev_kind SELECT account, addr, kind FROM senders WHERE kind_source = 'rule'`)
+	}
+	for _, q := range snap {
 		if _, err := tx.Exec(q); err != nil {
 			return fmt.Errorf("senders recount: %w", err)
 		}
@@ -639,6 +645,11 @@ WHERE name = ?`, c.now().Unix(), sendersJobName); err != nil {
 	}
 	if _, err := tx.Exec(`INSERT OR REPLACE INTO backfill (name, last_rowid, done, updated_at) VALUES (?, 0, 1, ?)`, sendersRecountStarted, c.now().Unix()); err != nil {
 		return fmt.Errorf("senders recount: %w", err)
+	}
+	for _, f := range extra {
+		if err := f(tx); err != nil {
+			return err
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("senders recount: %w", err)
@@ -703,8 +714,15 @@ WHERE s.kind_source = 'rule' AND s.kind <> p.kind GROUP BY s.account, p.kind, s.
 	if _, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO backfill (name, last_rowid, done, updated_at) VALUES (?, 0, 1, ?)`, sendersRecount, c.now().Unix()); err != nil {
 		return fmt.Errorf("senders recount: %w", err)
 	}
+	ownerSets, err := finishOwnersTx(ctx, tx)
+	if err != nil {
+		return err
+	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("senders recount: %w", err)
+	}
+	if ownerSets > 0 {
+		log.Info("owner recount done: owner-derived counts match the current usernames and aliases")
 	}
 	log.Info("senders recount done", "kinds_changed", total)
 	accts := make([]string, 0, len(changed))
