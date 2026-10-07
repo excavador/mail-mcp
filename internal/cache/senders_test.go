@@ -2,6 +2,7 @@ package cache
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"slices"
 	"strings"
@@ -56,8 +57,8 @@ func TestClassifyMarketing(t *testing.T) {
 		// Marketing that read as transactional (shop domain) or human.
 		{"shop promotion@, unsub", KindInputs{Addr: "promotion@aliexpress.com", NMsgs: 60, NUnsub: 60}, KindList},
 		{"shop campaign address, unsub majority", KindInputs{Addr: "ae-market.ae3@deals.aliexpress.com", NMsgs: 17, NUnsub: 17}, KindList},
-		{"shop store-news@ with no headers", KindInputs{Addr: "store-news@amazon.nl", NMsgs: 247}, KindList},
-		{"shop offers@ any tld", KindInputs{Addr: "amazon-offers@amazon.co.uk", NMsgs: 21}, KindList},
+		{"shop store-news@ with unsub majority", KindInputs{Addr: "store-news@amazon.nl", NMsgs: 247, NUnsub: 240}, KindList},
+		{"shop offers@ any tld", KindInputs{Addr: "amazon-offers@amazon.co.uk", NMsgs: 21, NList: 21}, KindList},
 		{"shop promotionN@", KindInputs{Addr: "promotion5@amazon.de", NMsgs: 12, NUnsub: 12}, KindList},
 		{"shop newsletter@ with list id", KindInputs{Addr: "newsletter@update.thuisbezorgd.nl", NMsgs: 48, NList: 48, NUnsub: 48}, KindList},
 		{"shop email.campaign@", KindInputs{Addr: "email.campaign@sg.booking.com", NMsgs: 89, NUnsub: 80}, KindList},
@@ -81,11 +82,41 @@ func TestClassifyMarketing(t *testing.T) {
 		{"a person with an occasional unsub", KindInputs{Addr: "alice@home.example", NMsgs: 20, NUnsub: 2}, KindHuman},
 		{"newsletter@ but mostly invoices", KindInputs{Addr: "newsletter@shop.example", NMsgs: 10, NUnsub: 10, NTxn: 8}, KindHuman},
 		{"owner replied beats marketing", KindInputs{Addr: "newsletter@shop.example", NMsgs: 10, NUnsub: 10, NReplied: 1}, KindHuman},
+		{"shop campaign local part without bulk evidence", KindInputs{Addr: "store-news@amazon.nl", NMsgs: 20}, KindTransactional},
+		{"booking confirmed with unsub at a shop domain", KindInputs{Addr: "customer.service@booking.com", NMsgs: 12, NTxn: 12, NUnsub: 12}, KindTransactional},
+		{"shop unsub majority with a few order subjects, no list-id", KindInputs{Addr: "service@mail.shop.example", NMsgs: 5, NTxn: 1, NUnsub: 5}, KindList},
+		{"carrier unsub majority with an order subject", KindInputs{Addr: "info@dhl.com", NMsgs: 5, NTxn: 1, NUnsub: 5}, KindTransactional},
+		{"two messages, one unsub, as before", KindInputs{Addr: "info@brand.example", NMsgs: 2, NUnsub: 1}, KindHuman},
+		{"two messages, both unsub, as before", KindInputs{Addr: "info@brand.example", NMsgs: 2, NUnsub: 2}, KindHuman},
+		{"two messages at a shop, both unsub", KindInputs{Addr: "info@amazon.nl", NMsgs: 2, NUnsub: 2}, KindTransactional},
+		{"mailer-daemon is not marketing", KindInputs{Addr: "mailer-daemon@brand.example", NMsgs: 2, NUnsub: 1}, KindHuman},
+		{"mailer-daemon with bulk evidence", KindInputs{Addr: "mailer-daemon@brand.example", NMsgs: 1, NList: 1}, KindList}, // List-Id rule, not marketing
 		{"renewsletter is not the word newsletter", KindInputs{Addr: "renewsletter@x.example", NMsgs: 3, NUnsub: 1}, KindHuman},
 	}
 	for _, c := range cases {
 		if got := ClassifySender(c.in); got != c.want {
 			t.Errorf("%s: got %s, want %s", c.name, got, c.want)
+		}
+	}
+}
+
+func TestIsTransactionalSubject(t *testing.T) {
+	for subj, want := range map[string]bool{
+		"Your order has shipped":                   true,
+		"Order #1234567 confirmed":                 true,
+		"Booking confirmation":                     true,
+		"Your tickets for Saturday":                true,
+		"Uw bestelling is bezorgd":                 true,
+		"Bestätigung Ihrer Bestellung":             true,
+		"Payment received":                         true,
+		"Free shipping on your order":              false,
+		"Delivery deals this week":                 false,
+		"Order now and save 20% off":               false,
+		"Free delivery, order 171-1234567-1234567": true,
+		"Weekly digest":                            false,
+	} {
+		if got := IsTransactionalSubject(subj); got != want {
+			t.Errorf("%q: got %v, want %v", subj, got, want)
 		}
 	}
 }
@@ -488,5 +519,34 @@ func TestReclassifySendersOnlyRuleDerived(t *testing.T) {
 	}
 	if got := sndRow(t, c, "newsletter@brand.example").Kind; got != KindHuman {
 		t.Errorf("second run reclassified: %s", got)
+	}
+}
+
+func TestReclassifySendersMarkerWrittenOnlyOnSuccess(t *testing.T) {
+	c := thrOpen(t)
+	if _, err := c.db.Exec(`INSERT INTO senders (account, addr, domain, n_msgs, n_unsub, kind, kind_source) VALUES ('acc', 'newsletter@brand.example', 'brand.example', 10, 10, 'human', 'rule')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.db.Exec(`DELETE FROM backfill WHERE name = ?`, sendersRulesMarker); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.reclassifySendersWith(func() error { return errors.New("boom") }); err == nil {
+		t.Fatal("want the injected error")
+	}
+	var n int
+	if err := c.db.QueryRow(`SELECT COUNT(*) FROM backfill WHERE name = ?`, sendersRulesMarker).Scan(&n); err != nil || n != 0 {
+		t.Fatalf("marker after failure: n=%d err=%v", n, err)
+	}
+	if got := sndRow(t, c, "newsletter@brand.example").Kind; got != KindHuman {
+		t.Fatalf("failed pass changed the row: %s", got)
+	}
+	if err := c.reclassifySenders(); err != nil {
+		t.Fatal(err)
+	}
+	if got := sndRow(t, c, "newsletter@brand.example").Kind; got != KindList {
+		t.Fatalf("retry did not reclassify: %s", got)
+	}
+	if err := c.db.QueryRow(`SELECT COUNT(*) FROM backfill WHERE name = ?`, sendersRulesMarker).Scan(&n); err != nil || n != 1 {
+		t.Fatalf("marker after success: n=%d err=%v", n, err)
 	}
 }

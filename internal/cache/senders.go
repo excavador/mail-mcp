@@ -582,19 +582,26 @@ const sendersRulesMarker = "senders_rules_2"
 // its stored counts, once per rules version. Owner decisions (kind_source
 // owner, and llm) are never touched.
 func (c *Cache) reclassifySenders() error {
-	res, err := c.db.Exec(`INSERT OR IGNORE INTO backfill (name, last_rowid, done, updated_at) VALUES (?, 0, 1, ?)`,
-		sendersRulesMarker, c.now().Unix())
-	if err != nil {
-		return fmt.Errorf("reclassify senders: %w", err)
-	}
-	if n, _ := res.RowsAffected(); n != 1 {
-		return nil
-	}
+	return c.reclassifySendersWith(nil)
+}
+
+// reclassifySendersWith is reclassifySenders with a hook run after the rows are
+// read and before anything is written (tests inject a failure there). The
+// marker is the last statement of the transaction, so a failure or crash leaves
+// it absent and the next start runs the pass again.
+func (c *Cache) reclassifySendersWith(afterRead func() error) error {
 	tx, err := c.db.Begin()
 	if err != nil {
 		return fmt.Errorf("reclassify senders: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
+	var marked int
+	if err := tx.QueryRow(`SELECT COUNT(*) FROM backfill WHERE name = ?`, sendersRulesMarker).Scan(&marked); err != nil {
+		return fmt.Errorf("reclassify senders: %w", err)
+	}
+	if marked > 0 {
+		return nil
+	}
 	rows, err := tx.Query(`SELECT account, addr, domain, kind, n_msgs, n_replied_by_me, n_list, n_unsub, n_gh, n_txn_subj, n_auto
 FROM senders WHERE kind_source = 'rule'`)
 	if err != nil {
@@ -621,12 +628,20 @@ FROM senders WHERE kind_source = 'rule'`)
 	if err != nil {
 		return fmt.Errorf("reclassify senders: %w", err)
 	}
+	if afterRead != nil {
+		if err := afterRead(); err != nil {
+			return fmt.Errorf("reclassify senders: %w", err)
+		}
+	}
 	now := c.now().Unix()
 	for _, ch := range changes {
 		if _, err := tx.Exec(`UPDATE senders SET kind = ?, kind_updated_at = ? WHERE account = ? AND addr = ? AND kind_source = 'rule'`,
 			ch.kind, now, ch.account, ch.addr); err != nil {
 			return fmt.Errorf("reclassify senders: %w", err)
 		}
+	}
+	if _, err := tx.Exec(`INSERT INTO backfill (name, last_rowid, done, updated_at) VALUES (?, 0, 1, ?)`, sendersRulesMarker, now); err != nil {
+		return fmt.Errorf("reclassify senders: %w", err)
 	}
 	return tx.Commit()
 }
