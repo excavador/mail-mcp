@@ -50,7 +50,16 @@ var (
 	// noreplyRE matches a no-reply local part delimited by separators or the
 	// ends, so "piano.reply" does not match.
 	noreplyRE = regexp.MustCompile(`(?i)(^|[._+-])(no[-_.]?reply|do[-_.]?not[-_.]?reply)($|[._+0-9-])`)
-	txnSubjRE = regexp.MustCompile(`(?i)\b(order|orders|invoice|receipt|shipping|shipped|shipment|delivery|delivered|payment|paid|refund|tracking|bestell\w*|factuur|bezorg\w*|betaling|pakket|verzonden|unterwegs|versand\w*|rechnung|commande|facture|livraison)\b`)
+	// marketingRE matches a local part that names a bulk campaign stream
+	// (newsletter@, promotion5@, store-news@, ae-newsletter05.a0@, email.campaign@),
+	// each word delimited by separators, digits or the ends.
+	marketingRE = regexp.MustCompile(`(?i)(^|[._+=-])(newsletters?|news|nieuwsbrief|promo|promos|promotions?|promotional|deals?|offers?|offerte|aanbiedingen|marketing|campaigns?|digest|mailings?)($|[._+0-9=-])`)
+	txnSubjRE   = regexp.MustCompile(`(?i)\b(order|orders|invoice|receipt|shipping|shipped|shipment|delivery|delivered|payment|paid|refund|tracking|bestell\w*|factuur|bezorg\w*|betaling|pakket|verzonden|unterwegs|versand\w*|rechnung|commande|facture|livraison|booking|reservation|reservering|tickets?|trip|confirmed|confirmation|purchase|bevestiging|levering|bestätigung|boarding)\b`)
+	// promoSubjRE marks a subject that sells ("Free shipping on your order",
+	// "Delivery deals"): it only counts as order mail with an order number.
+	promoSubjRE = regexp.MustCompile(`(?i)\b(free|gratis|deals?|sale|discount|korting|coupons?|promo\w*|save|offers?|aanbieding\w*|now|nu|win|new)\b|\d+ ?% ?off`)
+	// orderNumRE is order evidence in a subject: #12345, an Amazon 3-7-7 id, "order no".
+	orderNumRE = regexp.MustCompile(`(?i)#\d{5,}|\b\d{3}-\d{7}-\d{7}\b|\b(order|bestelling|bestelnummer)\s*(no|nr|number|nummer)\b`)
 
 	// notifierDomains are registrable domains whose mail is automated
 	// notification traffic (CI, tracker, chat, monitoring, compliance).
@@ -117,9 +126,49 @@ func isShop(domain string) bool {
 	return shopLabels[label]
 }
 
+// IsMarketing reports whether the sender's address and counts say bulk
+// marketing, per address (order@ and newsletter@ of one domain differ):
+//
+//   - a campaign-style local part (newsletter@, promotion@, deals@) with bulk
+//     evidence: any List-Id or List-Unsubscribe at an unknown domain; at a known
+//     shop, carrier or payment domain a List-Id or List-Unsubscribe on most
+//     messages; or
+//   - List-Unsubscribe on most of at least 3 messages of a non-noreply address;
+//     at a known shop also with no order-shaped subject (or a List-Id).
+//
+// Never when most subjects have an order shape, so a shop's order mail that
+// also carries List-Unsubscribe stays transactional.
+func IsMarketing(in KindInputs, shop bool) bool {
+	if in.NMsgs > 0 && in.NTxn*2 > in.NMsgs {
+		return false
+	}
+	lp := localPart(in.Addr)
+	unsubMajority := in.NMsgs > 0 && in.NUnsub*2 > in.NMsgs
+	if marketingRE.MatchString(lp) {
+		if shop {
+			if in.NList > 0 || unsubMajority {
+				return true
+			}
+		} else if in.NList > 0 || in.NUnsub > 0 {
+			return true
+		}
+	}
+	// No-reply addresses keep the notification rule below unless named above.
+	if noreplyRE.MatchString(lp) || in.NMsgs < 3 || !unsubMajority {
+		return false
+	}
+	return !shop || in.NTxn == 0 || in.NList > 0
+}
+
 // IsTransactionalSubject reports whether a subject has an order, invoice,
 // receipt, shipping or payment shape.
-func IsTransactionalSubject(s string) bool { return txnSubjRE.MatchString(s) }
+// A selling subject counts only when it also carries an order number.
+func IsTransactionalSubject(s string) bool {
+	if !txnSubjRE.MatchString(s) {
+		return false
+	}
+	return !promoSubjRE.MatchString(s) || orderNumRE.MatchString(s)
+}
 
 // ClassifySender applies the rules, in this order, first match wins:
 //
@@ -131,15 +180,19 @@ func IsTransactionalSubject(s string) bool { return txnSubjRE.MatchString(s) }
 //     forge the header)
 //  4. notification: a known notifier domain AND a majority of the sender's
 //     messages look automated (so a person at cloudflare.com is not caught)
-//  5. transactional: a known shop, carrier or payment domain
-//  6. noreply-style address: transactional when any subject has an order
+//  5. list: marketing (IsMarketing): a campaign-style local part, or a
+//     List-Unsubscribe on most messages, unless most subjects are order mail;
+//     even at a shop domain, so promotions are not transactional
+//  6. transactional: a known shop, carrier or payment domain
+//  7. noreply-style address: transactional when any subject has an order
 //     shape, notification when any message carries List-Id or List-Unsubscribe
-//  7. list: any message carries a List-Id
-//  8. human: everything else
+//  8. list: any message carries a List-Id
+//  9. human: everything else
 //
 // The rules see only headers and subjects, never bodies, so they are
 // conservative about "human": a marketing sender without List-Id or
-// List-Unsubscribe, or a shop on an unlisted domain, reads as human.
+// List-Unsubscribe or a campaign-style address, or a shop on an unlisted
+// domain, reads as human.
 func ClassifySender(in KindInputs) string {
 	domain := in.Domain
 	if domain == "" {
@@ -155,6 +208,8 @@ func ClassifySender(in KindInputs) string {
 		return KindNotification
 	case notifierDomains[domain] && in.NMsgs > 0 && in.NAuto*2 > in.NMsgs:
 		return KindNotification
+	case IsMarketing(in, isShop(domain)):
+		return KindList
 	case isShop(domain):
 		return KindTransactional
 	}
