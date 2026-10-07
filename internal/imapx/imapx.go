@@ -406,3 +406,85 @@ func examineAndSearch(ctx context.Context, c *imapclient.Client, folder, query s
 	sort.Slice(uids, func(i, j int) bool { return uids[i] < uids[j] })
 	return uids, nil
 }
+
+// ErrNoDrafts means the account has no Drafts folder to write a draft into.
+var ErrNoDrafts = errors.New("no Drafts folder found (no \\Drafts special-use folder, and none named Drafts)")
+
+// ErrAmbiguousDrafts means more than one folder carries \\Drafts.
+var ErrAmbiguousDrafts = errors.New("ambiguous Drafts folder: more than one folder is marked \\Drafts")
+
+// draftsFallback is the folder used when LIST marks none \Drafts: Proton
+// Bridge's own name for it.
+const draftsFallback = "Drafts"
+
+// DraftsFolder returns the account's Drafts folder: the one LIST marks with
+// the \Drafts special-use attribute (Gmail: "[Gmail]/Drafts"), else a folder
+// named exactly "Drafts". It is ErrNoDrafts when there is neither.
+func DraftsFolder(ctx context.Context, c *imapclient.Client) (string, error) {
+	SetPhase(ctx, "list")
+	list, err := c.List("", "*", nil).Collect()
+	if err != nil {
+		return "", fmt.Errorf("list: %w", err)
+	}
+	byName := false
+	var marked []string
+	for _, m := range list {
+		if hasAttr(m.Attrs, imap.MailboxAttrNonExistent) || hasAttr(m.Attrs, imap.MailboxAttrNoSelect) {
+			continue
+		}
+		if hasAttr(m.Attrs, imap.MailboxAttrDrafts) {
+			marked = append(marked, m.Mailbox)
+		} else if m.Mailbox == draftsFallback {
+			byName = true
+		}
+	}
+	if len(marked) > 1 {
+		return "", ErrAmbiguousDrafts
+	}
+	if len(marked) == 1 {
+		return marked[0], nil
+	}
+	if byName {
+		return draftsFallback, nil
+	}
+	return "", ErrNoDrafts
+}
+
+func hasAttr(attrs []imap.MailboxAttr, want imap.MailboxAttr) bool {
+	for _, a := range attrs {
+		if a == want {
+			return true
+		}
+	}
+	return false
+}
+
+// AppendedDraft is what the server said about a stored draft. UID is zero when
+// the server does not advertise UIDPLUS (no APPENDUID).
+type AppendedDraft struct {
+	UIDValidity uint32
+	UID         uint32
+}
+
+// AppendDraft stores raw in folder with the flags \Draft and \Seen, dated now.
+// It is the only place mail-mcp puts a message into a mailbox, and it only
+// adds: nothing here deletes, replaces or sends.
+func AppendDraft(ctx context.Context, c *imapclient.Client, folder string, raw []byte, now time.Time) (AppendedDraft, error) {
+	SetPhase(ctx, "append")
+	cmd := c.Append(folder, int64(len(raw)), &imap.AppendOptions{
+		Flags: []imap.Flag{imap.FlagDraft, imap.FlagSeen},
+		Time:  now,
+	})
+	if _, err := cmd.Write(raw); err != nil {
+		_ = cmd.Close()
+		return AppendedDraft{}, fmt.Errorf("append: %w", err)
+	}
+	if err := cmd.Close(); err != nil {
+		return AppendedDraft{}, fmt.Errorf("append: %w", err)
+	}
+	data, err := cmd.Wait()
+	if err != nil {
+		return AppendedDraft{}, fmt.Errorf("append: %w", err)
+	}
+	return AppendedDraft{UIDValidity: data.UIDValidity, UID: uint32(data.UID)}, nil
+}

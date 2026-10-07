@@ -133,7 +133,8 @@ func New(accts []accounts.Account, store *cache.Cache, version string, mode Mode
 		addListHistory(s, byName, o.hist)
 	}
 	// Write tools exist only on the Admin server: create_folder, preview_intent,
-	// apply_intent, undo and reapply. The Read server cannot be handed them by
+	// apply_intent, undo, reapply, preview_draft and create_draft (which only
+	// saves a draft: nothing here sends mail). The Read server cannot be handed them by
 	// any option.
 	if mode == Admin && o.hist != nil && o.org != nil {
 		addWriteTools(s, writeDeps{byName: byName, store: store, hist: o.hist, org: o.org, maxUnelicited: o.maxUnelicited, maxUnelicitedLabel: o.maxUnelicitedLabel, approvalMode: o.approvalMode})

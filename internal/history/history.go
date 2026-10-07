@@ -35,6 +35,10 @@ const (
 	KindTagMessages   = "tag_messages"    // Target: the tag; Touched["tag"]: ids newly tagged
 	KindUntagMessages = "untag_messages"  // Target: the tag; Touched["tag"]: ids the tag was removed from
 	KindUndoLocal     = "undo_local"      // Undoes: the record reversed
+	// KindCreateDraft: a draft appended to the Drafts folder (Draft holds what
+	// was saved, never the body). It cannot be undone: mail-mcp deletes
+	// nothing, so the owner discards a draft in their mail client.
+	KindCreateDraft = "create_draft"
 )
 
 // NewID returns a fresh record id, for a caller that must know the id before
@@ -70,6 +74,21 @@ type PreviewInfo struct {
 	ApprovedBy string `json:"approved_by,omitempty"`
 }
 
+// DraftInfo is what create_draft saved: who, to whom, and where, but not what
+// it said.
+type DraftInfo struct {
+	Folder      string   `json:"folder"`
+	MessageID   string   `json:"message_id"`
+	UIDValidity uint32   `json:"uidvalidity,omitempty"`
+	UID         uint32   `json:"uid,omitempty"` // 0: the server gave no APPENDUID
+	From        string   `json:"from"`
+	To          []string `json:"to"`
+	Cc          []string `json:"cc,omitempty"`
+	Bcc         []string `json:"bcc,omitempty"`
+	Subject     string   `json:"subject"`
+	ReplyToID   string   `json:"reply_to,omitempty"` // stable id of the message answered
+}
+
 // Record is one history line.
 type Record struct {
 	ID      string           `json:"id"`
@@ -85,6 +104,7 @@ type Record struct {
 	OldKindSource string      `json:"old_kind_source,omitempty"`
 	NewKind       string      `json:"new_kind,omitempty"`
 	Preview       PreviewInfo `json:"preview"`
+	Draft         *DraftInfo  `json:"draft,omitempty"` // create_draft
 	// Touched is the stable ids acted on, grouped by the folder they came from.
 	Touched map[string][]string `json:"touched,omitempty"`
 	// AlreadyInTarget lists, by source folder, acted-on ids that were in the

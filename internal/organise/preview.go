@@ -75,6 +75,13 @@ type Organiser struct {
 	order    []string // tokens, oldest first
 
 	slots sync.Map // account -> chan struct{} (capacity 1)
+
+	// drafts are the previews of preview_draft, kept apart from the intents: a
+	// draft token never opens apply_intent and an intent token never opens
+	// create_draft. They share the signing key, the lifetime and the cap.
+	drafts     map[string]*DraftPreview
+	draftOrder []string
+	draftTimes map[string][]time.Time // account -> times of unelicited drafts
 }
 
 // New returns an Organiser over store with a fresh random signing key.
@@ -83,7 +90,7 @@ func New(store *cache.Cache) (*Organiser, error) {
 	if _, err := rand.Read(key); err != nil {
 		return nil, fmt.Errorf("organise: signing key: %w", err)
 	}
-	return &Organiser{store: store, key: key, previews: map[string]*Preview{}}, nil
+	return &Organiser{store: store, key: key, previews: map[string]*Preview{}, drafts: map[string]*DraftPreview{}}, nil
 }
 
 // Acquire takes the account's write slot. A second caller does not wait: it is
@@ -313,11 +320,11 @@ func (o *Organiser) NewQuestion(token string) (string, error) {
 	}
 	o.mu.Lock()
 	defer o.mu.Unlock()
-	p, ok := o.previews[token]
-	if !ok {
+	q := o.questionSlot(token)
+	if q == nil {
 		return "", ErrExpired
 	}
-	p.question = nonce
+	*q = nonce
 	return base64.RawURLEncoding.EncodeToString(nonce[:]) + "." +
 		base64.RawURLEncoding.EncodeToString(o.questionMAC(token, nonce[:])), nil
 }
@@ -336,11 +343,23 @@ func (o *Organiser) TakeQuestion(token, state string) bool {
 	}
 	o.mu.Lock()
 	defer o.mu.Unlock()
-	p, ok := o.previews[token]
+	q := o.questionSlot(token)
 	var zero [16]byte
-	if !ok || p.question == zero || !hmac.Equal(p.question[:], nonce) {
+	if q == nil || *q == zero || !hmac.Equal(q[:], nonce) {
 		return false
 	}
-	p.question = zero
+	*q = zero
 	return true
+}
+
+// questionSlot returns the outstanding-question nonce of the intent or draft
+// preview a token names, nil if there is none. Callers hold o.mu.
+func (o *Organiser) questionSlot(token string) *[16]byte {
+	if p, ok := o.previews[token]; ok {
+		return &p.question
+	}
+	if p, ok := o.drafts[token]; ok {
+		return &p.question
+	}
+	return nil
 }

@@ -308,3 +308,58 @@ func TestAliasesRefused(t *testing.T) {
 		})
 	}
 }
+
+func TestOwns(t *testing.T) {
+	got, err := loadAliases(t, `["me.alias@example.com", "@example.org"]`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := got[0]
+	for addr, want := range map[string]bool{
+		"me@example.com":          true,
+		"ME@Example.com":          true,
+		" me@example.com ":        true,
+		"me+news@example.com":     true, // plus-tagged username
+		"me.alias@example.com":    true,
+		"anyone@example.org":      true, // domain alias
+		"x+y@example.org":         true,
+		"anyone@sub.example.org":  false, // exactly that domain
+		"other@example.com":       false,
+		"me.alias+t@example.com":  true,
+		"someone@example.net":     false,
+		"":                        false,
+		"example.com":             false,
+		"@example.org":            false,
+		"me@":                     false,
+		"+x@example.org.evil.com": false,
+	} {
+		if g := a.Owns(addr); g != want {
+			t.Errorf("Owns(%q) = %v, want %v", addr, g, want)
+		}
+	}
+}
+
+func TestDraftsSwitchAndDisplayName(t *testing.T) {
+	load := func(over map[string]string) ([]Account, error) {
+		dir := t.TempDir()
+		pw := writeFile(t, dir, "pw", "secret")
+		return Load(writeFile(t, dir, "accounts.yaml", "accounts:\n"+acct(pw, over)))
+	}
+	got, err := load(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got[0].DraftsEnabled() || got[0].DisplayName != "" {
+		t.Errorf("defaults: drafts enabled = %v, display name %q", got[0].DraftsEnabled(), got[0].DisplayName)
+	}
+	got, err = load(map[string]string{"drafts": "false", "displayName": `"Oleg Tsarev"`})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got[0].DraftsEnabled() || got[0].DisplayName != "Oleg Tsarev" {
+		t.Errorf("drafts enabled = %v, display name %q", got[0].DraftsEnabled(), got[0].DisplayName)
+	}
+	if _, err := load(map[string]string{"displayName": `"a\nb"`}); err == nil {
+		t.Error("a display name with a newline was accepted")
+	}
+}

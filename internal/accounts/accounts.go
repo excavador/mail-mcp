@@ -67,6 +67,12 @@ type Account struct {
 	// owner address counts as the owner's own: sent-mail detection,
 	// n_replied_by_me, outsider flags.
 	Aliases []string `yaml:"aliases,omitempty"`
+	// DisplayName is the name shown on the From line of a draft
+	// (preview_draft); empty: the From line is the bare address.
+	DisplayName string `yaml:"displayName,omitempty"`
+	// Drafts turns draft creation (preview_draft, create_draft) off for the
+	// account when false. Unset: on.
+	Drafts *bool `yaml:"drafts,omitempty"`
 
 	password string
 }
@@ -149,6 +155,36 @@ func (a Account) OwnerAddrs() []string {
 	return out
 }
 
+// DraftsEnabled reports whether preview_draft and create_draft may be used on
+// the account: on unless the configuration says `drafts: false`.
+func (a Account) DraftsEnabled() bool { return a.Drafts == nil || *a.Drafts }
+
+// Owns reports whether addr is one of the owner's own addresses on this
+// account: the username, an exact alias, any address at an "@domain" alias,
+// compared case-insensitively. A plus-tagged address (me+tag@host) is owned
+// when its base address is.
+func (a Account) Owns(addr string) bool {
+	addr = strings.ToLower(strings.TrimSpace(addr))
+	at := strings.LastIndexByte(addr, '@')
+	if at <= 0 || at == len(addr)-1 {
+		return false
+	}
+	local, domain := addr[:at], addr[at+1:]
+	base := ""
+	if plus := strings.IndexByte(local, '+'); plus > 0 {
+		base = local[:plus] + "@" + domain
+	}
+	for _, o := range a.OwnerAddrs() {
+		switch {
+		case o == addr, base != "" && o == base:
+			return true
+		case strings.HasPrefix(o, "@") && o[1:] == domain:
+			return true
+		}
+	}
+	return false
+}
+
 var domainRE = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$`)
 
 // NormalizeAlias validates one aliases entry and returns it lowercase:
@@ -193,6 +229,11 @@ func (a Account) validate() error {
 	for _, x := range a.Aliases {
 		if _, err := NormalizeAlias(x); err != nil {
 			return fmt.Errorf("aliases: %w", err)
+		}
+	}
+	for _, r := range a.DisplayName {
+		if r < ' ' || r == 0x7f {
+			return errors.New("displayName must not contain control characters")
 		}
 	}
 	if a.PinnedCertSHA256 != "" {
