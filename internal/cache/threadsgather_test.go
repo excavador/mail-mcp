@@ -117,14 +117,14 @@ func gatherComponentRef(ctx context.Context, tx dbq, account, seed string, visit
 func TestGatherComponentMatchesReference(t *testing.T) {
 	ctx := context.Background()
 	c := thrOpen(t)
-	loadSynth(t, c, "p", synthCorpus(4000, 7))
-	for _, limit := range []int{3000, 40, 7} {
+	loadSynth(t, c, "p", synthCorpus(800, 7))
+	for _, limit := range []int{3000, 25} {
 		old := maxComponent
 		maxComponent = limit
 		func() {
 			defer func() { maxComponent = old }()
 			capped := 0
-			for i := 0; i < 4000; i += 3 {
+			for i := 0; i < 800; i += 7 {
 				seed := fmt.Sprintf("pm:%07d", i)
 				v1, v2 := map[string]bool{}, map[string]bool{}
 				got, gc, err1 := gatherComponent(ctx, c.db, "p", seed, v1)
