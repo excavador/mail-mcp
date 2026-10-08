@@ -189,9 +189,12 @@ func TestReleaseOnCancelHandsOverToStandby(t *testing.T) {
 	ctxB, cancelB := context.WithCancel(context.Background())
 	defer cancelB()
 
-	var bStarted atomic.Bool
-	da := start(t, ctxA, log, cfg(c, "a"), func(jc context.Context) { <-jc.Done() })
-	eventually(t, 5*time.Second, "a to lead", func() bool { h, _ := holder(t, c); return h == "a" })
+	// Wait for a's jobs, not just the Lease: the elector runs the start
+	// callback in its own goroutine, and a cancel that lands before it has
+	// run means the jobs (and the "released" log) never happen.
+	var aStarted, bStarted atomic.Bool
+	da := start(t, ctxA, log, cfg(c, "a"), func(jc context.Context) { aStarted.Store(true); <-jc.Done() })
+	eventually(t, 5*time.Second, "a's jobs to start", aStarted.Load)
 	db := start(t, ctxB, log, cfg(c, "b"), func(jc context.Context) { bStarted.Store(true); <-jc.Done() })
 
 	cancelA()
@@ -202,9 +205,9 @@ func TestReleaseOnCancelHandsOverToStandby(t *testing.T) {
 	}
 	// The standby takes over well before a crashed leader's LeaseDuration.
 	eventually(t, tLease+tRetry*3, "b to lead", func() bool { return bStarted.Load() })
-	if !strings.Contains(buf.String(), "leadership released") {
-		t.Errorf("log lacks 'leadership released':\n%s", buf.String())
-	}
+	eventually(t, 5*time.Second, "'leadership released' in the log", func() bool {
+		return strings.Contains(buf.String(), "leadership released")
+	})
 	cancelB()
 	waitRun(t, db)
 }
