@@ -9,11 +9,17 @@ metadata:
   {{- end }}
 spec:
   replicas: {{ .Values.replicaCount }}
-  # Recreate strategy: the cache is a node-local SQLite database and
-  # history is an RWO PVC. A rolling update would cause multi-attach
-  # errors and concurrent writes to the cache. Only one pod at a time.
+  # RollingUpdate with overlap: the new pod starts and becomes Ready before the
+  # old one stops, so MCP clients see no gap. Both pods land on the same node
+  # (the cache is a node-local PVC, history an RWO PVC, which several pods on
+  # one node may mount) and share both. Requests are safe on both pods (SQLite
+  # WAL with a busy timeout, an O_APPEND history file); the background jobs run
+  # only in the pod holding the Lease named after this release.
   strategy:
-    type: Recreate
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
   selector:
     matchLabels: {{- include "mail-mcp.selectorLabels" . | nindent 6 }}
   template:
@@ -23,9 +29,13 @@ spec:
       annotations: {{- toYaml . | nindent 8 }}
       {{- end }}
     spec:
-      # mail-mcp does not use the Kubernetes API, and a parser sidecar has no
-      # business holding a service-account token.
+      serviceAccountName: {{ include "mail-mcp.fullname" . }}
+      # Only mail-mcp talks to the Kubernetes API (its Lease), and a parser
+      # sidecar has no business holding a service-account token: the token is
+      # a projected volume mounted into the mail-mcp container alone.
       automountServiceAccountToken: false
+      # SIGTERM: drain requests (20s), stop the jobs, release the Lease.
+      terminationGracePeriodSeconds: 45
       securityContext: {{- toYaml .Values.podSecurityContext | nindent 8 }}
       containers:
         - name: mail-mcp
@@ -35,6 +45,12 @@ spec:
           env:
             - name: ACCOUNTS_FILE
               value: /etc/mail-mcp/accounts.yaml
+            - name: POD_NAME
+              valueFrom: {fieldRef: {fieldPath: metadata.name}}
+            - name: POD_NAMESPACE
+              valueFrom: {fieldRef: {fieldPath: metadata.namespace}}
+            - name: LEASE_NAME
+              value: {{ include "mail-mcp.fullname" . }}
             # stdio would exit immediately in a pod with no attached client.
             - name: TRANSPORT
               value: http
@@ -68,7 +84,9 @@ spec:
             - name: http
               containerPort: {{ .Values.service.port }}
               protocol: TCP
-          # /healthz is liveness only and does NOT call external services:
+          # /healthz is liveness and readiness, independent of leadership (a new
+          # pod is Ready while the old one still leads), and does NOT call
+          # external services:
           # a readiness probe that fails when a dependency blips would take
           # the pod out of service for something it cannot fix by restarting.
           # Open can run one-time work before the server listens (the drop of the
@@ -97,6 +115,9 @@ spec:
               mountPath: /var/lib/mail-mcp/history
             - name: tmp
               mountPath: /tmp
+            - name: kube-api-access
+              mountPath: /var/run/secrets/kubernetes.io/serviceaccount
+              readOnly: true
             {{- if .Values.pdfExtractor.enabled }}
             - name: pdftext-socket
               mountPath: /run/pdftext
@@ -152,6 +173,16 @@ spec:
           {{- end }}
         - name: tmp
           emptyDir: {}
+        - name: kube-api-access
+          projected:
+            defaultMode: 0444
+            sources:
+              - serviceAccountToken: {path: token, expirationSeconds: 3607}
+              - configMap:
+                  name: kube-root-ca.crt
+                  items: [{key: ca.crt, path: ca.crt}]
+              - downwardAPI:
+                  items: [{path: namespace, fieldRef: {fieldPath: metadata.namespace}}]
         {{- if .Values.pdfExtractor.enabled }}
         - name: pdftext-socket
           emptyDir:

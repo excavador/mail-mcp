@@ -105,6 +105,10 @@ openssl s_client -starttls imap -connect 127.0.0.1:143 </dev/null | \
 | `--scope` | `SCOPE` | no; default `openid` | http |
 | `--pdf-extractor-socket` | `PDF_EXTRACTOR_SOCKET` | no; empty (default) turns PDF text off | all |
 | `--pdf-stage-dir` | `PDF_STAGE_DIR` | no; default `--cache-dir` | all |
+| `--leader-election` | `LEADER_ELECTION` | no; `auto` (default: on when running in a cluster), `true`, or `false` (always the leader, for local runs) | all |
+| `--lease-name` | `LEASE_NAME` | no; default `mail-mcp` | all |
+| `--lease-namespace` | `POD_NAMESPACE` | in a cluster, if the service-account namespace file is not mounted | all |
+| (identity) | `POD_NAME` | no; default the hostname | all |
 
 The read and admin resource URLs must differ — that difference is the whole
 point, so that sluis can mint 7-day tokens for the read endpoint and shorter
@@ -288,6 +292,57 @@ from <https://poppler.freedesktop.org/>.
 **There is no delete tool, and there will not be one.** Moves are reversible; deletes are not. The only way to throw a message away is to move it, so you can undo it later.
 
 **It never sends mail.** There is no SMTP code and no send tool. Drafts are saved in the Drafts folder ([above](#drafts)); sending is yours, from your own mail client.
+
+## Rolling updates and the Lease
+
+A Deployment may use `RollingUpdate` (`maxSurge: 1`, `maxUnavailable: 0`): for a
+few seconds two pods run on the same node and share the cache directory and
+the history volume. Every pod serves requests; SQLite runs in WAL mode with a
+10 s busy timeout, and the history file is only ever appended to, one
+`O_APPEND` write per record, and re-read for records the other pod wrote.
+
+The periodic writers are not meant to run twice, so only the holder of a
+Kubernetes `Lease` (`coordination.k8s.io/v1`, `--lease-name`, in
+`--lease-namespace`) runs them: the per-account IMAP refreshers, the backfills
+(fts2 index, threading, senders recount, entities, PDF text), the owner
+recount and the search-log retention. Timing: 15 s lease, 10 s renew deadline,
+2 s retry; a crashed leader is replaced within about 15 s, a terminating one
+releases the Lease at once. A pod that loses the Lease stops its jobs, keeps
+serving and campaigns again. Leadership changes are logged at INFO
+(`leadership acquired`, `leadership lost`, `leadership released`).
+
+`/healthz` is ready as soon as the cache is open and the server listens,
+whoever leads. On SIGTERM the server stops accepting, gives in-flight requests
+20 s, then stops the jobs, releases the Lease and closes the cache; keep
+`terminationGracePeriodSeconds` above that (the chart uses 45).
+
+Leader election is on automatically in a cluster. It needs this RBAC in the
+pod's namespace (the chart creates it):
+
+```yaml
+rules:
+  - apiGroups: [coordination.k8s.io]
+    resources: [leases]
+    verbs: [create]
+  - apiGroups: [coordination.k8s.io]
+    resources: [leases]
+    resourceNames: [mail-mcp]
+    verbs: [get, update, patch]
+```
+
+and the downward API for the identity and namespace:
+
+```yaml
+env:
+  - {name: POD_NAME, valueFrom: {fieldRef: {fieldPath: metadata.name}}}
+  - {name: POD_NAMESPACE, valueFrom: {fieldRef: {fieldPath: metadata.namespace}}}
+```
+
+The pod therefore needs a service-account token (the chart mounts one into the
+`mail-mcp` container only, not into the PDF sidecar). One thing a Lease cannot
+protect: a release that bumps the cache schema version drops and rebuilds the
+index tables on start, which breaks the old pod still running; deploy such a
+release with `Recreate`.
 
 ## Two things to know before deploying it
 

@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"time"
 )
 
 var sumRE = regexp.MustCompile(`^[0-9a-f]{64}$`)
@@ -91,6 +92,10 @@ func syncDir(dir string) error {
 	return d.Sync()
 }
 
+// staleTemp is how old a ".tmp-" file must be before sweepTemp treats it as
+// left behind by a crash rather than a write in progress in another process.
+const staleTemp = time.Hour
+
 // sweepTemp removes temporary files a crashed write left behind. Blobs are
 // only ever renamed into place complete, so a ".tmp-" file is never a blob.
 func sweepTemp(blobs string) {
@@ -108,9 +113,16 @@ func sweepTemp(blobs string) {
 			continue
 		}
 		for _, e := range ents {
-			if !e.IsDir() && strings.HasPrefix(e.Name(), ".tmp-") {
-				_ = os.Remove(filepath.Join(dir, e.Name()))
+			if e.IsDir() || !strings.HasPrefix(e.Name(), ".tmp-") {
+				continue
 			}
+			// Another process may share this directory (the old pod of a
+			// rolling update): its write in flight is a fresh ".tmp-" file,
+			// and removing it would fail that write's rename.
+			if info, err := e.Info(); err != nil || time.Since(info.ModTime()) < staleTemp {
+				continue
+			}
+			_ = os.Remove(filepath.Join(dir, e.Name()))
 		}
 	}
 }
