@@ -132,6 +132,10 @@
         }
       }
     },
+    "forceRecreate": {
+      "type": "boolean",
+      "description": "Use the Recreate strategy even when history.existingClaim is set. Needed for a release that bumps the cache schemaVersion."
+    },
     "history": {
       "type": "object",
       "additionalProperties": false,

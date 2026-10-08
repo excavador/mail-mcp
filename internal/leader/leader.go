@@ -35,6 +35,10 @@ const (
 	RetryPeriod   = 2 * time.Second
 )
 
+// stopWait bounds how long a handover waits for the jobs to stop, so a stuck
+// job cannot hold the Lease past the pod's grace period.
+const stopWait = 15 * time.Second
+
 const namespaceFile = "/var/run/secrets/kubernetes.io/serviceaccount/namespace"
 
 // Config configures Run.
@@ -72,10 +76,13 @@ func (c *Config) resolve() (kubernetes.Interface, error) {
 	}
 	rc, err := rest.InClusterConfig()
 	if err != nil {
-		if mode == "auto" {
+		// Only "not in a cluster" lets auto mode run without election; any
+		// other failure (an unreadable token, say) must not silently turn
+		// into a second pod running the writers.
+		if mode == "auto" && errors.Is(err, rest.ErrNotInCluster) {
 			return nil, nil
 		}
-		return nil, fmt.Errorf("leader election: not in a cluster: %w", err)
+		return nil, fmt.Errorf("leader election: in-cluster config: %w", err)
 	}
 	cl, err := kubernetes.NewForConfig(rc)
 	if err != nil {
@@ -125,17 +132,44 @@ func (c *Config) fill() error {
 //
 // With election off, jobs runs once, at once, for as long as ctx lives.
 func Run(ctx context.Context, log *slog.Logger, cfg Config, jobs func(ctx context.Context)) error {
-	client, err := cfg.resolve()
+	e, err := New(cfg)
 	if err != nil {
 		return err
 	}
+	return e.Run(ctx, log, jobs)
+}
+
+// Elector is a validated configuration. Build it with New at startup so a bad
+// flag or a missing namespace is a startup error, not a pod without jobs.
+type Elector struct {
+	cfg    Config
+	client kubernetes.Interface // nil: election off
+}
+
+// New resolves and validates cfg.
+func New(cfg Config) (*Elector, error) {
+	client, err := cfg.resolve()
+	if err != nil {
+		return nil, err
+	}
+	if client != nil {
+		if err := cfg.fill(); err != nil {
+			return nil, err
+		}
+	}
+	return &Elector{cfg: cfg, client: client}, nil
+}
+
+// On reports whether this process campaigns for the Lease.
+func (e *Elector) On() bool { return e.client != nil }
+
+// Run is the package-level Run on a validated Elector.
+func (e *Elector) Run(ctx context.Context, log *slog.Logger, jobs func(ctx context.Context)) error {
+	cfg, client := e.cfg, e.client
 	if client == nil {
 		log.Info("leader election off; running the background jobs here", "mode", cfg.Mode)
 		jobs(ctx)
 		return nil
-	}
-	if err := cfg.fill(); err != nil {
-		return err
 	}
 	log.Info("leader election on", "lease", cfg.Namespace+"/"+cfg.Name, "identity", cfg.Identity,
 		"lease_duration", cfg.LeaseDuration.String(), "renew_deadline", cfg.RenewDeadline.String(), "retry_period", cfg.Retry.String())
@@ -187,7 +221,11 @@ func campaign(ctx context.Context, log *slog.Logger, cfg Config, client kubernet
 			c()
 		}
 		if d != nil {
-			<-d
+			select {
+			case <-d:
+			case <-time.After(stopWait):
+				log.Error("background jobs did not stop in time; giving up the Lease anyway", "identity", cfg.Identity, "waited", stopWait.String())
+			}
 		}
 	}
 
@@ -199,8 +237,13 @@ func campaign(ctx context.Context, log *slog.Logger, cfg Config, client kubernet
 		ReleaseOnCancel: true,
 		Name:            cfg.Name,
 		Callbacks: leaderelection.LeaderCallbacks{
-			OnStartedLeading: func(context.Context) {
+			OnStartedLeading: func(lctx context.Context) {
+				// Jobs end when either the process is shutting down (ctx)
+				// or the elector stops leading (lctx: renewal failed or
+				// the elector's context ended), not only after release.
 				jctx, c := context.WithCancel(ctx)
+				stop := context.AfterFunc(lctx, c)
+				defer stop()
 				d := make(chan struct{})
 				mu.Lock()
 				if stopped {

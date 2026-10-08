@@ -384,6 +384,11 @@ CREATE TABLE IF NOT EXISTS pdf_text (
 // migrated: the index tables are dropped and recreated, and the next refresh
 // re-indexes from the server. Bump it whenever the schema or the meaning of a
 // stable id changes.
+//
+// WARNING: bumping this makes the NEW pod drop the index tables the OLD pod is
+// still serving from during a RollingUpdate (and a rollback does the same the
+// other way). Deploy the release that bumps it with the chart's
+// forceRecreate: true (strategy Recreate), then switch it back.
 const schemaVersion = 2
 
 // indexTables are the tables the index owns, FTS first (dropping the virtual

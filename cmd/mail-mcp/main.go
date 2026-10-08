@@ -230,6 +230,17 @@ func run(ctx context.Context, cmd *cli.Command) error {
 	}
 	log.Info("accounts loaded", "accounts", names, "version", version)
 
+	// Validated before anything is opened or served: a bad mode or an unknown
+	// namespace is a startup error, not a healthy pod that never runs jobs.
+	elector, err := leader.New(leader.Config{
+		Mode:      cmd.String("leader-election"),
+		Name:      cmd.String("lease-name"),
+		Namespace: cmd.String("lease-namespace"),
+	})
+	if err != nil {
+		return err
+	}
+
 	store, err := cache.Open(cmd.String("cache-dir"))
 	if err != nil {
 		return err
@@ -315,12 +326,7 @@ func run(ctx context.Context, cmd *cli.Command) error {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		err := leader.Run(jobsCtx, log, leader.Config{
-			Mode:      cmd.String("leader-election"),
-			Name:      cmd.String("lease-name"),
-			Namespace: cmd.String("lease-namespace"),
-		}, jobs)
-		if err != nil {
+		if err := elector.Run(jobsCtx, log, jobs); err != nil {
 			log.Error("leader election failed; no background jobs run in this pod", "error", err.Error())
 		}
 	}()

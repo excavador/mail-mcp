@@ -20,6 +20,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"sync"
 	"time"
@@ -143,6 +144,9 @@ type Store struct {
 	f    *os.File
 	recs []Record
 	off  int64 // bytes of the file already folded into recs
+	// pending are ids of records written but kept in memory because reading
+	// them back failed; catchUp skips them when it finds them in the file.
+	pending []string
 }
 
 // Open creates dir (0700) and the file (0600) if needed, loads every record
@@ -172,18 +176,28 @@ func Open(dir string) (*Store, error) {
 		_ = f.Close()
 		return nil, fmt.Errorf("history: stat: %w", err)
 	}
-	s.recs = load(io.NewSectionReader(f, 0, st.Size()))
-	s.off = st.Size()
+	// Fold in only through the last complete line: a trailing fragment is
+	// either a crash leftover (repaired below) or, in principle, another
+	// process mid-append, which catchUp picks up once its newline lands.
+	head := make([]byte, st.Size())
+	n, err := f.ReadAt(head, 0)
+	if err != nil && !errors.Is(err, io.EOF) {
+		_ = f.Close()
+		return nil, fmt.Errorf("history: read: %w", err)
+	}
+	head = head[:n]
+	end := bytes.LastIndexByte(head, '\n') + 1
+	s.recs = load(bytes.NewReader(head[:end]))
+	s.off = int64(end)
 	// A crash mid-write can leave a last line without its newline; the next
-	// append would glue a record onto it and lose both. Start a fresh line.
-	if st.Size() > 0 {
-		var last [1]byte
-		if _, err := f.ReadAt(last[:], st.Size()-1); err == nil && last[0] != '\n' {
-			if _, err := f.Write([]byte{'\n'}); err != nil {
-				_ = f.Close()
-				return nil, fmt.Errorf("history: repair line end: %w", err)
-			}
-			s.off++
+	// append would glue a record onto it and lose both. Appends are single
+	// atomic O_APPEND writes, so a live peer never leaves a fragment: a file
+	// that still ends without a newline here is a crash leftover. End it, and
+	// fold it in as the (probably corrupt) line it is.
+	if end < len(head) {
+		if _, err := f.Write([]byte{'\n'}); err != nil {
+			_ = f.Close()
+			return nil, fmt.Errorf("history: repair line end: %w", err)
 		}
 	}
 	return s, nil
@@ -208,7 +222,13 @@ func (s *Store) catchUp() {
 	if end < 0 {
 		return
 	}
-	s.recs = append(s.recs, load(bytes.NewReader(buf[:end+1]))...)
+	for _, r := range load(bytes.NewReader(buf[:end+1])) {
+		if i := slices.Index(s.pending, r.ID); i >= 0 {
+			s.pending = slices.Delete(s.pending, i, i+1)
+			continue
+		}
+		s.recs = append(s.recs, r)
+	}
 	s.off += int64(end + 1)
 }
 
@@ -297,7 +317,16 @@ func (s *Store) Append(r Record) (Record, error) {
 	}
 	// Fold in what the other process appended before this record, then this
 	// one, so both processes hold the file's order.
+	before := len(s.recs)
 	s.catchUp()
+	if !slices.ContainsFunc(s.recs[before:], func(x Record) bool { return x.ID == r.ID }) {
+		// The write succeeded but reading it back did not (stat or read
+		// failed): keep it in memory so this process still sees it. The
+		// next catchUp skips it when it finds it in the file.
+		slog.Warn("history: record written but not read back; kept in memory", "id", r.ID)
+		s.recs = append(s.recs, r)
+		s.pending = append(s.pending, r.ID)
+	}
 	return r, nil
 }
 

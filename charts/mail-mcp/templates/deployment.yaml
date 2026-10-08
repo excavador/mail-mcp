@@ -15,11 +15,24 @@ spec:
   # one node may mount) and share both. Requests are safe on both pods (SQLite
   # WAL with a busy timeout, an O_APPEND history file); the background jobs run
   # only in the pod holding the Lease named after this release.
+  #
+  # Rolling needs history on a shared claim: with the per-pod emptyDir fallback
+  # the two pods would each have their own history and undo would break. So no
+  # history.existingClaim means Recreate. forceRecreate does the same for a
+  # release that bumps the cache schemaVersion (the new pod drops the index
+  # tables the old pod is still using).
+  {{- $history := .Values.history | default dict }}
+  {{- $rolling := and $history.existingClaim (not .Values.forceRecreate) }}
+  {{- if $rolling }}
   strategy:
     type: RollingUpdate
     rollingUpdate:
       maxSurge: 1
       maxUnavailable: 0
+  {{- else }}
+  strategy:
+    type: Recreate
+  {{- end }}
   selector:
     matchLabels: {{- include "mail-mcp.selectorLabels" . | nindent 6 }}
   template:
@@ -80,6 +93,11 @@ spec:
             - name: PDF_STAGE_DIR
               value: /var/lib/mail-mcp/pdf-stage
             {{- end }}
+          # Let the gateway drop this endpoint before shutdown starts.
+          lifecycle:
+            preStop:
+              sleep:
+                seconds: 5
           ports:
             - name: http
               containerPort: {{ .Values.service.port }}
@@ -198,6 +216,12 @@ spec:
       {{- with .Values.tolerations }}
       tolerations: {{- toYaml . | nindent 8 }}
       {{- end }}
-      {{- with .Values.affinity }}
+      {{- $aff := .Values.affinity | default dict | deepCopy }}
+      {{- if and $rolling (not $aff.podAffinity) }}
+      {{- /* The surge pod must land on the old pod's node (shared cache and
+             history); a pod may match its own selector when it is the first. */}}
+      {{- $_ := set $aff "podAffinity" (dict "requiredDuringSchedulingIgnoredDuringExecution" (list (dict "topologyKey" "kubernetes.io/hostname" "labelSelector" (dict "matchLabels" (include "mail-mcp.selectorLabels" . | fromYaml))))) }}
+      {{- end }}
+      {{- with $aff }}
       affinity: {{- toYaml . | nindent 8 }}
       {{- end }}
