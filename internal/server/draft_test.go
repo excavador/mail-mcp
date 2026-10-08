@@ -5,6 +5,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"mime"
+	"mime/multipart"
+	"net/mail"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -614,4 +617,63 @@ func call2(cs *mcp.ClientSession, tool string, args map[string]any) (*mcp.CallTo
 		return res, text(res)
 	}
 	return res, ""
+}
+
+func TestDraftIsMultipartAlternativeAndAppendedAsPreviewed(t *testing.T) {
+	e, id := draftEnv(t)
+	cs := e.admin()
+	body := "Yes <b>12:30</b> & \"fine\"\n\n- one\n- two\n"
+	p := e.previewDraft(t, cs, map[string]any{"reply_to": id, "quote_original": true, "body": body})
+
+	// body_text is the plain text only: no HTML, no MIME structure.
+	for _, bad := range []string{"<html", "<p>", "<blockquote", "text/html", "boundary", "multipart"} {
+		if strings.Contains(p.Untrusted.BodyText, bad) {
+			t.Errorf("body_text holds %q:\n%s", bad, p.Untrusted.BodyText)
+		}
+	}
+	if !strings.Contains(p.Untrusted.BodyText, "Yes <b>12:30</b> & \"fine\"") || !strings.Contains(p.Untrusted.BodyText, "wrote:") {
+		t.Errorf("body_text = %q", p.Untrusted.BodyText)
+	}
+	// The message shows both parts.
+	for _, want := range []string{
+		"Content-Type: multipart/alternative;", "Content-Type: text/plain; charset=utf-8",
+		"Content-Type: text/html; charset=utf-8", "Content-Transfer-Encoding: quoted-printable", "&lt;b&gt;12:30&lt;/b&gt;",
+		"<blockquote",
+	} {
+		if !strings.Contains(strings.ReplaceAll(p.Untrusted.Message, "=\n", ""), want) {
+			t.Errorf("preview message lacks %q:\n%s", want, p.Untrusted.Message)
+		}
+	}
+
+	ok[draftOutT](t, cs, "create_draft", createArgs(p))
+	_, raws := e.draftsOnServer("[Gmail]/Drafts")
+	if len(raws) != 1 {
+		t.Fatalf("%d messages in Drafts", len(raws))
+	}
+	if p.SizeBytes != len(raws[0]) {
+		t.Errorf("size_bytes %d, saved message is %d bytes", p.SizeBytes, len(raws[0]))
+	}
+	if !sameMessage(raws[0], p.Untrusted.Message) {
+		t.Errorf("saved message differs from the preview:\n%s\n---\n%s", raws[0], p.Untrusted.Message)
+	}
+	msg, err := mail.ReadMessage(strings.NewReader(raws[0]))
+	if err != nil {
+		t.Fatal(err)
+	}
+	mt, params, err := mime.ParseMediaType(msg.Header.Get("Content-Type"))
+	if err != nil || mt != "multipart/alternative" {
+		t.Fatalf("content type %q, %v", mt, err)
+	}
+	mr := multipart.NewReader(msg.Body, params["boundary"])
+	var types []string
+	for {
+		part, err := mr.NextPart()
+		if err != nil {
+			break
+		}
+		types = append(types, part.Header.Get("Content-Type"))
+	}
+	if len(types) != 2 || !strings.HasPrefix(types[0], "text/plain") || !strings.HasPrefix(types[1], "text/html") {
+		t.Errorf("parts = %v", types)
+	}
 }
