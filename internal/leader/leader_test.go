@@ -281,18 +281,9 @@ func TestLosingTheLeaseCancelsJobsAndRecampaigns(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	var calls atomic.Int32
-	firstCancelled := make(chan struct{})
-	d := start(t, ctx, log, cfg(c, "a"), func(jc context.Context) {
-		n := calls.Add(1)
-		<-jc.Done()
-		if n == 1 {
-			close(firstCancelled)
-		}
-	})
-	eventually(t, 5*time.Second, "a to lead", func() bool { return calls.Load() == 1 })
-
-	// Another holder takes the Lease over. The fake client does not enforce
+	// Installed before the elector runs: the fake client's reaction chain is
+	// not safe to change while it is in use. Gated by the flag below.
+	// The fake client does not enforce
 	// resourceVersion, so model the apiserver's conflict: a's updates are
 	// refused while "other" holds the Lease.
 	var stolen atomic.Bool
@@ -306,6 +297,18 @@ func TestLosingTheLeaseCancelsJobsAndRecampaigns(t *testing.T) {
 		}
 		return false, nil, nil
 	})
+	var calls atomic.Int32
+	firstCancelled := make(chan struct{})
+	d := start(t, ctx, log, cfg(c, "a"), func(jc context.Context) {
+		n := calls.Add(1)
+		<-jc.Done()
+		if n == 1 {
+			close(firstCancelled)
+		}
+	})
+	eventually(t, 5*time.Second, "a to lead", func() bool { return calls.Load() == 1 })
+
+	// Another holder takes the Lease over.
 	l, err := c.CoordinationV1().Leases("ns").Get(ctx, "lease", metav1.GetOptions{})
 	if err != nil {
 		t.Fatal(err)
