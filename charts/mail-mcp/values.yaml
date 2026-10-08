@@ -62,6 +62,12 @@ cache:
 history:
   existingClaim: ""
 
+# Deploys roll with overlap (RollingUpdate, maxSurge 1) when history.existingClaim
+# is set; without it the chart uses Recreate. Set forceRecreate: true for the one
+# release that bumps the cache schemaVersion (internal/cache/cache.go): the new
+# pod drops the index tables the old pod is still using.
+forceRecreate: false
+
 # How apply_intent is approved.
 #   client:      the client's own tool-approval prompt (capped at 50 messages
 #                per apply); the server never elicits.

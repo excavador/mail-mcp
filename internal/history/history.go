@@ -10,6 +10,7 @@ package history
 
 import (
 	"bufio"
+	"bytes"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -19,6 +20,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"sync"
 	"time"
@@ -131,10 +133,20 @@ type Record struct {
 }
 
 // Store is the history file plus an in-memory copy of its records.
+//
+// Two processes may share the file (a rolling update overlaps two pods on one
+// node). Appends are single O_APPEND writes, so lines never interleave, and
+// every read first folds in the lines the other process appended since
+// (catchUp): neither sees a stale copy, and undo finds a record the other
+// pod wrote.
 type Store struct {
 	mu   sync.Mutex
 	f    *os.File
 	recs []Record
+	off  int64 // bytes of the file already folded into recs
+	// pending are ids of records written but kept in memory because reading
+	// them back failed; catchUp skips them when it finds them in the file.
+	pending []string
 }
 
 // Open creates dir (0700) and the file (0600) if needed, loads every record
@@ -159,26 +171,72 @@ func Open(dir string) (*Store, error) {
 		return nil, fmt.Errorf("history: restrict file: %w", err)
 	}
 	s := &Store{f: f}
-	s.recs = load(f)
+	st, err := f.Stat()
+	if err != nil {
+		_ = f.Close()
+		return nil, fmt.Errorf("history: stat: %w", err)
+	}
+	// Fold in only through the last complete line: a trailing fragment is
+	// either a crash leftover (repaired below) or, in principle, another
+	// process mid-append, which catchUp picks up once its newline lands.
+	head := make([]byte, st.Size())
+	n, err := f.ReadAt(head, 0)
+	if err != nil && !errors.Is(err, io.EOF) {
+		_ = f.Close()
+		return nil, fmt.Errorf("history: read: %w", err)
+	}
+	head = head[:n]
+	end := bytes.LastIndexByte(head, '\n') + 1
+	s.recs = load(bytes.NewReader(head[:end]))
+	s.off = int64(end)
 	// A crash mid-write can leave a last line without its newline; the next
-	// append would glue a record onto it and lose both. Start a fresh line.
-	if st, err := f.Stat(); err == nil && st.Size() > 0 {
-		var last [1]byte
-		if _, err := f.ReadAt(last[:], st.Size()-1); err == nil && last[0] != '\n' {
-			if _, err := f.Write([]byte{'\n'}); err != nil {
-				_ = f.Close()
-				return nil, fmt.Errorf("history: repair line end: %w", err)
-			}
+	// append would glue a record onto it and lose both. Appends are single
+	// atomic O_APPEND writes, so a live peer never leaves a fragment: a file
+	// that still ends without a newline here is a crash leftover. End it, and
+	// fold it in as the (probably corrupt) line it is.
+	if end < len(head) {
+		if _, err := f.Write([]byte{'\n'}); err != nil {
+			_ = f.Close()
+			return nil, fmt.Errorf("history: repair line end: %w", err)
 		}
 	}
 	return s, nil
 }
 
+// catchUp folds into recs the complete lines appended to the file since the
+// last call -- by this process or by another one sharing the file. A trailing
+// line without its newline is left for the next call. s.mu must be held.
+func (s *Store) catchUp() {
+	st, err := s.f.Stat()
+	if err != nil || st.Size() <= s.off {
+		return
+	}
+	buf := make([]byte, st.Size()-s.off)
+	n, err := s.f.ReadAt(buf, s.off)
+	buf = buf[:n]
+	if err != nil && !errors.Is(err, io.EOF) {
+		slog.Warn("history: reading appended records", "error", err.Error())
+		return
+	}
+	end := bytes.LastIndexByte(buf, '\n')
+	if end < 0 {
+		return
+	}
+	for _, r := range load(bytes.NewReader(buf[:end+1])) {
+		if i := slices.Index(s.pending, r.ID); i >= 0 {
+			s.pending = slices.Delete(s.pending, i, i+1)
+			continue
+		}
+		s.recs = append(s.recs, r)
+	}
+	s.off += int64(end + 1)
+}
+
 // load parses the file from the start, skipping and logging lines that are
 // too long or not a record.
-func load(f *os.File) []Record {
+func load(src io.Reader) []Record {
 	var out []Record
-	r := bufio.NewReaderSize(io.NewSectionReader(f, 0, 1<<62), 64<<10)
+	r := bufio.NewReaderSize(src, 64<<10)
 	for n := 1; ; n++ {
 		line, tooLong, err := readLine(r)
 		if len(line) > 0 || tooLong {
@@ -257,7 +315,18 @@ func (s *Store) Append(r Record) (Record, error) {
 	if err := s.f.Sync(); err != nil {
 		return r, fmt.Errorf("history: sync: %w", err)
 	}
-	s.recs = append(s.recs, r)
+	// Fold in what the other process appended before this record, then this
+	// one, so both processes hold the file's order.
+	before := len(s.recs)
+	s.catchUp()
+	if !slices.ContainsFunc(s.recs[before:], func(x Record) bool { return x.ID == r.ID }) {
+		// The write succeeded but reading it back did not (stat or read
+		// failed): keep it in memory so this process still sees it. The
+		// next catchUp skips it when it finds it in the file.
+		slog.Warn("history: record written but not read back; kept in memory", "id", r.ID)
+		s.recs = append(s.recs, r)
+		s.pending = append(s.pending, r.ID)
+	}
 	return r, nil
 }
 
@@ -370,6 +439,7 @@ func merged(parts []Record) Record {
 func (s *Store) Get(id string) (Record, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.catchUp()
 	return s.get(id)
 }
 
@@ -401,6 +471,7 @@ func (s *Store) get(id string) (Record, bool) {
 func (s *Store) Undone(id string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.catchUp()
 	rec, ok := s.get(id)
 	if ok {
 		id = rec.ID
@@ -418,6 +489,7 @@ func (s *Store) Undone(id string) bool {
 func (s *Store) TargetHistory(account, target string) (applied bool, created time.Time) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.catchUp()
 	for _, r := range s.recs {
 		if r.Account != account {
 			continue
@@ -437,6 +509,7 @@ func (s *Store) TargetHistory(account, target string) (applied bool, created tim
 func (s *Store) List(account string, limit int) []Record {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.catchUp()
 	var out []Record
 	for i := len(s.recs) - 1; i >= 0 && len(out) < limit; i-- {
 		if account == "" || s.recs[i].Account == account {
@@ -452,6 +525,7 @@ func (s *Store) List(account string, limit int) []Record {
 func (s *Store) Grouped(account string, limit int) []Record {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.catchUp()
 	var out []Record
 	seen := map[string]bool{}
 	for i := len(s.recs) - 1; i >= 0 && len(out) < limit; i-- {

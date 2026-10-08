@@ -21,7 +21,7 @@
       "type": "integer",
       "minimum": 0,
       "maximum": 1,
-      "description": "Fixed at 1: cache is a node-local SQLite database and history is an RWO PVC. Multiple replicas would cause multi-attach errors and concurrent writes."
+      "description": "At most 1 steady-state replica: the cache is a node-local SQLite database and history an RWO PVC. A rolling update briefly runs a second pod (maxSurge 1) on the same node; a Lease keeps the background jobs on one of them."
     },
     "image": {
       "type": "object",
@@ -131,6 +131,10 @@
           "minLength": 1
         }
       }
+    },
+    "forceRecreate": {
+      "type": "boolean",
+      "description": "Use the Recreate strategy even when history.existingClaim is set. Needed for a release that bumps the cache schemaVersion."
     },
     "history": {
       "type": "object",

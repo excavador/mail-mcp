@@ -1,0 +1,35 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "mail-mcp.fullname" . }}
+  labels: {{- include "mail-mcp.labels" . | nindent 4 }}
+automountServiceAccountToken: false
+---
+# The leader-election Lease and nothing else. create has no resourceNames
+# (the object does not exist yet); the rest are limited to the one Lease.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "mail-mcp.fullname" . }}-leader
+  labels: {{- include "mail-mcp.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [coordination.k8s.io]
+    resources: [leases]
+    verbs: [create]
+  - apiGroups: [coordination.k8s.io]
+    resources: [leases]
+    resourceNames: [{{ include "mail-mcp.fullname" . }}]
+    verbs: [get, update, patch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "mail-mcp.fullname" . }}-leader
+  labels: {{- include "mail-mcp.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "mail-mcp.fullname" . }}-leader
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "mail-mcp.fullname" . }}

@@ -32,6 +32,7 @@ import (
 	"github.com/excavador/mail-mcp/internal/accounts"
 	"github.com/excavador/mail-mcp/internal/cache"
 	"github.com/excavador/mail-mcp/internal/history"
+	"github.com/excavador/mail-mcp/internal/leader"
 	"github.com/excavador/mail-mcp/internal/memlimit"
 	"github.com/excavador/mail-mcp/internal/organise"
 	"github.com/excavador/mail-mcp/internal/pdfclient"
@@ -40,6 +41,10 @@ import (
 
 // version is overridden at build time.
 var version = "dev"
+
+// shutdownTimeout bounds how long in-flight requests get after SIGTERM; keep
+// it below the pod's terminationGracePeriodSeconds.
+const shutdownTimeout = 20 * time.Second
 
 func main() {
 	// Everything this process creates (the cache, its SQLite WAL and shm
@@ -172,6 +177,26 @@ func main() {
 				Value:   15 * time.Minute,
 				Sources: cli.EnvVars("REFRESH_INTERVAL"),
 			},
+			&cli.StringFlag{
+				Name: "leader-election",
+				// Only the holder of a Kubernetes Lease runs the background
+				// writers (refresh, backfills, retention), so a RollingUpdate
+				// can overlap two pods. Every pod serves requests.
+				Usage:   "auto (on when running in a cluster), true or false (always the leader, for local runs)",
+				Value:   "auto",
+				Sources: cli.EnvVars("LEADER_ELECTION"),
+			},
+			&cli.StringFlag{
+				Name:    "lease-name",
+				Usage:   "name of the coordination.k8s.io Lease that elects the pod running the background jobs",
+				Value:   "mail-mcp",
+				Sources: cli.EnvVars("LEASE_NAME"),
+			},
+			&cli.StringFlag{
+				Name:    "lease-namespace",
+				Usage:   "namespace of the Lease (default: the pod's own namespace; set POD_NAMESPACE from the downward API)",
+				Sources: cli.EnvVars("POD_NAMESPACE"),
+			},
 		},
 		Action: run,
 	}
@@ -205,6 +230,17 @@ func run(ctx context.Context, cmd *cli.Command) error {
 	}
 	log.Info("accounts loaded", "accounts", names, "version", version)
 
+	// Validated before anything is opened or served: a bad mode or an unknown
+	// namespace is a startup error, not a healthy pod that never runs jobs.
+	elector, err := leader.New(leader.Config{
+		Mode:      cmd.String("leader-election"),
+		Name:      cmd.String("lease-name"),
+		Namespace: cmd.String("lease-namespace"),
+	})
+	if err != nil {
+		return err
+	}
+
 	store, err := cache.Open(cmd.String("cache-dir"))
 	if err != nil {
 		return err
@@ -218,12 +254,6 @@ func run(ctx context.Context, cmd *cli.Command) error {
 		}
 	}
 	store.SetOwners(owners)
-	// A changed username/alias set restarts the owner-derived recount; the
-	// work itself runs in the background (RunBackfills), not here.
-	if err := store.ReconcileOwners(log); err != nil {
-		_ = store.Close()
-		return err
-	}
 	hist, err := history.Open(cmd.String("history-dir"))
 	if err != nil {
 		_ = store.Close()
@@ -243,35 +273,62 @@ func run(ctx context.Context, cmd *cli.Command) error {
 		store.SetPDFExtractor(pdfclient.New(sock))
 		log.Info("pdf text", "extractor_socket", sock)
 	}
-	// Refreshers stop, and are waited for, before the cache closes under them.
-	ctx, cancel := context.WithCancel(ctx)
+	// The background jobs run only while this pod holds the Lease. They stop,
+	// and are waited for, before the cache closes under them. Their context is
+	// not the request context: it ends after the HTTP server has drained, so
+	// the Lease is released last and a successor takes over from a quiet pod.
+	jobsCtx, cancelJobs := context.WithCancel(context.WithoutCancel(ctx))
 	var wg sync.WaitGroup
 	defer func() {
-		cancel()
+		cancelJobs()
 		wg.Wait()
 		_ = store.Close()
 		_ = hist.Close()
 	}()
-	// Background backfills, one goroutine, one after the other: the fts2
-	// index (search depends on it) from the blobs on disk, then threading.
-	// Both are resumable, use short write transactions and give way to
-	// refresh; they never touch IMAP and stop with ctx.
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		store.RunBackfills(ctx, log)
-	}()
-	for _, a := range accts {
-		wg.Add(1)
+	jobs := func(jctx context.Context) {
+		// Owner-derived recount: it resets counters and writes markers, so
+		// the leader does it, once per leadership, before the backfills.
+		// A changed username/alias set restarts the recount; the work itself
+		// runs in RunBackfills.
+		recountOK := true
+		if err := store.ReconcileOwners(log); err != nil {
+			log.Error("owner reconcile failed; the backfills are skipped until the next leadership", "error", err.Error())
+			recountOK = false
+		}
+		var jw sync.WaitGroup
+		defer jw.Wait()
+		// Background backfills, one goroutine, one after the other: the fts2
+		// index (search depends on it) from the blobs on disk, then threading,
+		// senders, entities and PDF text. All are resumable, use short write
+		// transactions and give way to refresh; they never touch IMAP and stop
+		// with the context.
+		if recountOK {
+			jw.Add(1)
+			go func() {
+				defer jw.Done()
+				store.RunBackfills(jctx, log)
+			}()
+		}
+		for _, a := range accts {
+			jw.Add(1)
+			go func() {
+				defer jw.Done()
+				store.Run(jctx, log, a, cmd.Duration("refresh-interval"))
+			}()
+		}
+		jw.Add(1)
 		go func() {
-			defer wg.Done()
-			store.Run(ctx, log, a, cmd.Duration("refresh-interval"))
+			defer jw.Done()
+			store.RunSearchLogRetention(jctx, log)
 		}()
+		<-jctx.Done()
 	}
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		store.RunSearchLogRetention(ctx, log)
+		if err := elector.Run(jobsCtx, log, jobs); err != nil {
+			log.Error("leader election failed; no background jobs run in this pod", "error", err.Error())
+		}
 	}()
 	log.Info("approval", "mode", string(approval), "max_unelicited_apply", cmd.Int("max-unelicited-apply"), "max_unelicited_label", cmd.Int("max-unelicited-label"))
 	log.Info("history", "dir", cmd.String("history-dir"))
@@ -319,7 +376,8 @@ func run(ctx context.Context, cmd *cli.Command) error {
 		log.Info("endpoint", "path", ep.path, "mode", ep.mode.String(), "resource", ep.url, "metadata", auth.Path())
 	}
 
-	// Liveness only, and deliberately does NOT touch any mailbox: a probe that
+	// Liveness and readiness, independent of leadership: a new pod is Ready
+	// while the old one still leads. Deliberately does NOT touch any mailbox: a probe that
 	// fails when Gmail blips takes the pod out of service for something a
 	// restart cannot fix. Unauthenticated on purpose -- a probe carries no token.
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
@@ -330,16 +388,26 @@ func run(ctx context.Context, cmd *cli.Command) error {
 	addr := cmd.String("addr")
 	srv := &http.Server{Addr: addr, Handler: mux, ReadHeaderTimeout: 10 * time.Second}
 
+	// On SIGTERM: stop accepting, let in-flight requests finish (bounded),
+	// and only then return, so the deferred cancel of the jobs (which
+	// releases the Lease) and the closing of the cache come after the last
+	// request.
+	drained := make(chan struct{})
 	go func() {
+		defer close(drained)
 		<-ctx.Done()
-		shutdown, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		shutdown, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 		defer cancel()
-		_ = srv.Shutdown(shutdown)
+		if err := srv.Shutdown(shutdown); err != nil {
+			log.Warn("http shutdown timed out; closing remaining connections", "error", err.Error())
+			_ = srv.Close()
+		}
 	}()
 
 	log.Info("serving mcp over http", "addr", addr)
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		return err
 	}
+	<-drained
 	return nil
 }
