@@ -151,7 +151,7 @@ Both are on the admin endpoint only. A draft cannot be undone from mail-mcp, whi
 
 **Safety switch.** `drafts: false` on an account turns both tools off for it.
 
-**Shape of the message.** `Date`, `From`, `To`, `Cc`, `Bcc`, `Subject` (RFC 2047 when not ASCII), a generated `Message-ID` at the sender's domain, `In-Reply-To`/`References`, `MIME-Version: 1.0`, `Content-Type: text/plain; charset=utf-8`, `Content-Transfer-Encoding: quoted-printable`, CRLF line ends. CR, LF and NUL in any header value are refused, addresses must parse (`net/mail`) and be plain ASCII, and a draft has at most 50 recipients.
+**Shape of the message.** `Date`, `From`, `To`, `Cc`, `Bcc`, `Subject` (RFC 2047 when not ASCII), a generated `Message-ID` at the sender's domain, `In-Reply-To`/`References`, `MIME-Version: 1.0`, `Content-Type: multipart/alternative` with two quoted-printable UTF-8 parts, CRLF line ends: `text/plain` (the body and the `> ` quote) and a `text/html` rendering of the same text (paragraphs, `<br>`, lists, one `<blockquote>`; everything escaped, no scripts, styles or external resources). The HTML part exists because Gmail opens a plain-text-only draft in plain-text mode and hard-wraps every line at about 70 characters when it is sent. CR, LF and NUL in any header value are refused, addresses must parse (`net/mail`) and be plain ASCII, and a draft has at most 50 recipients.
 
 ### Approval mode
 
