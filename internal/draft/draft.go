@@ -307,8 +307,32 @@ func threadHeaders(o *Original) (inReplyTo string, refs []string) {
 	return id, refs
 }
 
-// quote renders the attribution line and the "> " quoted text of the original.
-func quote(o *Original) string {
+// quoted is the original of a reply, ready to be rendered as plain text or HTML.
+type quoted struct {
+	Attribution string   // "On <date>, <who> wrote:"
+	Lines       []string // the original's text, one entry per line, controls stripped
+	Cut         bool     // the original was longer than MaxQuoteBytes
+}
+
+// plain renders the attribution line and the "> " quoted text.
+func (q quoted) plain() string {
+	var b strings.Builder
+	b.WriteString(q.Attribution + "\n")
+	for _, ln := range q.Lines {
+		if ln == "" {
+			b.WriteString(">\n")
+		} else {
+			b.WriteString("> " + ln + "\n")
+		}
+	}
+	if q.Cut {
+		b.WriteString("> [quote truncated]\n")
+	}
+	return b.String()
+}
+
+// quoteParts extracts the attribution line and the text of the original.
+func quoteParts(o *Original) quoted {
 	who := ""
 	if len(o.From) > 0 {
 		x := o.From[0]
@@ -328,24 +352,14 @@ func quote(o *Original) string {
 	}
 	body := strings.ToValidUTF8(o.Body, "")
 	body = strings.ReplaceAll(strings.ReplaceAll(body, "\r\n", "\n"), "\r", "\n")
-	cut := false
+	q := quoted{Attribution: when + who + " wrote:"}
 	if len(body) > MaxQuoteBytes {
-		body, cut = strings.ToValidUTF8(body[:MaxQuoteBytes], ""), true
+		body, q.Cut = strings.ToValidUTF8(body[:MaxQuoteBytes], ""), true
 	}
-	var b strings.Builder
-	b.WriteString(when + who + " wrote:\n")
 	for _, ln := range strings.Split(strings.TrimRight(body, "\n"), "\n") {
-		ln = stripControls(ln)
-		if ln == "" {
-			b.WriteString(">\n")
-		} else {
-			b.WriteString("> " + ln + "\n")
-		}
+		q.Lines = append(q.Lines, stripControls(ln))
 	}
-	if cut {
-		b.WriteString("> [quote truncated]\n")
-	}
-	return b.String()
+	return q
 }
 
 func stripControls(s string) string {
@@ -498,8 +512,11 @@ func Compose(in Input) (*Message, error) {
 
 	// Body with quote.
 	text := in.Body
+	var q *quoted
 	if in.Original != nil && in.QuoteOriginal && strings.TrimSpace(in.Original.Body) != "" {
-		text = strings.TrimRight(text, "\r\n") + "\n\n" + quote(in.Original)
+		qq := quoteParts(in.Original)
+		q = &qq
+		text = strings.TrimRight(text, "\r\n") + "\n\n" + qq.plain()
 	}
 
 	// Message-ID.
@@ -509,6 +526,10 @@ func Compose(in Input) (*Message, error) {
 	}
 	domain := from.Address[strings.LastIndexByte(from.Address, '@')+1:]
 	msgID := "<" + hex.EncodeToString(rb[:]) + "@" + strings.ToLower(domain) + ">"
+
+	// The boundary starts with "=", which quoted-printable always encodes, so
+	// it cannot occur inside either part.
+	boundary := "=_mailmcp_" + hex.EncodeToString(rb[:])
 
 	m := &Message{
 		FromAddr: from.Address, From: formatAddr(from), Subject: subject, MessageID: msgID, Body: text,
@@ -559,8 +580,7 @@ func Compose(in Input) (*Message, error) {
 	}
 	steps = append(steps,
 		struct{ n, v string }{"MIME-Version", "1.0"},
-		struct{ n, v string }{"Content-Type", "text/plain; charset=utf-8"},
-		struct{ n, v string }{"Content-Transfer-Encoding", "quoted-printable"})
+		struct{ n, v string }{"Content-Type", `multipart/alternative; boundary="` + boundary + `"`})
 	for _, s := range steps {
 		if err := hdr(s.n, s.v); err != nil {
 			return nil, err
@@ -572,20 +592,38 @@ func Compose(in Input) (*Message, error) {
 		}
 	}
 	b.WriteString("\r\n")
+	plainQP, err := encodeQP(text)
+	if err != nil {
+		return nil, err
+	}
+	htmlQP, err := encodeQP(renderHTML(in.Body, q))
+	if err != nil {
+		return nil, err
+	}
+	for _, part := range []struct{ typ, body string }{{"text/plain", plainQP}, {"text/html", htmlQP}} {
+		b.WriteString("--" + boundary + "\r\nContent-Type: " + part.typ + "; charset=utf-8\r\n" +
+			"Content-Transfer-Encoding: quoted-printable\r\n\r\n" + part.body)
+	}
+	b.WriteString("--" + boundary + "--\r\n")
+	m.Raw = []byte(b.String())
+	return m, nil
+}
+
+// encodeQP quoted-printable-encodes text (CRLF line ends, ending in one).
+func encodeQP(text string) (string, error) {
 	var qp strings.Builder
 	w := quotedprintable.NewWriter(&qp)
 	if _, err := w.Write([]byte(normalizeNewlines(text))); err != nil {
-		return nil, err
+		return "", err
 	}
 	if err := w.Close(); err != nil {
-		return nil, err
+		return "", err
 	}
-	b.WriteString(qp.String())
-	if !strings.HasSuffix(qp.String(), "\r\n") {
-		b.WriteString("\r\n")
+	out := qp.String()
+	if !strings.HasSuffix(out, "\r\n") {
+		out += "\r\n"
 	}
-	m.Raw = []byte(b.String())
-	return m, nil
+	return out, nil
 }
 
 // normalizeNewlines makes every line break "\n" and ends the text with one;
@@ -656,3 +694,6 @@ func foldHeader(name, value string) string {
 	b.WriteString(line + "\r\n")
 	return b.String()
 }
+
+// quote renders the attribution line and the "> " quoted text of the original.
+func quote(o *Original) string { return quoteParts(o).plain() }

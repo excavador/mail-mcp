@@ -2,7 +2,12 @@ package draft
 
 import (
 	"bytes"
+	"io"
+	"mime"
+	"mime/multipart"
+	"mime/quotedprintable"
 	"net/mail"
+	"net/textproto"
 	"os"
 	"strings"
 	"testing"
@@ -69,19 +74,94 @@ func refused(t *testing.T, in Input, want string) {
 
 func crlf(s string) string { return strings.ReplaceAll(s, "\n", "\r\n") }
 
+// parsed is a draft split into its headers and its two decoded parts.
+type parsed struct {
+	msg        *mail.Message
+	boundary   string
+	plain, htm string   // decoded, "\n" line ends
+	rawParts   []string // as sent (still quoted-printable)
+	partHdrs   []textproto.MIMEHeader
+}
+
+// parse reads Raw with net/mail and mime/multipart and insists on the shape:
+// multipart/alternative with exactly text/plain then text/html, both utf-8 and
+// quoted-printable.
+func parse(t *testing.T, raw []byte) parsed {
+	t.Helper()
+	msg, err := mail.ReadMessage(bytes.NewReader(raw))
+	if err != nil {
+		t.Fatalf("ReadMessage: %v", err)
+	}
+	mt, params, err := mime.ParseMediaType(msg.Header.Get("Content-Type"))
+	if err != nil || mt != "multipart/alternative" || params["boundary"] == "" {
+		t.Fatalf("Content-Type = %q (%v), want multipart/alternative with a boundary", msg.Header.Get("Content-Type"), err)
+	}
+	p := parsed{msg: msg, boundary: params["boundary"]}
+	mr := multipart.NewReader(msg.Body, p.boundary)
+	for {
+		part, err := mr.NextRawPart()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatalf("NextRawPart: %v", err)
+		}
+		body, err := io.ReadAll(part)
+		if err != nil {
+			t.Fatal(err)
+		}
+		p.rawParts = append(p.rawParts, string(body))
+		p.partHdrs = append(p.partHdrs, part.Header)
+		dec, err := io.ReadAll(quotedprintable.NewReader(bytes.NewReader(body)))
+		if err != nil {
+			t.Fatalf("part %d is not quoted-printable: %v", len(p.rawParts), err)
+		}
+		text := strings.ReplaceAll(string(dec), "\r\n", "\n") + "\n" // the CRLF before the delimiter belongs to it
+		if len(p.rawParts) == 1 {
+			p.plain = text
+		} else {
+			p.htm = text
+		}
+	}
+	if len(p.rawParts) != 2 {
+		t.Fatalf("%d parts, want 2", len(p.rawParts))
+	}
+	for i, want := range []string{"text/plain", "text/html"} {
+		ct, cp, err := mime.ParseMediaType(p.partHdrs[i].Get("Content-Type"))
+		if err != nil || ct != want || !strings.EqualFold(cp["charset"], "utf-8") {
+			t.Errorf("part %d Content-Type = %q, want %s; charset=utf-8", i, p.partHdrs[i].Get("Content-Type"), want)
+		}
+		if got := p.partHdrs[i].Get("Content-Transfer-Encoding"); !strings.EqualFold(got, "quoted-printable") {
+			t.Errorf("part %d Content-Transfer-Encoding = %q", i, got)
+		}
+	}
+	return p
+}
+
 func TestGoldenNewMessageASCII(t *testing.T) {
 	m := compose(t, Input{To: []string{"Bob <bob@x.test>"}, Subject: "Hello", Body: "Hi Bob,\nsee you.\n"})
+	boundary := "=_mailmcp_000102030405060708090a0b"
 	want := crlf(`Date: Wed, 07 Oct 2026 09:30:00 +0000
 From: <me@example.com>
 To: "Bob" <bob@x.test>
 Subject: Hello
 Message-ID: <000102030405060708090a0b@example.com>
 MIME-Version: 1.0
+Content-Type: multipart/alternative;
+ boundary="` + boundary + `"
+
+--` + boundary + `
 Content-Type: text/plain; charset=utf-8
 Content-Transfer-Encoding: quoted-printable
 
 Hi Bob,
 see you.
+--` + boundary + `
+Content-Type: text/html; charset=utf-8
+Content-Transfer-Encoding: quoted-printable
+
+<html><body><div dir=3D"ltr"><p>Hi Bob,<br>see you.</p></div></body></html>
+--` + boundary + `--
 `)
 	if string(m.Raw) != want {
 		t.Errorf("raw message:\n%q\nwant:\n%q", m.Raw, want)
@@ -89,32 +169,51 @@ see you.
 	if m.InReplyTo != "" || strings.Contains(string(m.Raw), "References") {
 		t.Error("a new message carries threading headers")
 	}
+	p := parse(t, m.Raw)
+	if p.plain != "Hi Bob,\nsee you.\n" {
+		t.Errorf("plain = %q", p.plain)
+	}
+	if p.htm != `<html><body><div dir="ltr"><p>Hi Bob,<br>see you.</p></div></body></html>`+"\n" {
+		t.Errorf("html = %q", p.htm)
+	}
 }
 
 func TestGoldenReplyNonASCIIWithQuoteAndThreading(t *testing.T) {
 	a := acct()
 	a.DisplayName = "Oleg Tsarev"
 	m := compose(t, Input{Account: a, Original: orig(), QuoteOriginal: true, Body: "Ja, gern — 12:30?\n"})
-	want := crlf(`Date: Wed, 07 Oct 2026 09:30:00 +0000
-From: "Oleg Tsarev" <me.alias@example.com>
-To: "Alice A" <alice@x.test>
-Subject: Re: Lunch?
-Message-ID: <000102030405060708090a0b@example.com>
-In-Reply-To: <m3@x.test>
-References: <m1@x.test> <m2@x.test> <m3@x.test>
-MIME-Version: 1.0
-Content-Type: text/plain; charset=utf-8
-Content-Transfer-Encoding: quoted-printable
-
-Ja, gern =E2=80=94 12:30?
+	p := parse(t, m.Raw)
+	for k, want := range map[string]string{
+		"Date": "Wed, 07 Oct 2026 09:30:00 +0000", "From": `"Oleg Tsarev" <me.alias@example.com>`,
+		"To": `"Alice A" <alice@x.test>`, "Subject": "Re: Lunch?",
+		"Message-Id": "<000102030405060708090a0b@example.com>", "In-Reply-To": "<m3@x.test>",
+		"References": "<m1@x.test> <m2@x.test> <m3@x.test>", "Mime-Version": "1.0",
+	} {
+		if got := p.msg.Header.Get(k); got != want {
+			t.Errorf("%s = %q, want %q", k, got, want)
+		}
+	}
+	wantPlain := `Ja, gern — 12:30?
 
 On 2026-03-04 05:06 UTC, Alice A <alice@x.test> wrote:
 > Shall we?
 >
 > Yes.
-`)
-	if string(m.Raw) != want {
-		t.Errorf("raw message:\n%s\nwant:\n%s", m.Raw, want)
+`
+	if p.plain != wantPlain {
+		t.Errorf("plain:\n%s\nwant:\n%s", p.plain, wantPlain)
+	}
+	wantHTML := `<html><body><div dir="ltr"><p>Ja, gern — 12:30?</p>` +
+		`<div>On 2026-03-04 05:06 UTC, Alice A &lt;alice@x.test&gt; wrote:</div>` +
+		`<blockquote style="` + quoteStyle + `">Shall we?<br><br>Yes.</blockquote></div></body></html>` + "\n"
+	if p.htm != wantHTML {
+		t.Errorf("html:\n%s\nwant:\n%s", p.htm, wantHTML)
+	}
+	// Non-ASCII is quoted-printable in both parts as sent.
+	for i, r := range p.rawParts {
+		if !strings.Contains(r, "=E2=80=94") {
+			t.Errorf("part %d lacks the encoded em dash:\n%s", i, r)
+		}
 	}
 	if m.FromAddr != "me.alias@example.com" || m.InReplyTo != "<m3@x.test>" {
 		t.Errorf("FromAddr %q, InReplyTo %q", m.FromAddr, m.InReplyTo)
