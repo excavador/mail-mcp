@@ -180,3 +180,62 @@ func TestOpenRepairsCrashTruncatedLastLine(t *testing.T) {
 		t.Fatalf("%d lines, want 3: %q", len(ls), ls)
 	}
 }
+
+func TestOpenFoldsInOnlyCompleteLinesThenRepairsTheFragment(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "history.jsonl")
+	first := goodLine("r1") + "\n"
+	frag := goodLine("r2")
+	frag = frag[:len(frag)-5]
+	if err := os.WriteFile(path, []byte(first+frag), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s := open(t, dir)
+	s.mu.Lock()
+	off := s.off
+	s.mu.Unlock()
+	if off != int64(len(first)) {
+		t.Fatalf("off = %d, want %d (just past the last newline)", off, len(first))
+	}
+	if got := idsOf(s.List("", 10)); fmt.Sprint(got) != "[r1]" {
+		t.Fatalf("got %v, want [r1]", got)
+	}
+	// Open ended the fragment's line; a later complete record is read once.
+	if _, err := s.Append(Record{ID: "r3", Account: "a", Kind: "apply"}); err != nil {
+		t.Fatal(err)
+	}
+	if got := idsOf(s.List("", 10)); fmt.Sprint(got) != "[r3 r1]" {
+		t.Fatalf("got %v, want [r3 r1]", got)
+	}
+}
+
+func TestAppendKeepsItsRecordWhenReadBackFails(t *testing.T) {
+	dir := t.TempDir()
+	s := open(t, dir)
+	if _, err := s.Append(Record{ID: "r1", Account: "a", Kind: "apply"}); err != nil {
+		t.Fatal(err)
+	}
+	// Make catchUp see nothing new: the offset is past the end of the file.
+	s.mu.Lock()
+	realOff := s.off
+	s.off += 1 << 20
+	s.mu.Unlock()
+
+	if _, err := s.Append(Record{ID: "r2", Account: "a", Kind: "apply"}); err != nil {
+		t.Fatal(err)
+	}
+	if got := idsOf(s.List("", 10)); fmt.Sprint(got) != "[r2 r1]" {
+		t.Fatalf("record lost in memory: %v", got)
+	}
+	// Reading resumes: r2 is found in the file and must not appear twice.
+	s.mu.Lock()
+	s.off = realOff
+	s.mu.Unlock()
+	if got := idsOf(s.List("", 10)); fmt.Sprint(got) != "[r2 r1]" {
+		t.Fatalf("after resuming the read: %v, want [r2 r1] (no duplicate)", got)
+	}
+	// Another store sees exactly the file.
+	if got := idsOf(open(t, dir).List("", 10)); fmt.Sprint(got) != "[r2 r1]" {
+		t.Fatalf("second store: %v", got)
+	}
+}
