@@ -20,7 +20,7 @@ func evPreview(account string) *EventPreview {
 	}
 }
 
-func TestEventIDIsDerivedFromTheNonce(t *testing.T) {
+func TestEventIDIsDerivedFromTheContent(t *testing.T) {
 	o := newOrg(t)
 	p, err := o.IssueEvent(evPreview("acct"))
 	if err != nil {
@@ -28,15 +28,20 @@ func TestEventIDIsDerivedFromTheNonce(t *testing.T) {
 	}
 	id := p.EventID()
 	// Google event ids: 5-1024 characters of a-v and 0-9.
-	if !regexp.MustCompile(`^mm[0-9a-f]{32}$`).MatchString(id) {
-		t.Fatalf("event id %q is not mm + 32 lowercase hex", id)
+	if !regexp.MustCompile(`^mm[0-9a-v]{40}$`).MatchString(id) {
+		t.Fatalf("event id %q is not mm + 40 base32hex", id)
 	}
 	if p.EventID() != id {
 		t.Error("EventID is not stable for one preview")
 	}
 	q, _ := o.IssueEvent(evPreview("acct"))
-	if q.EventID() == id || q.Token == p.Token {
-		t.Errorf("two previews share an id/token: %s %s", id, q.EventID())
+	if q.EventID() != id || q.Token == p.Token {
+		t.Errorf("same content must give the same id and different tokens: %s %s", id, q.EventID())
+	}
+	r := evPreview("acct")
+	r.Title = "Other"
+	if r.EventID() == id {
+		t.Error("different content shares an id")
 	}
 }
 
@@ -230,30 +235,24 @@ func TestOnly32EventPreviewsAreHeldOldestEvicted(t *testing.T) {
 	}
 }
 
-func TestUnelicitedEventsAreCappedPerAccountPerHour(t *testing.T) {
-	if UnelicitedEventsPerHour != 10 {
-		t.Fatalf("UnelicitedEventsPerHour = %d, want 10", UnelicitedEventsPerHour)
-	}
+func TestUnelicitedInviteesAreCappedPerAccountPerRollingHour(t *testing.T) {
 	o := newOrg(t)
-	for i := range UnelicitedEventsPerHour {
-		if !o.TakeUnelicitedEvent("a") {
-			t.Fatalf("event %d refused", i+1)
-		}
+	if !o.TakeUnelicitedInvitees("a", 15) || !o.TakeUnelicitedInvitees("a", 5) {
+		t.Fatal("20 invitees refused")
 	}
-	if o.TakeUnelicitedEvent("a") {
-		t.Error("the 11th event in an hour was allowed")
+	if o.TakeUnelicitedInvitees("a", 1) {
+		t.Error("the 21st invitee in an hour was allowed")
 	}
-	if !o.TakeUnelicitedEvent("b") {
+	if !o.TakeUnelicitedInvitees("b", 20) {
 		t.Error("another account shares the cap")
 	}
-	// Entries older than the window no longer count.
 	o.mu.Lock()
 	old := time.Now().Add(-unelicitedWindow - time.Minute)
 	for i := range o.eventTimes["a"] {
-		o.eventTimes["a"][i] = old
+		o.eventTimes["a"][i].at = old
 	}
 	o.mu.Unlock()
-	if !o.TakeUnelicitedEvent("a") {
+	if !o.TakeUnelicitedInvitees("a", 20) {
 		t.Error("the cap did not expire after the window")
 	}
 }
