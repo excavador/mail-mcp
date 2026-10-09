@@ -82,6 +82,11 @@ type Organiser struct {
 	drafts     map[string]*DraftPreview
 	draftOrder []string
 	draftTimes map[string][]time.Time // account -> times of unelicited drafts
+
+	// events are the previews of preview_event (see event.go).
+	events     map[string]*EventPreview
+	eventOrder []string
+	eventTimes map[string][]inviteTake // account -> invitees of unelicited events
 }
 
 // New returns an Organiser over store with a fresh random signing key.
@@ -359,6 +364,9 @@ func (o *Organiser) questionSlot(token string) *[16]byte {
 		return &p.question
 	}
 	if p, ok := o.drafts[token]; ok {
+		return &p.question
+	}
+	if p, ok := o.events[token]; ok {
 		return &p.question
 	}
 	return nil

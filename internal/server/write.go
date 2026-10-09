@@ -18,6 +18,7 @@ import (
 
 	"github.com/excavador/mail-mcp/internal/accounts"
 	"github.com/excavador/mail-mcp/internal/cache"
+	"github.com/excavador/mail-mcp/internal/calendar"
 	"github.com/excavador/mail-mcp/internal/history"
 	"github.com/excavador/mail-mcp/internal/imapx"
 	"github.com/excavador/mail-mcp/internal/organise"
@@ -37,6 +38,9 @@ type writeDeps struct {
 	maxUnelicitedLabel int
 	// approvalMode decides whether apply_intent may elicit at all.
 	approvalMode ApprovalMode
+	// cal: the Google Calendar clients (event tools exist only for accounts
+	// whose calendar has write: true).
+	cal calendar.Registry
 }
 
 func ptr[T any](v T) *T { return &v }
@@ -62,6 +66,7 @@ func addWriteTools(s *mcp.Server, d writeDeps) {
 	addUntagMessages(s, d)
 	addSaveQuery(s, d)
 	addDraftTools(s, d)
+	addEventTools(s, d)
 }
 
 // --- create_folder ----------------------------------------------------------
@@ -742,6 +747,8 @@ func addUndo(s *mcp.Server, d writeDeps) {
 		switch rec.Kind {
 		case history.KindCreateDraft:
 			return nil, nil, errors.New("a draft cannot be undone from here (mail-mcp deletes nothing): discard it in your mail client")
+		case history.KindCreateEvent:
+			return nil, nil, errors.New("an event cannot be undone from here (there is no calendar delete tool, and the invitations are already sent): cancel it in the calendar")
 		case history.KindSetSenderKind, history.KindTagMessages, history.KindUntagMessages:
 			out, err := undoLocal(ctx, d, rec)
 			return nil, out, err

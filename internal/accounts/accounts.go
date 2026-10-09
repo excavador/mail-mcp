@@ -73,8 +73,82 @@ type Account struct {
 	// Drafts turns draft creation (preview_draft, create_draft) off for the
 	// account when false. Unset: on.
 	Drafts *bool `yaml:"drafts,omitempty"`
+	// Calendar configures the account's calendar (Google Workspace only for
+	// now); nil: the account has no calendar tools.
+	Calendar *Calendar `yaml:"calendar,omitempty"`
 
 	password string
+}
+
+// CalendarProvider names the calendar service behind an account. Only Google
+// is supported; Proton Calendar is not (research pending).
+type CalendarProvider string
+
+const GoogleCalendar CalendarProvider = "google"
+
+// Calendar is the calendar section of an account. Like the mail password,
+// the OAuth client and the refresh token live in files of their own (a
+// mounted Secret), never in the accounts file.
+type Calendar struct {
+	Provider         CalendarProvider `yaml:"provider"`
+	ClientIDFile     string           `yaml:"clientIdFile"`
+	ClientSecretFile string           `yaml:"clientSecretFile"`
+	RefreshTokenFile string           `yaml:"refreshTokenFile"`
+	// Write turns on preview_event and create_event for the account. The
+	// refresh token must then have been obtained with `calendar-login
+	// --write` (scope calendar.events); without it only calendar.readonly is
+	// needed and used.
+	Write bool `yaml:"write,omitempty"`
+
+	clientID, clientSecret, refreshToken string
+}
+
+// ClientID, ClientSecret and RefreshToken return the values read from the
+// files at load time. They are credentials: never log or return them.
+func (c Calendar) ClientID() string     { return c.clientID }
+func (c Calendar) ClientSecret() string { return c.clientSecret }
+func (c Calendar) RefreshToken() string { return c.refreshToken }
+
+// NewCalendarForTest builds a Calendar with credentials set, for tests in
+// other packages.
+func NewCalendarForTest(id, secret, refresh string, write bool) *Calendar {
+	return &Calendar{Provider: GoogleCalendar, Write: write, clientID: id, clientSecret: secret, refreshToken: refresh}
+}
+
+func readSecretFile(path string) (string, error) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return "", errors.New("cannot be read")
+	}
+	v := strings.TrimSpace(string(b))
+	if v == "" {
+		return "", errors.New("is empty")
+	}
+	return v, nil
+}
+
+func (c *Calendar) load() error {
+	switch {
+	case c.Provider != GoogleCalendar:
+		return fmt.Errorf("calendar.provider must be %q (Proton Calendar is not supported yet)", GoogleCalendar)
+	case c.ClientIDFile == "" || c.ClientSecretFile == "" || c.RefreshTokenFile == "":
+		return errors.New("calendar needs clientIdFile, clientSecretFile and refreshTokenFile; credentials are never written in this file")
+	}
+	for _, f := range []struct {
+		name, path string
+		dst        *string
+	}{
+		{"clientIdFile", c.ClientIDFile, &c.clientID},
+		{"clientSecretFile", c.ClientSecretFile, &c.clientSecret},
+		{"refreshTokenFile", c.RefreshTokenFile, &c.refreshToken},
+	} {
+		v, err := readSecretFile(f.path)
+		if err != nil {
+			return fmt.Errorf("calendar.%s %s", f.name, err)
+		}
+		*f.dst = v
+	}
+	return nil
 }
 
 // Password returns the credential read from PasswordFile at load time.
@@ -133,6 +207,11 @@ func Load(path string) ([]Account, error) {
 		a.password = strings.TrimRight(string(pw), "\r\n")
 		if a.password == "" {
 			return nil, fmt.Errorf("account %q: password file is empty", a.Name)
+		}
+		if a.Calendar != nil {
+			if err := a.Calendar.load(); err != nil {
+				return nil, fmt.Errorf("account %q: %w", a.Name, err)
+			}
 		}
 	}
 	return f.Accounts, nil

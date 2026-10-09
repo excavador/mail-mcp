@@ -20,6 +20,20 @@ replicaCount: 1
 #       aliases:
 #         - me@example.com     # exact address (plus-tags match too)
 #         - "@example.org"     # any address at this domain
+#
+# Calendar (Google Workspace accounts only; see the README, "Calendar
+# (Google)"): the same Secret also carries the OAuth client id, client secret
+# and refresh token as one key each, and the account's `calendar:` section
+# names them under /etc/mail-mcp. No chart value is needed: the whole Secret
+# is mounted, so adding keys to it (and Reloader, via deploymentAnnotations)
+# is all it takes.
+#
+#       calendar:
+#         provider: google
+#         clientIdFile: /etc/mail-mcp/gmail-truvity-calendar-client-id
+#         clientSecretFile: /etc/mail-mcp/gmail-truvity-calendar-client-secret
+#         refreshTokenFile: /etc/mail-mcp/gmail-truvity-calendar-refresh-token
+#         write: true    # preview_event / create_event; needs calendar-login --write
 accounts:
   # Required. The accounts file and password files are never literals in values:
   # they would end up in a values file, in git, and in `helm get values` output.

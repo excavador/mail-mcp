@@ -31,6 +31,7 @@ import (
 
 	"github.com/excavador/mail-mcp/internal/accounts"
 	"github.com/excavador/mail-mcp/internal/cache"
+	"github.com/excavador/mail-mcp/internal/calendar"
 	"github.com/excavador/mail-mcp/internal/history"
 	"github.com/excavador/mail-mcp/internal/leader"
 	"github.com/excavador/mail-mcp/internal/memlimit"
@@ -53,6 +54,17 @@ func main() {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	// `mail-mcp calendar-login ...` is the owner's one-time consent helper,
+	// run on their own machine; it needs none of the server's flags.
+	if len(os.Args) > 1 && os.Args[1] == "calendar-login" {
+		if err := calendar.Login(ctx, os.Args[2:], os.Stdout, os.Stderr); err != nil {
+			fmt.Fprintf(os.Stderr, "mail-mcp calendar-login: %v\n", err)
+			stop()
+			os.Exit(1)
+		}
+		return
+	}
 
 	cmd := &cli.Command{
 		Name:    "mail-mcp",
@@ -266,6 +278,20 @@ func run(ctx context.Context, cmd *cli.Command) error {
 		return err
 	}
 	opts := []server.Option{server.WithHistory(hist), server.WithOrganiser(org), server.WithMaxUnelicited(cmd.Int("max-unelicited-apply")), server.WithMaxUnelicitedLabel(cmd.Int("max-unelicited-label")), server.WithApprovalMode(approval)}
+	cals, err := calendar.NewRegistry(ctx, accts)
+	if err != nil {
+		_ = hist.Close()
+		_ = store.Close()
+		return err
+	}
+	if len(cals) > 0 {
+		opts = append(opts, server.WithCalendars(cals))
+		calNames := make([]string, 0, len(cals))
+		for n, c := range cals {
+			calNames = append(calNames, fmt.Sprintf("%s(write=%t)", n, c.Write))
+		}
+		log.Info("calendars", "accounts", calNames)
+	}
 	if sock := cmd.String("pdf-extractor-socket"); sock != "" {
 		if d := cmd.String("pdf-stage-dir"); d != "" {
 			store.SetPDFStageDir(d)

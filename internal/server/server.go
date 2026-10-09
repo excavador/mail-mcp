@@ -22,6 +22,7 @@ import (
 
 	"github.com/excavador/mail-mcp/internal/accounts"
 	"github.com/excavador/mail-mcp/internal/cache"
+	"github.com/excavador/mail-mcp/internal/calendar"
 	"github.com/excavador/mail-mcp/internal/history"
 	"github.com/excavador/mail-mcp/internal/organise"
 )
@@ -55,6 +56,7 @@ type options struct {
 	// maxUnelicitedLabel is the cap for label actions (and their undo).
 	maxUnelicitedLabel int
 	approvalMode       ApprovalMode
+	cal                calendar.Registry
 }
 
 // ApprovalMode says how apply_intent obtains the owner's approval.
@@ -118,7 +120,7 @@ func New(accts []accounts.Account, store *cache.Cache, version string, mode Mode
 		byName[a.Name] = a
 	}
 
-	addReads(s, accts, byName)
+	addReads(s, accts, byName, o.cal)
 	addListFolders(s, byName, store)
 	addSearch(s, byName, store)
 	addFetchMessage(s, byName, store)
@@ -129,6 +131,9 @@ func New(accts []accounts.Account, store *cache.Cache, version string, mode Mode
 	addListTags(s, byName, store)
 	addListSavedQueries(s, byName, store)
 	addCacheStatus(s, store)
+	if len(o.cal) > 0 {
+		addCalendarReads(s, byName, o.cal)
+	}
 	if o.hist != nil {
 		addListHistory(s, byName, o.hist)
 	}
@@ -137,7 +142,7 @@ func New(accts []accounts.Account, store *cache.Cache, version string, mode Mode
 	// saves a draft: nothing here sends mail). The Read server cannot be handed them by
 	// any option.
 	if mode == Admin && o.hist != nil && o.org != nil {
-		addWriteTools(s, writeDeps{byName: byName, store: store, hist: o.hist, org: o.org, maxUnelicited: o.maxUnelicited, maxUnelicitedLabel: o.maxUnelicitedLabel, approvalMode: o.approvalMode})
+		addWriteTools(s, writeDeps{byName: byName, store: store, hist: o.hist, org: o.org, maxUnelicited: o.maxUnelicited, maxUnelicitedLabel: o.maxUnelicitedLabel, approvalMode: o.approvalMode, cal: o.cal})
 	}
 	return s
 }
@@ -148,9 +153,11 @@ type accountInfo struct {
 	Username string `json:"username"`
 	// How folders behave, so a caller does not have to know the providers.
 	Folders string `json:"folders"`
+	// Calendar says what the account's calendar tools can do; empty: none.
+	Calendar string `json:"calendar,omitempty"`
 }
 
-func addReads(s *mcp.Server, accts []accounts.Account, byName map[string]accounts.Account) {
+func addReads(s *mcp.Server, accts []accounts.Account, byName map[string]accounts.Account, cal calendar.Registry) {
 	mcp.AddTool(s, &mcp.Tool{
 		Name: "list_accounts",
 		Description: "List the mailboxes this server can reach, with the provider behind each. " +
@@ -164,9 +171,16 @@ func addReads(s *mcp.Server, accts []accounts.Account, byName map[string]account
 			if a.Provider == accounts.Proton {
 				fold = "Folders/... one per message; Labels/... many per message"
 			}
-			out = append(out, accountInfo{
-				Name: a.Name, Provider: string(a.Provider), Username: a.Username, Folders: fold,
-			})
+			info := accountInfo{Name: a.Name, Provider: string(a.Provider), Username: a.Username, Folders: fold}
+			if c, ok := cal[a.Name]; ok {
+				info.Calendar = "google: list_calendars, list_events, get_event, free_busy"
+				if c.Write {
+					info.Calendar += ", preview_event/create_event (admin endpoint)"
+				}
+			} else if a.Provider == accounts.Proton {
+				info.Calendar = "none: Proton calendar is not supported yet"
+			}
+			out = append(out, info)
 		}
 		return nil, map[string]any{"accounts": out}, nil
 	})
