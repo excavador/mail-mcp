@@ -41,6 +41,10 @@ const (
 	// was saved, never the body). It cannot be undone: mail-mcp deletes
 	// nothing, so the owner discards a draft in their mail client.
 	KindCreateDraft = "create_draft"
+	// KindCreateEvent: a calendar event inserted, with invitations sent
+	// (Event holds what was created, never the description). It cannot be
+	// undone from here: there is no calendar delete tool.
+	KindCreateEvent = "create_event"
 )
 
 // NewID returns a fresh record id, for a caller that must know the id before
@@ -91,6 +95,20 @@ type DraftInfo struct {
 	ReplyToID   string   `json:"reply_to,omitempty"` // stable id of the message answered
 }
 
+// EventInfo is what create_event created: where, when and who was invited, but
+// not the description.
+type EventInfo struct {
+	Calendar  string   `json:"calendar"`
+	EventID   string   `json:"event_id"`
+	HTMLLink  string   `json:"html_link,omitempty"`
+	Title     string   `json:"title"`
+	Start     string   `json:"start"`
+	End       string   `json:"end"`
+	TimeZone  string   `json:"time_zone"`
+	Attendees []string `json:"attendees,omitempty"` // invited by e-mail (sendUpdates=all)
+	Meet      bool     `json:"meet,omitempty"`
+}
+
 // Record is one history line.
 type Record struct {
 	ID      string           `json:"id"`
@@ -107,6 +125,7 @@ type Record struct {
 	NewKind       string      `json:"new_kind,omitempty"`
 	Preview       PreviewInfo `json:"preview"`
 	Draft         *DraftInfo  `json:"draft,omitempty"` // create_draft
+	Event         *EventInfo  `json:"event,omitempty"` // create_event
 	// Touched is the stable ids acted on, grouped by the folder they came from.
 	Touched map[string][]string `json:"touched,omitempty"`
 	// AlreadyInTarget lists, by source folder, acted-on ids that were in the

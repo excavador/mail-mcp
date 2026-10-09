@@ -54,6 +54,12 @@ accounts:
       - "@example.org"             # any address at this domain
     displayName: Oleg Tsarev       # optional: name on the From line of drafts
     drafts: true                   # optional, default true; false turns draft creation off
+    calendar:                      # optional, Google Workspace only, see "Calendar (Google)"
+      provider: google
+      clientIdFile: /secrets/gmail-work-calendar-client-id
+      clientSecretFile: /secrets/gmail-work-calendar-client-secret
+      refreshTokenFile: /secrets/gmail-work-calendar-refresh-token
+      write: false                 # optional, default false; true enables preview_event / create_event
 ```
 
 #### Owner aliases
@@ -166,6 +172,42 @@ Both are on the admin endpoint only. A draft cannot be undone from mail-mcp, whi
 `preview_intent` takes `criterion.tag`: the cached messages of `criterion.folder` that carry that local tag (set with `tag_messages`; same name syntax as tags). It is ANDed with the other criteria, may be the only one besides `folder`, and does not change a mailbox. With `action: label` it adds the target label (Gmail label, Proton `Labels/...`) on top of the current folder and moves nothing, so tagged mail can be labelled `Purchases/Imported`, `Purchases/Shipping` and so on in the mailbox itself.
 
 `undo` of a label removes the label from exactly the messages that intent labelled. Messages that already carried the label when the intent ran (checked against the server, not only the cache) are recorded as `already_in_target` and keep it. The undo preview has `action: unlabel`; the history keeps the stable ids (Gmail: `X-GM-MSGID`), so it works after UIDs change. Gmail: `STORE -X-GM-LABELS` on the label folder, and only that: it requires the X-GM-EXT-1 extension and refuses without it, and mail-mcp never expunges on Gmail, so nothing can reach the Trash. Proton, where a label is a `Labels/...` folder: `UID STORE +FLAGS \Deleted` and `UID EXPUNGE` of exactly those UIDs, only in a `Labels/...` folder and only with UIDPLUS (never a plain `EXPUNGE`); if the expunge fails the flag is cleared again. The Proton path has not yet been verified by hand against Bridge, so on client approval its undo is capped at `--max-unelicited-apply` (50), not the label cap.
+
+## Calendar (Google)
+
+Accounts with a `calendar:` section get calendar tools. **Only Google Workspace calendars are supported. Proton calendar is not supported yet (research pending)**; a Proton account, and a Gmail account without a `calendar:` section, has no calendar tools. Calendar tools are request-driven live API calls: no cache, no background job.
+
+| tool | endpoint | |
+|---|---|---|
+| `list_calendars` | read + admin | The account's calendars with the owner's access role |
+| `list_events` | read + admin | Events in a window (at most 366 days, 250 per page, `next_cursor` to continue). Recurring events are expanded into instances (`singleEvents=true`, ordered by start). Start/end with time zone, title, location, organiser, attendees with response status, conference link, status, web link |
+| `get_event` | read + admin | One event with its description |
+| `free_busy` | read + admin | Busy intervals of several accounts' primary calendars (at most 10 accounts, 31 days); busy time of two different accounts that overlaps is reported as a `conflict` |
+| `preview_event` | admin only | The exact event that would be created, a single-use preview token (15 minutes), and a notice naming who Google will invite |
+| `create_event` | admin only | Creates a previewed event after the owner's approval; **Google e-mails the invitations at once** (`sendUpdates=all`) |
+
+Titles, locations, organisers, attendees and descriptions are third-party text: they are sanitised (control and invisible characters removed, length capped), returned under `untrusted`, and a description is fenced like a mail body (`<untrusted-email-content nonce=...>`).
+
+`preview_event(account, calendar?, title, start, end, time_zone, attendees[], description?, location?, add_meet_link?)` validates the IANA time zone, `end > start` (at most 7 days), and the attendee addresses (at most 50), then returns the event, the token, and a notice that starts with who gets mail: `Google will email invitations to 2 attendees: a@x, b@y` or `no attendees, no invitations`. `create_event(preview_token, approved: true, expect_account, expect_calendar, expect_start, expect_attendees, expect_attendee_count, expect_title)` must restate the preview (`expect_attendees` is the preview's `attendees`: lowercase, comma-separated), so the client's approval prompt shows the owner exactly who will be invited. Approval follows `--approval-mode` like `create_draft`: in `elicitation` mode the owner is asked through an MCP form naming the invitees; in `client` mode the client's tool approval is the gate and at most 10 events per account per hour are accepted that way. The Google event id is derived from the preview, so a retried create of the same preview cannot invite everyone twice. Recorded in the history (calendar, event id, time, title, attendees; never the description). There is no update or delete tool, and `undo` refuses an event: cancel it in the calendar.
+
+### Setup (the owner, once per Google Workspace)
+
+Nothing here gives a credential to anyone but you: the refresh token is written to a file on your machine and you store it yourself.
+
+1. In the Google Cloud project of the Workspace (create one if needed): **APIs & Services > Library > Google Calendar API > Enable**.
+2. **APIs & Services > OAuth consent screen**: user type **Internal** (only users of that Workspace; no Google verification). Add the scope `.../auth/calendar.readonly`, and `.../auth/calendar.events` if you will use `create_event`.
+3. **Credentials > Create credentials > OAuth client ID > Desktop app**. (A desktop client accepts the loopback redirect `calendar-login` uses.) Save the client id and the client secret each to a file, mode 0600, e.g. `client-id` and `client-secret`.
+4. On your machine, signed in to the browser as the Workspace user whose calendar this is:
+
+   ```
+   mail-mcp calendar-login --client-id-file client-id --client-secret-file client-secret --out refresh-token [--write]
+   ```
+
+   It prints a Google URL; open it and approve. It listens on `127.0.0.1` at a random port, uses PKCE, `access_type=offline` and `prompt=consent`, writes the refresh token to `--out` with mode 0600 and prints only `saved`. `--write` also asks for `calendar.events` (needed for `create_event`); without it only `calendar.readonly`. Repeat per account, each with its own project, client and token.
+5. Store the three values in OpenBao (e.g. under the account's entry) and extend the ExternalSecret template that renders `accounts.yaml` and the password files: one more key per file (client id, client secret, refresh token) in the same Secret, and the `calendar:` section in the account's `accounts.yaml` entry (above). The chart mounts the whole Secret at `/etc/mail-mcp`, so no chart change is needed; Reloader restarts the pod when the Secret changes. Then delete the local files.
+6. `write: true` in the account's `calendar:` section enables the two event tools (admin endpoint only); leave it out for read-only.
+
+Scopes: `calendar.readonly` for the read tools; `calendar.events` additionally for `create_event`, and only if `calendar-login --write` was used. A token revoked or expired shows up as a "calendar authorization failed" error; run `calendar-login` again. Credentials are never logged or returned in a tool result.
 
 ## PDF attachment text
 
@@ -291,7 +333,7 @@ from <https://poppler.freedesktop.org/>.
 
 **There is no delete tool, and there will not be one.** Moves are reversible; deletes are not. The only way to throw a message away is to move it, so you can undo it later.
 
-**It never sends mail.** There is no SMTP code and no send tool. Drafts are saved in the Drafts folder ([above](#drafts)); sending is yours, from your own mail client.
+**It never sends mail.** There is no SMTP code and no send tool. Drafts are saved in the Drafts folder ([above](#drafts)); sending is yours, from your own mail client. The one thing that reaches other people is `create_event` ([Calendar](#calendar-google)): Google e-mails the invitations as soon as the owner approves an event, and the approval names exactly who will be invited. There is no calendar update or delete tool.
 
 ## Rolling updates and the Lease
 
