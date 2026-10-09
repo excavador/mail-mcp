@@ -163,6 +163,19 @@ Both are on the admin endpoint only. A draft cannot be undone from mail-mcp, whi
 
 **Shape of the message.** `Date`, `From`, `To`, `Cc`, `Bcc`, `Subject` (RFC 2047 when not ASCII), a generated `Message-ID` at the sender's domain, `In-Reply-To`/`References`, `MIME-Version: 1.0`, `Content-Type: multipart/alternative` with two quoted-printable UTF-8 parts, CRLF line ends: `text/plain` (the body and the `> ` quote) and a `text/html` rendering of the same text (paragraphs, `<br>`, lists, one `<blockquote>`; everything escaped, no scripts, styles or external resources). The HTML part exists because Gmail opens a plain-text-only draft in plain-text mode and hard-wraps every line at about 70 characters when it is sent. CR, LF and NUL in any header value are refused, addresses must parse (`net/mail`) and be plain ASCII, and a draft has at most 50 recipients.
 
+### Refreshing the cache on demand
+
+`refresh_cache` (both endpoints) refreshes one account's cache now instead of waiting for the background refresh (every `--refresh-interval`, 15 minutes by default, run by the Lease leader). It reads the mailbox over IMAP and writes only the local cache; it never changes the mailbox.
+
+| argument | |
+|---|---|
+| `account` | Required. The account name from `list_accounts`; the account's email/username or an exact owner alias is also accepted. |
+| `max_age` | Optional Go duration (`30s`, `5m`, `1h`). Default `5m`, floor `30s`, cap `24h`; values outside are clamped and the result says so (`max_age_note`). Refresh only if the last successful refresh is older; otherwise the answer is `refreshed: false, reason: "fresh"` with `last_refresh`. |
+
+It runs the same refresh as the background loop (all folders; folders unchanged since the last scan are skipped) and waits up to 2 minutes. The result has `refreshed` (`true`, `false`, or `"in_progress"` when the wait ran out and the refresh finishes in the background), `started_at`, `finished_at`, `duration`, `folders_scanned`, `folders_skipped_unchanged`, `new_uids`, `new_messages`, `last_refresh`, `last_refresh_ok` and `error`. The error is a fixed phrase (`login failed`, `mail server did not answer in time`, ...); details go to the server log only. Each call is logged at INFO (account, max_age, outcome, duration, new count; no message content).
+
+Only one refresh of an account runs at a time in a process: a call made while the background refresh of that account is running joins it and returns its result, and a background tick that fires during an on-demand refresh joins that one. The background schedule is not shifted. At most one on-demand refresh starts per account per 30 seconds per process; a call inside that window returns the last run's result (`reason` starts with `rate_limited`). A pod that is not the Lease leader runs the refresh itself, once; this is safe next to the leader's refresh because the cache database is SQLite in WAL mode with a busy timeout, so two writers queue rather than fail, and a refresh is idempotent. `cache_status` shows the outcome.
+
 ### Approval mode
 
 `--approval-mode` (`APPROVAL_MODE`, chart `approval.mode`) sets how `apply_intent` is approved. `client` (default) never elicits: approval is the client's own tool-approval prompt, which shows the account, action, source, target and count, and an apply of more than `--max-unelicited-apply` (50) messages is refused, except `label` (and the undo of a Gmail label), whose cap is `--max-unelicited-label` (`MAX_UNELICITED_LABEL`, default 1000): a label only adds, and its undo removes only what it added. The `expect_*` echo fields stay mandatory at either cap. `elicitation` asks the owner through MCP elicitation forms; use it once the Claude Code VS Code extension renders them ([anthropics/claude-code#98978](https://github.com/anthropics/claude-code/issues/98978)).

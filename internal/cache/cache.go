@@ -67,6 +67,15 @@ type Cache struct {
 
 	// now is the clock; tests replace it to exercise the full-scan interval.
 	now func() time.Time
+
+	// Per-account refresh coordination (see refreshnow.go). bgCtx is the
+	// parent of refreshes started on demand: they outlive the request that
+	// started them, and Close cancels and waits for them.
+	rfMu     sync.Mutex
+	rf       map[string]*acctRefresh
+	bgCtx    context.Context
+	bgCancel context.CancelFunc
+	bgWG     sync.WaitGroup
 }
 
 // columnSet is a table's columns added after the first release. They are
@@ -497,6 +506,7 @@ func Open(dir string) (*Cache, error) {
 		return nil, fmt.Errorf("cache: initialise index: %w", err)
 	}
 	c := &Cache{dir: dir, db: db, now: time.Now}
+	c.bgCtx, c.bgCancel = context.WithCancel(context.Background())
 	if err := c.initBackfill(); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("cache: initialise index: %w", err)
@@ -513,7 +523,13 @@ func Open(dir string) (*Cache, error) {
 }
 
 // Close releases the index.
-func (c *Cache) Close() error { return c.db.Close() }
+func (c *Cache) Close() error {
+	if c.bgCancel != nil {
+		c.bgCancel()
+		c.bgWG.Wait()
+	}
+	return c.db.Close()
+}
 
 // AccountStatus summarises what the cache holds for one account.
 type AccountStatus struct {
