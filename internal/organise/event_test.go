@@ -2,6 +2,8 @@ package organise
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"regexp"
 	"strconv"
@@ -285,5 +287,52 @@ func TestEventQuestionKeyIsBoundToThePreview(t *testing.T) {
 	state2, _ := o.NewQuestion(p.Token)
 	if o.TakeQuestion(q.Token, state2) {
 		t.Error("a question state served another token")
+	}
+}
+
+func TestDescriptionDigestAndRefusedInviteesCountNothing(t *testing.T) {
+	p := evPreview("acct")
+	empty := sha256.Sum256(nil)
+	if p.DescriptionSHA256() != hex.EncodeToString(empty[:]) {
+		t.Errorf("digest of no description = %s", p.DescriptionSHA256())
+	}
+	p.Description = "Agenda"
+	sum := sha256.Sum256([]byte("Agenda"))
+	if p.DescriptionSHA256() != hex.EncodeToString(sum[:]) {
+		t.Errorf("digest = %s", p.DescriptionSHA256())
+	}
+	// The id covers every field the recipients see.
+	base := evPreview("acct").EventID()
+	for name, mut := range map[string]func(*EventPreview){
+		"description": func(q *EventPreview) { q.Description = "x" },
+		"location":    func(q *EventPreview) { q.Location = "x" },
+		"meet":        func(q *EventPreview) { q.Meet = true },
+		"end":         func(q *EventPreview) { q.End = q.End.Add(time.Minute) },
+		"attendee":    func(q *EventPreview) { q.Attendees = []string{"z@example.com"} },
+		"calendar":    func(q *EventPreview) { q.Calendar = "other" },
+		"account":     func(q *EventPreview) { q.Account = "other" },
+	} {
+		q := evPreview("acct")
+		mut(q)
+		if q.EventID() == base {
+			t.Errorf("changing %s keeps the event id", name)
+		}
+	}
+	// Attendee order does not matter to the id.
+	a, b := evPreview("acct"), evPreview("acct")
+	a.Attendees, b.Attendees = []string{"a@example.com", "b@example.com"}, []string{"b@example.com", "a@example.com"}
+	if a.EventID() != b.EventID() {
+		t.Error("attendee order changes the id")
+	}
+
+	o := newOrg(t)
+	if !o.TakeUnelicitedInvitees("a", 15) || o.TakeUnelicitedInvitees("a", 6) {
+		t.Fatal("15 then 6 should be 15 then refused")
+	}
+	if !o.TakeUnelicitedInvitees("a", 5) {
+		t.Error("a refusal counted against the cap")
+	}
+	if UnelicitedInviteesPerHour != 20 || UnelicitedAttendeesPerEvent != 10 {
+		t.Errorf("caps = %d/%d", UnelicitedInviteesPerHour, UnelicitedAttendeesPerEvent)
 	}
 }
