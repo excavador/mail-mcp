@@ -131,6 +131,7 @@ func New(accts []accounts.Account, store *cache.Cache, version string, mode Mode
 	addListTags(s, byName, store)
 	addListSavedQueries(s, byName, store)
 	addCacheStatus(s, store)
+	addRefreshCache(s, accts, store)
 	if len(o.cal) > 0 {
 		addCalendarReads(s, byName, o.cal)
 	}
@@ -193,7 +194,8 @@ func addCacheStatus(s *mcp.Server, store *cache.Cache) {
 	mcp.AddTool(s, &mcp.Tool{
 		Name: "cache_status",
 		Description: "Report what the local message cache holds for each account: cached messages, " +
-			"folder memberships, folders, and when the cache was last refreshed from the mailbox.",
+			"folder memberships, folders, and when the cache was last refreshed from the mailbox. " +
+			"To refresh an account now instead of waiting for the background refresh, call refresh_cache.",
 		Annotations: readOnly(),
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, _ struct{}) (*mcp.CallToolResult, any, error) {
 		st, err := store.Status(ctx)

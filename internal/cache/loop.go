@@ -63,30 +63,18 @@ func (c *Cache) Run(ctx context.Context, log *slog.Logger, a accounts.Account, i
 	// making progress may run on, up to refreshCeiling: the first fill of a
 	// large mailbox takes hours and must not be cut off and restarted.
 	stall := max(interval, 10*time.Minute)
+	// The run goes through the per-account guard shared with refresh_cache
+	// (RefreshNow): if an on-demand refresh of this account is in flight when
+	// the tick fires, the tick joins it instead of starting a second one. The
+	// ticker is not reset: the next tick still comes at its usual time.
 	refresh := func() {
-		start := time.Now()
-		rctx, touch, cancel := withStallTimeout(ctx, stall, refreshCeiling)
-		defer cancel()
-		logProgress := progressLogger(log, a.Name, progressLogEvery)
-		rctx = WithProgress(rctx, func(p Progress) {
-			touch()
-			logProgress(p)
+		call := c.startRefresh(ctx, a.Name, func(rctx context.Context) (Stats, error) {
+			return c.runLogged(rctx, log, a, stall)
 		})
-		st, err := c.RefreshOnce(rctx, a)
-		attrs := []any{
-			"account", a.Name, "folders", st.Folders, "folders_total", st.FoldersTotal,
-			"folders_skipped_unchanged", st.FoldersSkipped, "folders_scanned", st.FoldersScanned, "new_uids", st.NewUIDs,
-			"new_ids", st.NewIDs, "new_bodies", st.NewBodies, "removed", st.Removed, "skipped", st.Skipped,
-			"took", time.Since(start).Round(time.Millisecond).String(),
+		select {
+		case <-call.done:
+		case <-ctx.Done():
 		}
-		if err != nil {
-			if cause := context.Cause(rctx); cause != nil && rctx.Err() != nil {
-				attrs = append(attrs, "cause", cause.Error())
-			}
-			log.Error("cache refresh failed", append(attrs, "error", err.Error())...)
-			return
-		}
-		log.Info("cache refreshed", attrs...)
 	}
 
 	refresh()
@@ -100,4 +88,33 @@ func (c *Cache) Run(ctx context.Context, log *slog.Logger, a accounts.Account, i
 			refresh()
 		}
 	}
+}
+
+// runLogged is one refresh of a: the stall/ceiling bounds, progress logging
+// and the outcome log line shared by the background loop and refresh_cache.
+func (c *Cache) runLogged(ctx context.Context, log *slog.Logger, a accounts.Account, stall time.Duration) (Stats, error) {
+	start := time.Now()
+	rctx, touch, cancel := withStallTimeout(ctx, stall, refreshCeiling)
+	defer cancel()
+	logProgress := progressLogger(log, a.Name, progressLogEvery)
+	rctx = WithProgress(rctx, func(p Progress) {
+		touch()
+		logProgress(p)
+	})
+	st, err := c.RefreshOnce(rctx, a)
+	attrs := []any{
+		"account", a.Name, "folders", st.Folders, "folders_total", st.FoldersTotal,
+		"folders_skipped_unchanged", st.FoldersSkipped, "folders_scanned", st.FoldersScanned, "new_uids", st.NewUIDs,
+		"new_ids", st.NewIDs, "new_bodies", st.NewBodies, "removed", st.Removed, "skipped", st.Skipped,
+		"took", time.Since(start).Round(time.Millisecond).String(),
+	}
+	if err != nil {
+		if cause := context.Cause(rctx); cause != nil && rctx.Err() != nil {
+			attrs = append(attrs, "cause", cause.Error())
+		}
+		log.Error("cache refresh failed", append(attrs, "error", err.Error())...)
+		return st, err
+	}
+	log.Info("cache refreshed", attrs...)
+	return st, nil
 }
