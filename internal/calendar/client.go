@@ -27,7 +27,8 @@ import (
 // Scopes. Only what an account is configured for is requested.
 const (
 	ScopeReadonly = gcal.CalendarReadonlyScope
-	ScopeEvents   = gcal.CalendarEventsScope
+	// ScopeEvents lets the app create events only on calendars the user owns.
+	ScopeEvents = "https://www.googleapis.com/auth/calendar.events.owned"
 )
 
 // CallBudget bounds one tool's calls to the API. A var so a test can shorten it.
@@ -40,7 +41,7 @@ func (e Error) Error() string { return string(e) }
 
 // ErrAlreadyExists is a create whose event id is taken: the same preview was
 // already created (the id is derived from the preview).
-var ErrAlreadyExists = Error("an event from this preview already exists; look in the calendar before trying again")
+var ErrAlreadyExists = Error("an identical event was created before (possibly since cancelled), so Google refused a duplicate; change something in the event or check the calendar")
 
 // Client talks to the Calendar API as one account.
 type Client struct {
@@ -338,6 +339,17 @@ func (c *Client) CreateEvent(ctx context.Context, n NewEvent) (Event, error) {
 		return Event{}, err
 	}
 	return conv(res, n.Calendar), nil
+}
+
+// OutcomeUnknown reports whether a failed insert may nevertheless have
+// created the event: anything but a definite 4xx answer (timeouts, resets,
+// EOF, 5xx, a lost response).
+func OutcomeUnknown(err error) bool {
+	var ge *googleapi.Error
+	if errors.As(err, &ge) && ge.Code >= 400 && ge.Code < 500 {
+		return false
+	}
+	return true
 }
 
 // Registry holds the Client of every account that has a calendar.

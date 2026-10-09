@@ -86,7 +86,7 @@ type Organiser struct {
 	// events are the previews of preview_event (see event.go).
 	events     map[string]*EventPreview
 	eventOrder []string
-	eventTimes map[string][]time.Time // account -> times of unelicited events
+	eventTimes map[string][]inviteTake // account -> invitees of unelicited events
 }
 
 // New returns an Organiser over store with a fresh random signing key.

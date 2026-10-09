@@ -4,11 +4,14 @@ import (
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
+	"encoding/base32"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -65,11 +68,29 @@ func (o *Organiser) signEvent(p *EventPreview) string {
 	return strconv.FormatInt(p.Expires.Unix(), 10) + "." + base64.RawURLEncoding.EncodeToString(m.Sum(nil))
 }
 
-// EventID is the Google event id create_event uses for p: derived from the
-// preview's nonce, so a retried create of the same preview is refused by
-// Google (409) instead of inviting everyone twice. Lowercase hex is within
-// Google's id alphabet (a-v, 0-9).
-func (p *EventPreview) EventID() string { return "mm" + hex.EncodeToString(p.Nonce[:]) }
+// EventID is the Google event id create_event uses for p. It is derived from
+// the event's content (not from the preview's nonce): re-previewing the same
+// event after an uncertain failure yields the same id, so Google answers 409
+// instead of inviting everyone a second time. base32hex lowercase is within
+// Google's id alphabet (a-v, 0-9); "mm" + 40 characters.
+func (p *EventPreview) EventID() string {
+	atts := append([]string(nil), p.Attendees...)
+	sort.Strings(atts)
+	raw, _ := json.Marshal([]any{
+		p.Account, p.Calendar, p.Title, p.Start.Format(time.RFC3339), p.End.Format(time.RFC3339), p.TimeZone,
+		atts, p.Description, p.Location, p.Meet,
+	})
+	sum := sha256.Sum256(raw)
+	id := base32.HexEncoding.WithPadding(base32.NoPadding).EncodeToString(sum[:])
+	return "mm" + strings.ToLower(id)[:40]
+}
+
+// DescriptionSHA256 is the hex SHA-256 of the exact description (of the empty
+// string when there is none): what expect_description_sha256 restates.
+func (p *EventPreview) DescriptionSHA256() string {
+	sum := sha256.Sum256([]byte(p.Description))
+	return hex.EncodeToString(sum[:])
+}
 
 // IssueEvent stamps p with a nonce, an expiry and a token, and remembers it.
 func (o *Organiser) IssueEvent(p *EventPreview) (*EventPreview, error) {
@@ -142,29 +163,43 @@ func (o *Organiser) QuestionKeyEvent(p *EventPreview) string {
 	return "approve-" + hex.EncodeToString(sum[:])[:16]
 }
 
-// UnelicitedEventsPerHour is how many events one account may have created on
-// the client's tool approval alone (no elicitation) in an hour.
-const UnelicitedEventsPerHour = 10
+const (
+	// UnelicitedInviteesPerHour is how many invitee addresses, summed over
+	// events, one account may have invited in a rolling hour on the client's
+	// tool approval alone (no elicitation).
+	UnelicitedInviteesPerHour = 20
+	// UnelicitedAttendeesPerEvent is the most attendees one event may have on
+	// that path.
+	UnelicitedAttendeesPerEvent = 10
+)
 
-// TakeUnelicitedEvent counts one event created without elicitation against the
-// account's hourly cap and reports whether it was within it.
-func (o *Organiser) TakeUnelicitedEvent(account string) bool {
+type inviteTake struct {
+	at time.Time
+	n  int
+}
+
+// TakeUnelicitedInvitees counts n invitees created without elicitation
+// against the account's rolling-hour cap and reports whether they fit. A
+// refusal counts nothing.
+func (o *Organiser) TakeUnelicitedInvitees(account string, n int) bool {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	if o.eventTimes == nil {
-		o.eventTimes = map[string][]time.Time{}
+		o.eventTimes = map[string][]inviteTake{}
 	}
 	now := time.Now()
 	kept := o.eventTimes[account][:0]
+	total := 0
 	for _, t := range o.eventTimes[account] {
-		if now.Sub(t) < unelicitedWindow {
+		if now.Sub(t.at) < unelicitedWindow {
 			kept = append(kept, t)
+			total += t.n
 		}
 	}
-	if len(kept) >= UnelicitedEventsPerHour {
+	if total+n > UnelicitedInviteesPerHour {
 		o.eventTimes[account] = kept
 		return false
 	}
-	o.eventTimes[account] = append(kept, now)
+	o.eventTimes[account] = append(kept, inviteTake{now, n})
 	return true
 }

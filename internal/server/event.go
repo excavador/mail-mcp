@@ -82,8 +82,8 @@ func parseAttendees(in []string) ([]string, error) {
 			return nil, fmt.Errorf("attendees: %q is not an e-mail address", capRunes(clean(raw), 64))
 		}
 		addr := strings.ToLower(a.Address)
-		at := strings.LastIndexByte(addr, '@')
-		if at <= 0 || !domainOK(addr[at+1:]) || strings.ContainsAny(addr, " ,;<>\"") {
+		at := strings.IndexByte(addr, '@')
+		if at <= 0 || strings.Count(addr, "@") != 1 || len(addr[:at]) > 64 || !localRE.MatchString(addr[:at]) || !domainOK(addr[at+1:]) {
 			return nil, fmt.Errorf("attendees: %q is not an e-mail address", capRunes(clean(raw), 64))
 		}
 		if !seen[addr] {
@@ -93,6 +93,9 @@ func parseAttendees(in []string) ([]string, error) {
 	}
 	return out, nil
 }
+
+// localRE is the unquoted RFC 5322 atext local part; quoted local parts are refused.
+var localRE = regexp.MustCompile("^[a-z0-9.!#$%&'*+/=?^_`{|}~-]+$")
 
 var attendeeDomainRE = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$`)
 
@@ -107,6 +110,56 @@ func inviteNotice(attendees []string) string {
 		return "Google will email invitations to 1 attendee: " + attendees[0]
 	}
 	return fmt.Sprintf("Google will email invitations to %d attendees: %s", len(attendees), strings.Join(attendees, ", "))
+}
+
+var linkRE = regexp.MustCompile(`(?i)(?:[a-z][a-z0-9+.-]*://|www\.|mailto:)[^\s<>"]+`)
+
+const (
+	approvalDescRunes = 500
+	maxLinksShown     = 20
+	maxLinkRunes      = 200
+)
+
+// eventLinks lists every URL in the description and the location.
+func eventLinks(p *organise.EventPreview) []string {
+	var out []string
+	seen := map[string]bool{}
+	for _, m := range linkRE.FindAllString(cleanBody(p.Description)+"\n"+clean(p.Location), -1) {
+		m = capRunes(m, maxLinkRunes)
+		if !seen[m] {
+			seen[m] = true
+			out = append(out, m)
+		}
+		if len(out) == maxLinksShown {
+			break
+		}
+	}
+	return out
+}
+
+// eventDetails is everything the recipients will see beyond the title, as
+// plain sentences for the approval text and the preview notice: end, place,
+// Meet, a capped description and every link.
+func eventDetails(p *organise.EventPreview) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "Ends: %s. ", p.End.Format(time.RFC3339))
+	if p.Location != "" {
+		fmt.Fprintf(&b, "Location: %s. ", field(p.Location))
+	} else {
+		b.WriteString("Location: none. ")
+	}
+	fmt.Fprintf(&b, "Google Meet link: %s. ", map[bool]string{true: "yes", false: "no"}[p.Meet])
+	if p.Description != "" {
+		fmt.Fprintf(&b, "Description (first %d characters, sha256 %s): %s. ", approvalDescRunes, p.DescriptionSHA256(), capRunes(field(p.Description), approvalDescRunes))
+	} else {
+		b.WriteString("Description: none. ")
+	}
+	if links := eventLinks(p); len(links) > 0 {
+		b.WriteString("Links in this invitation: " + strings.Join(links, ", ") + ". ")
+	} else {
+		b.WriteString("Links in this invitation: none. ")
+	}
+	return b.String()
 }
 
 func addEventTools(s *mcp.Server, d writeDeps) {
@@ -146,19 +199,22 @@ type eventPreviewUntrusted struct {
 // previewEventOut puts who is invited first: the owner (and the client's
 // approval prompt) must see it before anything else.
 type previewEventOut struct {
-	Account       string    `json:"account"`
-	Invitations   string    `json:"invitations" jsonschema:"who Google will e-mail when the event is created"`
-	Attendees     string    `json:"attendees" jsonschema:"the attendee addresses, lowercase, comma-separated; restate as expect_attendees"`
-	AttendeeCount int       `json:"attendee_count" jsonschema:"restate as expect_attendee_count"`
-	Calendar      string    `json:"calendar" jsonschema:"restate as expect_calendar"`
-	Start         string    `json:"start" jsonschema:"RFC 3339 with the zone's offset; restate as expect_start"`
-	End           string    `json:"end"`
-	TimeZone      string    `json:"time_zone"`
-	AddMeetLink   bool      `json:"add_meet_link"`
-	Warnings      []string  `json:"warnings,omitempty"`
-	Notice        string    `json:"notice"`
-	PreviewToken  string    `json:"preview_token" jsonschema:"pass to create_event to create exactly this event"`
-	ExpiresAt     time.Time `json:"expires_at"`
+	Account           string    `json:"account"`
+	Invitations       string    `json:"invitations" jsonschema:"who Google will e-mail when the event is created"`
+	Attendees         string    `json:"attendees" jsonschema:"the attendee addresses, lowercase, comma-separated; restate as expect_attendees"`
+	AttendeeCount     int       `json:"attendee_count" jsonschema:"restate as expect_attendee_count"`
+	Calendar          string    `json:"calendar" jsonschema:"restate as expect_calendar"`
+	Start             string    `json:"start" jsonschema:"RFC 3339 with the zone's offset; restate as expect_start"`
+	End               string    `json:"end" jsonschema:"restate as expect_end"`
+	TimeZone          string    `json:"time_zone"`
+	AddMeetLink       bool      `json:"add_meet_link" jsonschema:"restate as expect_meet"`
+	Location          string    `json:"location" jsonschema:"restate as expect_location"`
+	DescriptionSHA256 string    `json:"description_sha256" jsonschema:"SHA-256 (hex) of the exact description, of the empty string when there is none; restate as expect_description_sha256"`
+	Links             []string  `json:"links" jsonschema:"every URL in the description and location"`
+	Warnings          []string  `json:"warnings,omitempty"`
+	Notice            string    `json:"notice"`
+	PreviewToken      string    `json:"preview_token" jsonschema:"pass to create_event to create exactly this event"`
+	ExpiresAt         time.Time `json:"expires_at"`
 
 	Untrusted eventPreviewUntrusted `json:"untrusted"`
 }
@@ -238,7 +294,8 @@ func addPreviewEvent(s *mcp.Server, d writeDeps) {
 		return nil, previewEventOut{
 			Account: a.Name, Invitations: inv, Attendees: p.AttendeesStr, AttendeeCount: len(atts), Calendar: field(cal),
 			Start: p.Start.Format(time.RFC3339), End: p.End.Format(time.RFC3339), TimeZone: p.TimeZone, AddMeetLink: p.Meet,
-			Warnings: warns, Notice: inv + ". " + eventNotice, PreviewToken: p.Token, ExpiresAt: p.Expires,
+			Location: field(loc), DescriptionSHA256: p.DescriptionSHA256(), Links: append([]string{}, eventLinks(p)...),
+			Warnings: warns, Notice: inv + ". " + eventDetails(p) + eventNotice, PreviewToken: p.Token, ExpiresAt: p.Expires,
 			Untrusted: eventPreviewUntrusted{
 				Title: field(title), Description: cleanBody(p.Description), Location: field(loc), Attendees: fieldAll(atts),
 			},
@@ -254,12 +311,16 @@ type createEventIn struct {
 	// The echo fields restate the preview, so the client's approval prompt,
 	// which shows a tool call's arguments, shows the owner what is about to be
 	// created and who will be invited, and not just an opaque token.
-	ExpectAccount       string `json:"expect_account" jsonschema:"the account, as the preview shows it"`
-	ExpectCalendar      string `json:"expect_calendar" jsonschema:"the calendar, as the preview shows it"`
-	ExpectStart         string `json:"expect_start" jsonschema:"the start, as the preview shows it"`
-	ExpectAttendees     string `json:"expect_attendees" jsonschema:"the attendees, as the preview's attendees field shows them (lowercase, comma-separated; empty for none)"`
-	ExpectAttendeeCount int    `json:"expect_attendee_count" jsonschema:"the number of attendees, as the preview shows it"`
-	ExpectTitle         string `json:"expect_title" jsonschema:"the title, as the preview shows it"`
+	ExpectAccount           string `json:"expect_account" jsonschema:"the account, as the preview shows it"`
+	ExpectCalendar          string `json:"expect_calendar" jsonschema:"the calendar, as the preview shows it"`
+	ExpectStart             string `json:"expect_start" jsonschema:"the start, as the preview shows it"`
+	ExpectAttendees         string `json:"expect_attendees" jsonschema:"the attendees, as the preview's attendees field shows them (lowercase, comma-separated; empty for none)"`
+	ExpectAttendeeCount     int    `json:"expect_attendee_count" jsonschema:"the number of attendees, as the preview shows it"`
+	ExpectTitle             string `json:"expect_title" jsonschema:"the title, as the preview shows it"`
+	ExpectEnd               string `json:"expect_end" jsonschema:"the end, as the preview shows it"`
+	ExpectLocation          string `json:"expect_location" jsonschema:"the location, as the preview shows it (empty for none)"`
+	ExpectMeet              bool   `json:"expect_meet" jsonschema:"whether a Google Meet link is created, as the preview's add_meet_link shows it"`
+	ExpectDescriptionSHA256 string `json:"expect_description_sha256" jsonschema:"the preview's description_sha256"`
 }
 
 type createEventOut struct {
@@ -276,10 +337,7 @@ type createEventOut struct {
 func eventQuestion(p *organise.EventPreview) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "Create a CALENDAR EVENT in account %s, calendar %s. %s.\n", field(p.Account), field(p.Calendar), inviteNotice(p.Attendees))
-	fmt.Fprintf(&b, "Title: %s\nWhen: %s to %s (%s)\n", field(p.Title), p.Start.Format(time.RFC3339), p.End.Format(time.RFC3339), field(p.TimeZone))
-	if p.Meet {
-		b.WriteString("With a Google Meet link.\n")
-	}
+	fmt.Fprintf(&b, "Title: %s\nStarts: %s (%s)\n%s\n", field(p.Title), p.Start.Format(time.RFC3339), field(p.TimeZone), eventDetails(p))
 	return b.String()
 }
 
@@ -301,6 +359,14 @@ func checkEventEcho(in createEventIn, p *organise.EventPreview) error {
 		return organise.SafeError("expect_attendee_count does not match the preview")
 	case field(in.ExpectTitle) != field(p.Title):
 		return organise.SafeError("expect_title does not match the preview")
+	case !echoEndMatches(in.ExpectEnd, p, zone):
+		return organise.SafeError("expect_end does not match the preview")
+	case in.ExpectLocation != p.Location:
+		return organise.SafeError("expect_location does not match the preview")
+	case in.ExpectMeet != p.Meet:
+		return organise.SafeError("expect_meet does not match the preview")
+	case !strings.EqualFold(strings.TrimSpace(in.ExpectDescriptionSHA256), p.DescriptionSHA256()):
+		return organise.SafeError("expect_description_sha256 does not match the preview")
 	}
 	return nil
 }
@@ -310,17 +376,22 @@ func echoStartMatches(s string, p *organise.EventPreview, zone *time.Location) b
 	return err == nil && t.Equal(p.Start)
 }
 
+func echoEndMatches(s string, p *organise.EventPreview, zone *time.Location) bool {
+	t, err := parseLocal("expect_end", s, zone)
+	return err == nil && t.Equal(p.End)
+}
+
 func addCreateEvent(s *mcp.Server, d writeDeps) {
 	mcp.AddTool(s, &mcp.Tool{
 		Name: "create_event",
 		Description: "Create a previewed event (from preview_event) in the Google Calendar, after the owner has read the event and " +
 			"its invitees and approved it. Google e-mails invitations to the attendees AT ONCE (sendUpdates=all); with " +
 			"add_meet_link a Google Meet link is created. It cannot be undone from here: there is no update or delete tool. " +
-			"Requires approved=true; restate account, calendar, start, attendees (lowercase, comma-separated), attendee count " +
-			"and title in the expect_* fields so the approval prompt shows them. Approval follows --approval-mode like " +
-			"create_draft; on the client's tool approval alone at most 10 events per account per hour. Recorded in the history " +
+			"Requires approved=true; restate account, calendar, start, end, attendees (lowercase, comma-separated), attendee count, " +
+			"title, location, the Meet flag and the description's sha256 in the expect_* fields so the approval prompt shows them. Approval follows --approval-mode like " +
+			"create_draft; on the client's tool approval alone at most 10 attendees per event and 20 invitees per account per rolling hour. Recorded in the history " +
 			"(without the description). Returns the event id, its web link and the Meet link. " + protonCalendarNote,
-		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: false, DestructiveHint: ptr(false), OpenWorldHint: ptr(true)},
+		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: false, OpenWorldHint: ptr(true)},
 	}, func(ctx context.Context, req *mcp.CallToolRequest, in createEventIn) (*mcp.CallToolResult, createEventOut, error) {
 		if !in.Approved {
 			return nil, createEventOut{}, errors.New("approved must be true, after the owner has seen the preview")
@@ -354,9 +425,13 @@ func addCreateEvent(s *mcp.Server, d writeDeps) {
 		approvedBy, pending, err := approveSpec(ctx, req, d, approvalSpec{
 			token: p.Token, key: d.org.QuestionKeyEvent(p), message: eventQuestion(p), title: "Create this event and send the invitations",
 			unelicited: func() error {
-				if !d.org.TakeUnelicitedEvent(p.Account) {
+				if len(p.Attendees) > organise.UnelicitedAttendeesPerEvent {
 					return organise.SafeError(fmt.Sprintf(
-						"more than %d events an hour cannot be created on the client's tool approval alone", organise.UnelicitedEventsPerHour))
+						"more than %d attendees cannot be invited on the client's tool approval alone", organise.UnelicitedAttendeesPerEvent))
+				}
+				if !d.org.TakeUnelicitedInvitees(p.Account, len(p.Attendees)) {
+					return organise.SafeError(fmt.Sprintf(
+						"more than %d invitees an hour cannot be invited on the client's tool approval alone", organise.UnelicitedInviteesPerHour))
 				}
 				return nil
 			},
@@ -384,13 +459,14 @@ func addCreateEvent(s *mcp.Server, d writeDeps) {
 		if cerr != nil {
 			safe, detail := c.Err(cerr)
 			slog.Warn("tool failed", "tool", "create_event", "account", a.Name, "err", detail)
-			if errors.Is(cerr, context.DeadlineExceeded) || errors.Is(cerr, context.Canceled) {
-				// Unknown whether Google created it (and sent invitations).
-				rec.Error = "calendar API did not answer in time; the event may or may not have been created"
+			if calendar.OutcomeUnknown(cerr) {
+				// Timeout, reset, EOF or 5xx: unknown whether Google created
+				// it (and sent invitations).
+				rec.Error = "calendar API gave no definite answer; the event may or may not have been created"
 				if _, herr := d.hist.Append(rec); herr != nil {
 					slog.Error("create_event: history write failed", "account", a.Name, "err", herr)
 				}
-				return nil, createEventOut{}, errors.New("the calendar API did not answer in time; the event may or may not have been created and invited: look in the calendar before trying again")
+				return nil, createEventOut{}, errors.New("the event may or may not have been created and invited — check the calendar before trying again (previewing the same event again cannot invite twice: Google refuses a duplicate)")
 			}
 			return nil, createEventOut{}, safe
 		}

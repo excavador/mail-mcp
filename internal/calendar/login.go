@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -28,7 +29,7 @@ func Login(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	idFile := fs.String("client-id-file", "", "file holding the OAuth client id")
 	secretFile := fs.String("client-secret-file", "", "file holding the OAuth client secret")
 	out := fs.String("out", "", "file to write the refresh token to (mode 0600)")
-	write := fs.Bool("write", false, "also ask for calendar.events (needed for preview_event / create_event); default: calendar.readonly only")
+	write := fs.Bool("write", false, "also ask for calendar.events.owned (needed for preview_event / create_event); default: calendar.readonly only")
 	timeout := fs.Duration("timeout", 5*time.Minute, "how long to wait for the browser")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -140,25 +141,87 @@ func login(ctx context.Context, conf *oauth2.Config, ln net.Listener, outPath st
 		}
 		return errors.New("token exchange failed")
 	}
+	granted := strings.Fields(fmt.Sprint(tok.Extra("scope")))
+	for _, want := range conf.Scopes {
+		found := false
+		for _, g := range granted {
+			found = found || g == want
+		}
+		if !found {
+			return fmt.Errorf("Google did not grant the scope %s (granted: %s); nothing was saved. Approve every requested permission and run again", want, sanitizeScopes(granted))
+		}
+	}
 	if tok.RefreshToken == "" {
 		return errors.New("Google returned no refresh token; remove this app's access at myaccount.google.com/permissions and run again")
 	}
-	f, err := os.OpenFile(outPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
-	if err != nil {
-		return errors.New("cannot write --out")
+	if err := writeTokenFile(outPath, tok.RefreshToken+"\n"); err != nil {
+		return err
 	}
+	fmt.Fprintln(stdout, "saved")
+	return nil
+}
+
+func sanitizeScopes(g []string) string {
+	if len(g) == 0 {
+		return "none reported"
+	}
+	return sanitizeURLs(strings.Join(g, " "))
+}
+
+func sanitizeURLs(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		if r > ' ' && r < 0x7f {
+			b.WriteRune(r)
+		} else if r == ' ' {
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}
+
+// writeTokenFile replaces outPath atomically: the token goes to an O_EXCL
+// 0600 temporary file beside it, is fsynced, and is renamed over outPath.
+// A symlink at outPath is refused, so the token cannot be steered elsewhere.
+func writeTokenFile(outPath, content string) error {
+	if fi, err := os.Lstat(outPath); err == nil && fi.Mode()&os.ModeSymlink != 0 {
+		return errors.New("--out is a symbolic link; refusing to write through it")
+	}
+	dir := filepath.Dir(outPath)
+	rnd, err := randHex(8)
+	if err != nil {
+		return err
+	}
+	tmp := filepath.Join(dir, "."+filepath.Base(outPath)+".tmp-"+rnd)
+	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return errors.New("cannot create a temporary file beside --out")
+	}
+	ok := false
+	defer func() {
+		if !ok {
+			_ = os.Remove(tmp)
+		}
+	}()
 	if err := f.Chmod(0o600); err != nil {
 		_ = f.Close()
-		return errors.New("cannot set --out to mode 0600")
+		return errors.New("cannot set the file to mode 0600")
 	}
-	if _, err := f.WriteString(tok.RefreshToken + "\n"); err != nil {
+	if _, err := f.WriteString(content); err != nil {
+		_ = f.Close()
+		return errors.New("cannot write --out")
+	}
+	if err := f.Sync(); err != nil {
 		_ = f.Close()
 		return errors.New("cannot write --out")
 	}
 	if err := f.Close(); err != nil {
 		return errors.New("cannot write --out")
 	}
-	fmt.Fprintln(stdout, "saved")
+	if err := os.Rename(tmp, outPath); err != nil {
+		return errors.New("cannot replace --out")
+	}
+	ok = true
 	return nil
 }
 
