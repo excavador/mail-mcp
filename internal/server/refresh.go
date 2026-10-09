@@ -148,7 +148,6 @@ func addRefreshCache(s *mcp.Server, accts []accounts.Account, store *cache.Cache
 	})
 }
 
-
 func derefInt(p *int) int {
 	if p == nil {
 		return 0
