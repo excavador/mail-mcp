@@ -677,3 +677,56 @@ func TestDraftIsMultipartAlternativeAndAppendedAsPreviewed(t *testing.T) {
 		t.Errorf("parts = %v", types)
 	}
 }
+
+func TestListDraftThreadedAndPlainTextThroughTheTool(t *testing.T) {
+	e, _ := draftEnv(t)
+	cs := e.admin()
+	args := newDraftArgs()
+	args["subject"] = "Re: [PATCH v2] arm64: dts: rockchip: x"
+	args["body"] = "Tested-by data.\n"
+	args["in_reply_to"] = "<20250819075522.2238643-1-tobetter@gmail.com>"
+	args["references"] = []string{"<root@lists.test>"}
+	args["plain_text_only"] = true
+	p := e.previewDraft(t, cs, args)
+
+	for _, want := range []string{
+		"In-Reply-To: <20250819075522.2238643-1-tobetter@gmail.com>",
+		"References: <root@lists.test> <20250819075522.2238643-1-tobetter@gmail.com>",
+		"Content-Type: text/plain; charset=utf-8",
+	} {
+		if !strings.Contains(p.Untrusted.Message, want) {
+			t.Errorf("preview lacks %q:\n%s", want, p.Untrusted.Message)
+		}
+	}
+	for _, bad := range []string{"text/html", "multipart"} {
+		if strings.Contains(p.Untrusted.Message, bad) {
+			t.Errorf("preview contains %q:\n%s", bad, p.Untrusted.Message)
+		}
+	}
+	ok[draftOutT](t, cs, "create_draft", createArgs(p))
+	_, raws := e.draftsOnServer("[Gmail]/Drafts")
+	if len(raws) != 1 || !sameMessage(raws[0], p.Untrusted.Message) {
+		t.Fatalf("saved drafts = %d, or the saved message differs from the preview", len(raws))
+	}
+}
+
+func TestListDraftThreadingRefusals(t *testing.T) {
+	e, id := draftEnv(t)
+	cs := e.admin()
+	for name, c := range map[string]struct {
+		extra map[string]any
+		want  string
+	}{
+		"in_reply_to with reply_to": {map[string]any{"reply_to": id, "in_reply_to": "<p@x.test>"}, "cannot be used together with reply_to"},
+		"bad in_reply_to":           {map[string]any{"in_reply_to": "<a@x.test>\r\nBcc: e@evil.test"}, "in_reply_to is not one Message-ID"},
+		"references alone":          {map[string]any{"references": []string{"<a@x.test>"}}, "references needs in_reply_to"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			args := newDraftArgs()
+			for k, v := range c.extra {
+				args[k] = v
+			}
+			requireToolError(t, cs, "preview_draft", args, c.want)
+		})
+	}
+}

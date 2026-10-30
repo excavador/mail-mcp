@@ -73,6 +73,17 @@ type Input struct {
 	// QuoteOriginal appends "On <date>, <from> wrote:" and the quoted text.
 	QuoteOriginal bool
 
+	// InReplyTo and References thread a new message under one that is not in
+	// the cache (a mailing-list post known only by its Message-ID). Each id is
+	// one "<...>" token. They are refused together with Original: a reply to a
+	// cached message takes its thread from that message.
+	InReplyTo  string
+	References []string
+	// PlainTextOnly sends text/plain only, without the HTML part. Mailing
+	// lists reject HTML, and a client that offers a "plain text" switch does
+	// not always honour it.
+	PlainTextOnly bool
+
 	// To, Cc and Bcc are addresses ("a@b" or "Name <a@b>"). For a reply, a
 	// non-empty To replaces the computed To; Cc and Bcc are added to it.
 	To, Cc, Bcc []string
@@ -286,6 +297,41 @@ var msgIDTokenRE = regexp.MustCompile(`^<[!-;=?-~]+>$`)
 
 func validMsgID(t string) bool { return len(t) <= maxIDLen && msgIDTokenRE.MatchString(t) }
 
+// explicitThread checks the in_reply_to and references the caller typed (not
+// taken from a cached message) and returns the In-Reply-To id and the
+// References chain: the given ids, deduplicated, ending with the parent, the
+// first and the most recent maxReferences-1 kept. Nothing from the caller's
+// text is echoed back in a refusal.
+func explicitThread(inReplyTo string, references []string) (string, []string, error) {
+	irt := strings.TrimSpace(inReplyTo)
+	if irt == "" {
+		return "", nil, refusef("references needs in_reply_to")
+	}
+	if !validMsgID(irt) {
+		return "", nil, refusef("in_reply_to is not one Message-ID in angle brackets")
+	}
+	if len(references) > maxReferences {
+		return "", nil, refusef("%d references; the most is %d", len(references), maxReferences)
+	}
+	seen := map[string]bool{}
+	var refs []string
+	for _, r := range references {
+		r = strings.TrimSpace(r)
+		if !validMsgID(r) {
+			return "", nil, refusef("references holds something that is not one Message-ID in angle brackets")
+		}
+		if r != irt && !seen[r] {
+			seen[r] = true
+			refs = append(refs, r)
+		}
+	}
+	refs = append(refs, irt) // the parent ends the chain
+	if len(refs) > maxReferences {
+		refs = append([]string{refs[0]}, refs[len(refs)-(maxReferences-1):]...)
+	}
+	return irt, refs, nil
+}
+
 // threadHeaders builds In-Reply-To and References from the original's
 // Message-ID and References: the original's chain plus the original, without
 // duplicates, the first and the most recent maxReferences-1 kept.
@@ -449,6 +495,19 @@ func Compose(in Input) (*Message, error) {
 		return nil, refusef("body is empty")
 	}
 
+	// Explicit threading, for a message that is not a reply to a cached one.
+	var threadIRT string
+	var threadRefs []string
+	if in.InReplyTo != "" || len(in.References) > 0 {
+		if in.Original != nil {
+			return nil, refusef("in_reply_to and references cannot be used together with reply_to")
+		}
+		var err error
+		if threadIRT, threadRefs, err = explicitThread(in.InReplyTo, in.References); err != nil {
+			return nil, err
+		}
+	}
+
 	// Recipients.
 	redirect := false
 	to, err := parseAll("to", in.To)
@@ -577,10 +636,18 @@ func Compose(in Input) (*Message, error) {
 			m.InReplyTo = irt
 			steps = append(steps, struct{ n, v string }{"In-Reply-To", irt}, struct{ n, v string }{"References", strings.Join(refs, " ")})
 		}
+	} else if threadIRT != "" {
+		m.InReplyTo = threadIRT
+		steps = append(steps, struct{ n, v string }{"In-Reply-To", threadIRT}, struct{ n, v string }{"References", strings.Join(threadRefs, " ")})
 	}
-	steps = append(steps,
-		struct{ n, v string }{"MIME-Version", "1.0"},
-		struct{ n, v string }{"Content-Type", `multipart/alternative; boundary="` + boundary + `"`})
+	steps = append(steps, struct{ n, v string }{"MIME-Version", "1.0"})
+	if in.PlainTextOnly {
+		steps = append(steps,
+			struct{ n, v string }{"Content-Type", "text/plain; charset=utf-8"},
+			struct{ n, v string }{"Content-Transfer-Encoding", "quoted-printable"})
+	} else {
+		steps = append(steps, struct{ n, v string }{"Content-Type", `multipart/alternative; boundary="` + boundary + `"`})
+	}
 	for _, s := range steps {
 		if err := hdr(s.n, s.v); err != nil {
 			return nil, err
@@ -595,6 +662,11 @@ func Compose(in Input) (*Message, error) {
 	plainQP, err := encodeQP(text)
 	if err != nil {
 		return nil, err
+	}
+	if in.PlainTextOnly {
+		b.WriteString(plainQP)
+		m.Raw = []byte(b.String())
+		return m, nil
 	}
 	htmlQP, err := encodeQP(renderHTML(in.Body, q))
 	if err != nil {

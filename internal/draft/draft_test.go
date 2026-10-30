@@ -578,3 +578,169 @@ func TestReplyToRedirectAndBareAddresses(t *testing.T) {
 		t.Error("explicit To flagged as redirect")
 	}
 }
+
+// --- explicit threading and plain text only (a list post that is not cached) --
+
+func listInput() Input {
+	return Input{
+		To: []string{"Dongjin Kim <tobetter@gmail.com>"}, Subject: "Re: [PATCH v2] arm64: dts: rockchip: x",
+		Body: "Tested on a second board.\n", From: "me@example.com",
+	}
+}
+
+func TestExplicitThreadingHeaders(t *testing.T) {
+	in := listInput()
+	in.InReplyTo = "<20250819075522.2238643-1-tobetter@gmail.com>"
+	in.References = []string{"<root@lists.test>", "<mid@lists.test>"}
+	m := compose(t, in)
+	p := parse(t, m.Raw)
+	if got := p.msg.Header.Get("In-Reply-To"); got != in.InReplyTo {
+		t.Errorf("In-Reply-To = %q", got)
+	}
+	want := "<root@lists.test> <mid@lists.test> " + in.InReplyTo
+	if got := strings.Join(strings.Fields(p.msg.Header.Get("References")), " "); got != want {
+		t.Errorf("References = %q, want %q", got, want)
+	}
+	if m.InReplyTo != in.InReplyTo {
+		t.Errorf("Message.InReplyTo = %q", m.InReplyTo)
+	}
+}
+
+func TestExplicitThreadingReferencesDefaultToTheParent(t *testing.T) {
+	in := listInput()
+	in.InReplyTo = "<p@lists.test>"
+	p := parse(t, compose(t, in).Raw)
+	if got := strings.TrimSpace(p.msg.Header.Get("References")); got != "<p@lists.test>" {
+		t.Errorf("References = %q", got)
+	}
+}
+
+func TestExplicitThreadingDedupesAndCaps(t *testing.T) {
+	in := listInput()
+	in.InReplyTo = "<p@lists.test>"
+	// The parent given inside references and a repeated id each appear once, the parent last.
+	in.References = []string{"<a@lists.test>", "<p@lists.test>", "<a@lists.test>", "<b@lists.test>"}
+	p := parse(t, compose(t, in).Raw)
+	if got, want := strings.Join(strings.Fields(p.msg.Header.Get("References")), " "), "<a@lists.test> <b@lists.test> <p@lists.test>"; got != want {
+		t.Errorf("References = %q, want %q", got, want)
+	}
+	// maxReferences ids plus the parent: the first and the most recent are kept.
+	in.References = nil
+	for i := range maxReferences {
+		in.References = append(in.References, "<r"+string(rune('a'+i))+"@lists.test>")
+	}
+	got := strings.Fields(parse(t, compose(t, in).Raw).msg.Header.Get("References"))
+	if len(got) != maxReferences || got[0] != "<ra@lists.test>" || got[len(got)-1] != "<p@lists.test>" {
+		t.Errorf("References = %v", got)
+	}
+}
+
+func TestExplicitThreadingRefusals(t *testing.T) {
+	long := "<" + strings.Repeat("a", maxIDLen) + "@x.test>"
+	var many []string
+	for i := range maxReferences + 1 {
+		many = append(many, "<r"+string(rune('a'+i))+"@lists.test>")
+	}
+	for name, c := range map[string]struct {
+		mutate func(*Input)
+		want   string
+	}{
+		"references without in_reply_to": {func(in *Input) { in.References = []string{"<a@x.test>"} }, "references needs in_reply_to"},
+		"two ids in in_reply_to":         {func(in *Input) { in.InReplyTo = "<a@x.test> <b@x.test>" }, "in_reply_to is not one Message-ID"},
+		"CRLF injection in in_reply_to":  {func(in *Input) { in.InReplyTo = "<a@x.test>\r\nBcc: evil@x.test" }, "in_reply_to is not one Message-ID"},
+		"no angle brackets":              {func(in *Input) { in.InReplyTo = "a@x.test" }, "in_reply_to is not one Message-ID"},
+		"empty angle brackets":           {func(in *Input) { in.InReplyTo = "<>" }, "in_reply_to is not one Message-ID"},
+		"overlong id":                    {func(in *Input) { in.InReplyTo = long }, "in_reply_to is not one Message-ID"},
+		"bad id in references": {func(in *Input) {
+			in.InReplyTo = "<p@x.test>"
+			in.References = []string{"<ok@x.test>", "<bad id@x.test>"}
+		}, "references holds something"},
+		"CRLF injection in references": {func(in *Input) {
+			in.InReplyTo = "<p@x.test>"
+			in.References = []string{"<a@x.test>\r\nBcc: evil@x.test"}
+		}, "references holds something"},
+		"too many references": {func(in *Input) { in.InReplyTo = "<p@x.test>"; in.References = many }, "references; the most is"},
+		"together with a reply": {func(in *Input) {
+			in.Original = orig()
+			in.InReplyTo = "<p@x.test>"
+		}, "cannot be used together with reply_to"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			in := listInput()
+			c.mutate(&in)
+			refused(t, in, c.want)
+		})
+	}
+}
+
+func TestExplicitThreadingRefusalDoesNotEchoTheInput(t *testing.T) {
+	in := listInput()
+	in.InReplyTo = "<secret-token-123 evil>"
+	in.Account, in.Now, in.Rand = acct(), now, fixedRand()
+	_, err := Compose(in)
+	if err == nil || strings.Contains(err.Error(), "secret-token-123") {
+		t.Errorf("error = %v", err)
+	}
+}
+
+// plainOnly decodes a text/plain-only draft.
+func plainOnly(t *testing.T, raw []byte) (*mail.Message, string) {
+	t.Helper()
+	msg, err := mail.ReadMessage(bytes.NewReader(raw))
+	if err != nil {
+		t.Fatalf("ReadMessage: %v", err)
+	}
+	ct, params, err := mime.ParseMediaType(msg.Header.Get("Content-Type"))
+	if err != nil || ct != "text/plain" || !strings.EqualFold(params["charset"], "utf-8") {
+		t.Fatalf("Content-Type = %q (%v), want text/plain; charset=utf-8", msg.Header.Get("Content-Type"), err)
+	}
+	if got := msg.Header.Get("Content-Transfer-Encoding"); !strings.EqualFold(got, "quoted-printable") {
+		t.Errorf("Content-Transfer-Encoding = %q", got)
+	}
+	dec, err := io.ReadAll(quotedprintable.NewReader(msg.Body))
+	if err != nil {
+		t.Fatalf("body is not quoted-printable: %v", err)
+	}
+	return msg, strings.ReplaceAll(string(dec), "\r\n", "\n")
+}
+
+func TestPlainTextOnlyHasNoHTMLPart(t *testing.T) {
+	in := listInput()
+	in.Body = "Line one with a long unbroken tail " + strings.Repeat("x", 120) + "\nSecond line ü\n"
+	in.PlainTextOnly = true
+	m := compose(t, in)
+	raw := string(m.Raw)
+	for _, bad := range []string{"text/html", "multipart", "boundary", "<html", "<div"} {
+		if strings.Contains(raw, bad) {
+			t.Errorf("plain-text-only draft contains %q", bad)
+		}
+	}
+	msg, body := plainOnly(t, m.Raw)
+	if body != in.Body {
+		t.Errorf("body = %q, want %q", body, in.Body)
+	}
+	if got := msg.Header.Get("MIME-Version"); got != "1.0" {
+		t.Errorf("MIME-Version = %q", got)
+	}
+	if m.Body != in.Body {
+		t.Errorf("Message.Body = %q", m.Body)
+	}
+}
+
+func TestPlainTextOnlyKeepsTheQuoteAndThreadingOfAReply(t *testing.T) {
+	m := compose(t, Input{Original: orig(), QuoteOriginal: true, Body: "Yes.\n", PlainTextOnly: true})
+	msg, body := plainOnly(t, m.Raw)
+	if !strings.Contains(body, "wrote:") || !strings.Contains(body, "> Shall we?") {
+		t.Errorf("body lacks the quote:\n%s", body)
+	}
+	if got := msg.Header.Get("In-Reply-To"); got != "<m3@x.test>" {
+		t.Errorf("In-Reply-To = %q", got)
+	}
+}
+
+func TestDefaultDraftStillCarriesTheHTMLPart(t *testing.T) {
+	p := parse(t, compose(t, listInput()).Raw)
+	if p.htm == "" {
+		t.Error("default draft has no HTML part")
+	}
+}

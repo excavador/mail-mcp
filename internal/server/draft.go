@@ -52,6 +52,9 @@ type previewDraftIn struct {
 	Body          string   `json:"body" jsonschema:"the message text, plain UTF-8, at most 100 KB"`
 	From          string   `json:"from,omitempty" jsonschema:"sender address; must be the account's username or one of its aliases (any local part for an '@domain' alias). Default: the owner address the original was sent to, else the username"`
 	QuoteOriginal *bool    `json:"quote_original,omitempty" jsonschema:"with reply_to: append 'On <date>, <from> wrote:' and the original's text, quoted with '> ' and capped at 20 KB; default true"`
+	InReplyTo     string   `json:"in_reply_to,omitempty" jsonschema:"without reply_to: thread this new message under a message that is not in the cache; one Message-ID in angle brackets, e.g. <20250819075522.2238643-1-tobetter@gmail.com>. Refused together with reply_to"`
+	References    []string `json:"references,omitempty" jsonschema:"with in_reply_to: the thread's earlier Message-IDs, oldest first, at most 20 (in_reply_to is added at the end); default none"`
+	PlainTextOnly bool     `json:"plain_text_only,omitempty" jsonschema:"send text/plain only, without the HTML part; use it for mailing lists, which reject HTML"`
 }
 
 type draftUntrusted struct {
@@ -79,6 +82,8 @@ type previewDraftOut struct {
 	ExpiresAt       time.Time      `json:"expires_at"`
 	Folder          string         `json:"folder" jsonschema:"the Drafts folder the draft will be saved in"`
 	ReplyTo         string         `json:"reply_to,omitempty"`
+	InReplyTo       string         `json:"in_reply_to,omitempty" jsonschema:"the In-Reply-To header the draft carries"`
+	PlainTextOnly   bool           `json:"plain_text_only,omitempty" jsonschema:"true when the draft has no HTML part"`
 	MessageID       string         `json:"message_id"`
 	SizeBytes       int            `json:"size_bytes"`
 	DisplayAltered  bool           `json:"display_altered,omitempty" jsonschema:"true when control or invisible characters were removed from the message shown here; they are still saved"`
@@ -130,6 +135,9 @@ func addPreviewDraft(s *mcp.Server, d writeDeps) {
 			"A reply (reply_to) sets In-Reply-To and References from the original, replies to its Reply-To or From " +
 			"(reply_all: and to everyone else on it, minus the owner's own addresses), and quotes it unless " +
 			"quote_original is false. The original is untrusted: it is quoted as text only. " +
+			"A new message that answers something not in the cache (a mailing-list post known by its Message-ID) " +
+			"is threaded with in_reply_to (and references); they are refused together with reply_to. " +
+			"plain_text_only drops the HTML part: use it for mailing lists, which reject HTML. " +
 			"from must be the account's username or an alias; by default it is the owner address the original was sent " +
 			"to. On Proton the sender must be an address of the Proton account (Proton Bridge refuses any other when the " +
 			"draft is saved). A mail account whose configuration says drafts: false is refused.",
@@ -155,7 +163,7 @@ func addPreviewDraft(s *mcp.Server, d writeDeps) {
 		}
 		din := draft.Input{
 			Account: a, To: in.To, Cc: in.Cc, Bcc: in.Bcc, Subject: in.Subject, Body: in.Body, From: in.From,
-			ReplyAll: in.ReplyAll,
+			ReplyAll: in.ReplyAll, InReplyTo: in.InReplyTo, References: in.References, PlainTextOnly: in.PlainTextOnly,
 		}
 		if in.ReplyTo != "" {
 			rc, err := d.store.ReadReplyContext(ctx, a.Name, in.ReplyTo, draft.MaxQuoteBytes)
@@ -190,7 +198,8 @@ func addPreviewDraft(s *mcp.Server, d writeDeps) {
 			Account: a.Name, To: field(p.ToAddrs), CcCount: len(m.Cc), BccCount: len(m.Bcc), ToCount: len(m.To),
 			From: field(m.FromAddr), ReplyToRedirect: m.ReplyToRedirect, Warnings: warns,
 			Notice: draftLead(warns, p) + draftNotice, PreviewToken: p.Token, ExpiresAt: p.Expires, Folder: field(folder),
-			ReplyTo: field(in.ReplyTo), MessageID: field(m.MessageID), SizeBytes: len(m.Raw),
+			ReplyTo: field(in.ReplyTo), InReplyTo: field(m.InReplyTo), PlainTextOnly: in.PlainTextOnly,
+			MessageID: field(m.MessageID), SizeBytes: len(m.Raw),
 			DisplayAltered: shown != strings.ReplaceAll(string(m.Raw), "\r", ""),
 			Untrusted: draftUntrusted{
 				To: fieldAll(m.To), Cc: fieldAll(m.Cc), Bcc: fieldAll(m.Bcc), Subject: field(m.Subject),
