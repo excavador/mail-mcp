@@ -67,16 +67,14 @@ spec:
             # stdio would exit immediately in a pod with no attached client.
             - name: TRANSPORT
               value: http
+            # Loopback only, and no container port for it: the two proxy
+            # containers below are the pod's only MCP ports. The server
+            # checks no token and refuses a non-loopback ADDR at start.
             - name: ADDR
-              value: "0.0.0.0:{{ .Values.service.port }}"
-            - name: ISSUER_URL
-              value: {{ .Values.auth.issuerUrl | quote }}
-            - name: READ_RESOURCE_URL
-              value: {{ .Values.auth.readResourceUrl | quote }}
-            - name: ADMIN_RESOURCE_URL
-              value: {{ .Values.auth.adminResourceUrl | quote }}
-            - name: SCOPE
-              value: {{ .Values.auth.scope | quote }}
+              value: {{ include "mail-mcp.mcpListen" . | quote }}
+            # /healthz only, for the kubelet; nothing of MCP.
+            - name: OPS_ADDR
+              value: {{ printf ":%s" (include "mail-mcp.opsPort" .) | quote }}
             - name: APPROVAL_MODE
               value: {{ .Values.approval.mode | default "client" | quote }}
             # Mount roots are owned by root and ignored by fsGroup. Point to
@@ -99,27 +97,28 @@ spec:
               sleep:
                 seconds: 5
           ports:
-            - name: http
-              containerPort: {{ .Values.service.port }}
+            - name: ops
+              containerPort: {{ include "mail-mcp.opsPort" . }}
               protocol: TCP
-          # /healthz is liveness and readiness, independent of leadership (a new
-          # pod is Ready while the old one still leads), and does NOT call
-          # external services:
-          # a readiness probe that fails when a dependency blips would take
-          # the pod out of service for something it cannot fix by restarting.
+          # /healthz on the ops port is liveness and readiness, independent of
+          # leadership (a new pod is Ready while the old one still leads), and
+          # does NOT call external services: a readiness probe that fails when
+          # a dependency blips would take the pod out of service for something
+          # it cannot fix by restarting. (The proxies' readiness, below, does
+          # depend on the issuer, on purpose.)
           # Open can run one-time work before the server listens (the drop of the
           # retired message_fts table, backfill init). Liveness only starts once
           # this passes: up to 10s x 30 = 300s for a first start.
           startupProbe:
-            httpGet: {path: /healthz, port: http}
+            httpGet: {path: /healthz, port: ops}
             periodSeconds: 10
             failureThreshold: 30
           livenessProbe:
-            httpGet: {path: /healthz, port: http}
+            httpGet: {path: /healthz, port: ops}
             initialDelaySeconds: 5
             periodSeconds: 20
           readinessProbe:
-            httpGet: {path: /healthz, port: http}
+            httpGet: {path: /healthz, port: ops}
             initialDelaySeconds: 3
             periodSeconds: 10
           resources: {{- toYaml .Values.resources | nindent 12 }}
@@ -142,6 +141,15 @@ spec:
             - name: pdftext-stage
               mountPath: /var/lib/mail-mcp/pdf-stage
             {{- end }}
+        # The resource-proxy sidecars, one per resource (a proxy handles
+        # exactly one): the pod's only MCP ports. Each checks the bearer token
+        # (signature, `iss`, and `aud` equal to its own resource URL), serves
+        # the RFC 9728 metadata, writes the audit line, strips the caller's
+        # Authorization header and forwards its prefix to the server on
+        # loopback. A token for one resource fails the other's `aud` check, so
+        # the read token never reaches /mcp-admin.
+        {{- include "mail-mcp.proxyContainer" (dict "root" . "name" "proxy-read" "port" (include "mail-mcp.readProxyPort" .) "portName" "http" "url" .Values.auth.readResourceUrl "upstream" "/mcp") | nindent 8 }}
+        {{- include "mail-mcp.proxyContainer" (dict "root" . "name" "proxy-admin" "port" (include "mail-mcp.adminProxyPort" .) "portName" "admin" "url" .Values.auth.adminResourceUrl "upstream" "/mcp-admin") | nindent 8 }}
         {{- if .Values.pdfExtractor.enabled }}
         # PDF text extraction runs here, not in mail-mcp: poppler parses
         # untrusted files, so it gets its own container with no network use,

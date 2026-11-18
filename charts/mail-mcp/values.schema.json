@@ -8,7 +8,8 @@
     "image",
     "accounts",
     "service",
-    "auth"
+    "auth",
+    "proxy"
   ],
   "properties": {
     "nameOverride": {
@@ -71,7 +72,8 @@
       "additionalProperties": false,
       "required": [
         "type",
-        "port"
+        "port",
+        "adminPort"
       ],
       "properties": {
         "type": {
@@ -84,7 +86,14 @@
         "port": {
           "type": "integer",
           "minimum": 1,
-          "maximum": 65535
+          "maximum": 65535,
+          "description": "The Service port of the read proxy (container port 8080)."
+        },
+        "adminPort": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65535,
+          "description": "The Service port of the admin proxy (container port 8082). Must differ from port."
         }
       }
     },
@@ -100,21 +109,24 @@
         "issuerUrl": {
           "type": "string",
           "minLength": 1,
-          "description": "access-roster's own URL, exactly as it appears in a token's `iss`."
+          "pattern": "^https://[^#\\s]+$",
+          "description": "The issuer's own URL, exactly as it appears in a token's `iss`. https, no fragment."
         },
         "readResourceUrl": {
           "type": "string",
           "minLength": 1,
-          "description": "This server's read endpoint EXTERNAL URL: the RFC 8707 resource indicator a client names, and the audience access-roster mints for it. Must match this resource's id in access-roster's policy, byte for byte."
+          "pattern": "^$|^https://[^/?#\\s]+/[^?#\\s]*[^/?#\\s]$",
+          "description": "The read endpoint's EXTERNAL URL: the RFC 8707 resource indicator, and the `aud` the read proxy requires. Must match this resource's id in the issuer's policy and the public URL, byte for byte. https, a path, no trailing slash."
         },
         "adminResourceUrl": {
           "type": "string",
           "minLength": 1,
-          "description": "This server's admin endpoint EXTERNAL URL: must be different from readResourceUrl."
+          "pattern": "^$|^https://[^/?#\\s]+/[^?#\\s]*[^/?#\\s]$",
+          "description": "The admin endpoint's EXTERNAL URL, the same way. Must differ from readResourceUrl; neither path inside the other."
         },
         "scope": {
           "type": "string",
-          "description": "Advertised in the PRM's scopes_supported and the 401 challenge's scope; never checked by this server. Empty omits both fields rather than advertising an empty list."
+          "description": "Advertised in the PRM's scopes_supported and the 401 challenge's scope; never checked. Empty omits both fields."
         }
       }
     },
@@ -244,6 +256,135 @@
       "description": "Annotations on the Deployment itself. Reloader reads them here, not on the pod template.",
       "additionalProperties": {
         "type": "string"
+      }
+    },
+    "proxy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "image"
+      ],
+      "description": "The sluis resource-proxy sidecars: two containers (read, admin) from one image.",
+      "properties": {
+        "image": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "repository"
+          ],
+          "properties": {
+            "repository": {
+              "type": "string",
+              "minLength": 1
+            },
+            "tag": {
+              "type": "string",
+              "description": "REQUIRED (the chart refuses an empty one): the chart has no default version of a sidecar built elsewhere."
+            },
+            "digest": {
+              "type": "string",
+              "pattern": "^(sha256:[0-9a-f]{64})?$",
+              "description": "REQUIRED (the chart refuses an empty one): sha256:<64 hex>."
+            },
+            "pullPolicy": {
+              "enum": [
+                "Always",
+                "IfNotPresent",
+                "Never"
+              ]
+            }
+          }
+        },
+        "runAsUser": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "resources": {
+          "type": "object"
+        }
+      }
+    },
+    "networkPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "ingressFrom": {
+          "type": "array",
+          "description": "NetworkPolicyPeer list admitted on the proxies' ports. Required non-empty while enabled."
+        },
+        "egress": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "dns": {
+              "type": "array"
+            },
+            "https": {
+              "type": "array"
+            },
+            "imap": {
+              "type": "array",
+              "description": "IMAP upstreams, verbatim NetworkPolicyEgressRule list."
+            }
+          }
+        },
+        "extraEgress": {
+          "type": "array",
+          "description": "Verbatim NetworkPolicyEgressRule list: an in-cluster IMAP bridge, the Kubernetes API server for the Lease."
+        }
+      }
+    },
+    "httpRoute": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "name": {
+          "type": "string"
+        },
+        "parentRefs": {
+          "type": "array"
+        },
+        "hostnames": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "annotations": {
+          "type": "object"
+        },
+        "labels": {
+          "type": "object"
+        },
+        "timeouts": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "request": {
+              "type": "string",
+              "pattern": "^([0-9]+(h|m|s|ms))*$"
+            }
+          }
+        },
+        "sessionAffinity": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            },
+            "headerName": {
+              "type": "string",
+              "minLength": 1
+            }
+          }
+        }
       }
     }
   }

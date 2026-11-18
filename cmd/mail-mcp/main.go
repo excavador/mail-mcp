@@ -26,7 +26,6 @@ import (
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
-	"github.com/truvity/sluis/identity/resource"
 	"github.com/urfave/cli/v3"
 
 	"github.com/excavador/mail-mcp/internal/accounts"
@@ -88,38 +87,29 @@ func main() {
 			},
 			&cli.StringFlag{
 				Name: "addr",
-				// 0.0.0.0, not 127.0.0.1: in a pod, loopback means nothing
-				// can reach it, including the readiness probe.
-				Usage:   "listen address for the http transport",
-				Value:   "0.0.0.0:8080",
+				// Loopback only: the resource-proxy sidecars in the same pod are
+				// the sole way in. Anything else is refused at start unless
+				// --allow-non-loopback is given.
+				Usage:   "MCP listen address for the http transport; must be a loopback address",
+				Value:   "127.0.0.1:8081",
 				Sources: cli.EnvVars("ADDR"),
 			},
-			&cli.StringFlag{
-				Name:    "issuer-url",
-				Usage:   "issuer that mints tokens for both resources (http transport only)",
-				Sources: cli.EnvVars("ISSUER_URL"),
+			&cli.BoolFlag{
+				Name: "allow-non-loopback",
+				// This server checks no token. A non-loopback --addr is
+				// reachable by whatever can route to it, with no authentication.
+				// Only for a setup where something else authenticates every
+				// request and is the only way in.
+				Usage:   "allow a non-loopback --addr; the server checks no token, so only with an authenticating proxy as the only way in",
+				Sources: cli.EnvVars("ALLOW_NON_LOOPBACK"),
 			},
 			&cli.StringFlag{
-				Name: "read-resource-url",
-				// The RFC 8707 resource indicator for the read endpoint: this
-				// server's externally reachable URL for /mcp, which is also the
-				// audience the issuer mints for it.
-				Usage:   "external URL of the read endpoint (http transport only)",
-				Sources: cli.EnvVars("READ_RESOURCE_URL"),
-			},
-			&cli.StringFlag{
-				Name:    "admin-resource-url",
-				Usage:   "external URL of the admin endpoint (http transport only)",
-				Sources: cli.EnvVars("ADMIN_RESOURCE_URL"),
-			},
-			&cli.StringFlag{
-				Name: "scope",
-				// sluis rejects an authorize request that carries no scope at
-				// all; "openid" is the one it accepts out of the box. Never
-				// checked here -- see resource.Config.Scope.
-				Usage:   "OAuth scope advertised in the PRM and the 401 challenge (http transport only)",
-				Value:   "openid",
-				Sources: cli.EnvVars("SCOPE"),
+				Name: "ops-addr",
+				// Serves /healthz and nothing of MCP, for the kubelet. Empty
+				// turns it off.
+				Usage:   "listen address of the ops listener (/healthz only); empty disables it",
+				Value:   ":9090",
+				Sources: cli.EnvVars("OPS_ADDR"),
 			},
 			&cli.StringFlag{
 				Name: "cache-dir",
@@ -364,76 +354,73 @@ func run(ctx context.Context, cmd *cli.Command) error {
 		return server.New(accts, store, version, server.Admin, opts...).Run(ctx, &mcp.StdioTransport{})
 	}
 
-	issuer := cmd.String("issuer-url")
-	readURL, adminURL := cmd.String("read-resource-url"), cmd.String("admin-resource-url")
-	if issuer == "" || readURL == "" || adminURL == "" {
-		return fmt.Errorf("--issuer-url, --read-resource-url and --admin-resource-url are required for the http transport")
-	}
-	if readURL == adminURL {
-		// The split is the point: one audience for both would hand a
-		// read-only, 7-day token the write tools.
-		return fmt.Errorf("--read-resource-url and --admin-resource-url must differ")
-	}
-
-	mux := http.NewServeMux()
-	for _, ep := range []struct {
-		path, url string
-		mode      server.Mode
-	}{
-		{"/mcp", readURL, server.Read},
-		{"/mcp-admin", adminURL, server.Admin},
-	} {
-		auth, err := resource.New(resource.Config{
-			IssuerURL:   issuer,
-			ResourceURL: ep.url,
-			Scope:       cmd.String("scope"),
-		})
-		if err != nil {
-			return fmt.Errorf("auth for %s: %w", ep.path, err)
-		}
-		s := server.New(accts, store, version, ep.mode, opts...)
-		h := mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return s }, &mcp.StreamableHTTPOptions{Logger: log})
-
-		mux.Handle(ep.path, auth.Protect(h))
-		mux.Handle(ep.path+"/", auth.Protect(h))
-		// RFC 9728 puts each resource's own path after the well-known
-		// prefix, so the two endpoints get two metadata documents.
-		mux.Handle(auth.Path(), auth.Metadata())
-		log.Info("endpoint", "path", ep.path, "mode", ep.mode.String(), "resource", ep.url, "metadata", auth.Path())
-	}
-
-	// Liveness and readiness, independent of leadership: a new pod is Ready
-	// while the old one still leads. Deliberately does NOT touch any mailbox: a probe that
-	// fails when Gmail blips takes the pod out of service for something a
-	// restart cannot fix. Unauthenticated on purpose -- a probe carries no token.
-	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte("ok\n"))
-	})
-
 	addr := cmd.String("addr")
+	if cmd.Bool("allow-non-loopback") {
+		log.Warn("non-loopback MCP address allowed: this server checks no token", "addr", addr)
+	} else if err := requireLoopback(addr); err != nil {
+		return err
+	}
+	ops := cmd.String("ops-addr")
+	if ops != "" && ops == addr {
+		return fmt.Errorf("--ops-addr and --addr must differ")
+	}
+
+	mux := newMCPMux(log,
+		server.New(accts, store, version, server.Read, opts...),
+		server.New(accts, store, version, server.Admin, opts...))
+	log.Info("endpoint", "path", "/mcp", "mode", server.Read.String())
+	log.Info("endpoint", "path", "/mcp-admin", "mode", server.Admin.String())
+
 	srv := &http.Server{Addr: addr, Handler: mux, ReadHeaderTimeout: 10 * time.Second}
+	var opsSrv *http.Server
+	if ops != "" {
+		opsSrv = &http.Server{Addr: ops, Handler: newOpsMux(), ReadHeaderTimeout: 10 * time.Second}
+	}
 
 	// On SIGTERM: stop accepting, let in-flight requests finish (bounded),
 	// and only then return, so the deferred cancel of the jobs (which
 	// releases the Lease) and the closing of the cache come after the last
 	// request.
+	srvCtx, cancelSrv := context.WithCancel(ctx)
+	defer cancelSrv()
 	drained := make(chan struct{})
 	go func() {
 		defer close(drained)
-		<-ctx.Done()
+		<-srvCtx.Done()
 		shutdown, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 		defer cancel()
 		if err := srv.Shutdown(shutdown); err != nil {
 			log.Warn("http shutdown timed out; closing remaining connections", "error", err.Error())
 			_ = srv.Close()
 		}
+		if opsSrv != nil {
+			_ = opsSrv.Shutdown(shutdown)
+		}
 	}()
 
-	log.Info("serving mcp over http", "addr", addr)
-	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-		return err
+	// The ops listener answers the kubelet while the MCP listener is up; if
+	// either stops with an error the process ends and the pod restarts.
+	failed := make(chan error, 2)
+	if opsSrv != nil {
+		go func() {
+			log.Info("serving ops over http", "addr", ops)
+			if err := opsSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				failed <- fmt.Errorf("ops listener: %w", err)
+			}
+		}()
 	}
-	<-drained
+	go func() {
+		log.Info("serving mcp over http", "addr", addr)
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			failed <- fmt.Errorf("mcp listener: %w", err)
+		}
+	}()
+	select {
+	case err := <-failed:
+		cancelSrv()
+		<-drained
+		return err
+	case <-drained:
+	}
 	return nil
 }
