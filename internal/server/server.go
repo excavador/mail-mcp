@@ -5,9 +5,14 @@
 // reading happens daily and should not need a daily sign-in; organising
 // happens rarely and can. So:
 //
-//   - Read  — served at the read-only resource (/mail). Read tools only.
-//   - Admin — served at the write resource (/mail-admin). Read tools plus the
-//     tools that change a mailbox.
+//   - Read  — served at /mcp, behind the read-only resource's sidecar proxy
+//     (public path /mail). Read tools only.
+//   - Admin — served at /mcp-admin, behind the write resource's sidecar proxy
+//     (public path /mail-admin). Read tools plus the tools that change a
+//     mailbox.
+//
+// This package checks no token: each resource's resource-proxy does, for its
+// own audience, and forwards only its own prefix to its own path.
 //
 // There is no delete tool in either, and there will not be one. Moves are
 // reversible; deletes are not.

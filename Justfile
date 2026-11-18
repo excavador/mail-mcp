@@ -17,7 +17,14 @@ check:
 # A chart exercised only with correct values has not been tested: the schema
 # and the required-value guards exist to REJECT things, so the checks that
 # matter are the ones expecting failure.
-auth_values := "--set auth.issuerUrl=https://access.example --set auth.readResourceUrl=https://mcp.example/read --set auth.adminResourceUrl=https://mcp.example/admin"
+#
+# The resource-proxy tag and digest are test fixtures: the chart requires both
+# and carries no default, so every render below passes them.
+issuer := "--set auth.issuerUrl=https://access.example"
+read_url := "--set auth.readResourceUrl=https://mcp.example/read"
+admin_url := "--set auth.adminResourceUrl=https://mcp.example/admin"
+proxy_values := "--set proxy.image.tag=1.84.0 --set proxy.image.digest=sha256:adf1c78e983f9c5f9b6eed362cd02b6ce4a6c814ff561894c25bd48e6fb98a89"
+auth_values := issuer + " " + read_url + " " + admin_url + " " + proxy_values
 
 chart:
     helm lint charts/mail-mcp \
@@ -25,26 +32,26 @@ chart:
     helm template t charts/mail-mcp \
         --set accounts.existingSecret=x {{auth_values}} > /dev/null
     @# missing required values
-    @! helm template t charts/mail-mcp >/dev/null 2>&1 \
+    @! helm template t charts/mail-mcp {{auth_values}} >/dev/null 2>&1 \
         || (echo "FAIL: rendered without accounts.existingSecret"; exit 1)
     @# auth.issuerUrl is required
     @! helm template t charts/mail-mcp --set accounts.existingSecret=x \
-        --set auth.readResourceUrl=https://mcp.example/read --set auth.adminResourceUrl=https://mcp.example/admin \
+        {{read_url}} {{admin_url}} {{proxy_values}} \
         >/dev/null 2>&1 \
         || (echo "FAIL: rendered without auth.issuerUrl"; exit 1)
     @# auth.readResourceUrl is required
     @! helm template t charts/mail-mcp --set accounts.existingSecret=x \
-        --set auth.issuerUrl=https://access.example --set auth.adminResourceUrl=https://mcp.example/admin \
+        {{issuer}} {{admin_url}} {{proxy_values}} \
         >/dev/null 2>&1 \
         || (echo "FAIL: rendered without auth.readResourceUrl"; exit 1)
     @# auth.adminResourceUrl is required
     @! helm template t charts/mail-mcp --set accounts.existingSecret=x \
-        --set auth.issuerUrl=https://access.example --set auth.readResourceUrl=https://mcp.example/read \
+        {{issuer}} {{read_url}} {{proxy_values}} \
         >/dev/null 2>&1 \
         || (echo "FAIL: rendered without auth.adminResourceUrl"; exit 1)
     @# read and admin resource URLs must not be equal
     @! helm template t charts/mail-mcp --set accounts.existingSecret=x \
-        --set auth.issuerUrl=https://access.example --set auth.readResourceUrl=https://mcp.example/same \
+        {{issuer}} {{proxy_values}} --set auth.readResourceUrl=https://mcp.example/same \
         --set auth.adminResourceUrl=https://mcp.example/same \
         >/dev/null 2>&1 \
         || (echo "FAIL: accepted equal read and admin resource URLs"; exit 1)
@@ -60,14 +67,14 @@ chart:
       || (echo "FAIL: deploymentAnnotations did not reach the Deployment"; exit 1)
     @# auth.scope defaults to openid and reaches SCOPE, so an estate that
     @# never sets it still advertises a scope access-roster accepts.
-    @helm template t charts/mail-mcp --set accounts.existingSecret=x {{auth_values}} \
-      | grep -A1 'name: SCOPE' | grep -q '"openid"' \
-      || (echo "FAIL: auth.scope did not default to openid on SCOPE"; exit 1)
+    @test "$(helm template t charts/mail-mcp --set accounts.existingSecret=x {{auth_values}} \
+      | grep -A1 'name: SCOPE' | grep -c '"openid"')" = 2 \
+      || (echo "FAIL: auth.scope did not default to openid on both proxies' SCOPE"; exit 1)
     @# and an estate needing a different scope can still set it.
-    @helm template t charts/mail-mcp --set accounts.existingSecret=x \
+    @test "$(helm template t charts/mail-mcp --set accounts.existingSecret=x \
         {{auth_values}} --set auth.scope=openid+mail \
-      | grep -A1 'name: SCOPE' | grep -q '"openid+mail"' \
-      || (echo "FAIL: auth.scope did not override SCOPE"; exit 1)
+      | grep -A1 'name: SCOPE' | grep -c '"openid+mail"')" = 2 \
+      || (echo "FAIL: auth.scope did not override SCOPE on both proxies"; exit 1)
     @# pdfExtractor is off by default: no sidecar, no socket variable, no socket volume.
     @! helm template t charts/mail-mcp --set accounts.existingSecret=x {{auth_values}} \
       | grep -q -E 'pdftext|PDF_EXTRACTOR_SOCKET' \
@@ -100,7 +107,12 @@ chart:
     @! helm template t charts/mail-mcp --set accounts.existingSecret=x {{auth_values}} --set pdfExtractor.enabled=true \
         --set pdfExtractor.resources.limits=null >/dev/null 2>&1 \
         || (echo "FAIL: accepted a pdf sidecar without a memory limit"; exit 1)
-    @echo "chart ok: renders, refuses missing values (including auth and accounts), equal resource URLs, and unknown keys, annotates the Deployment, wires auth.scope, and renders the PDF sidecar only when enabled, strictly confined"
+    just chart-proxy
+    @echo "chart ok: renders, refuses missing values (including auth, accounts and the proxy pin), equal resource URLs, and unknown keys, annotates the Deployment, wires auth.scope, renders the PDF sidecar only when enabled, strictly confined, and fronts the server with one resource-proxy per resource"
+
+# The resource-proxy sidecars (hack/chart-proxy-test.sh).
+chart-proxy:
+    issuer='{{issuer}}' proxy_values='{{proxy_values}}' bash hack/chart-proxy-test.sh
 
 # What the release will build, without publishing.
 #

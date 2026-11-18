@@ -5,9 +5,16 @@ metadata:
   labels: {{- include "mail-mcp.labels" . | nindent 4 }}
 spec:
   type: {{ .Values.service.type }}
+  # The two proxies' ports and no other: nothing else of the pod is reachable
+  # through the Service (the server itself has no container port for MCP, and
+  # the ops port is for the kubelet).
   ports:
     - name: http
       port: {{ .Values.service.port }}
       targetPort: http
+      protocol: TCP
+    - name: admin
+      port: {{ .Values.service.adminPort }}
+      targetPort: admin
       protocol: TCP
   selector: {{- include "mail-mcp.selectorLabels" . | nindent 4 }}

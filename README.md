@@ -19,12 +19,31 @@ mail-mcp serves two MCP endpoints from one process, because [sluis](https://gith
 | `/mcp` | read only | 7 days | read-only resource |
 | `/mcp-admin` | read + write | 24 hours | write resource |
 
-Both endpoints are served over HTTP and validate bearer tokens themselves: minted
-by the issuer, checked against its JWKS with the endpoint's own resource URL
-as the required audience (RFC 8707). `/healthz` is unauthenticated liveness,
-deliberately touching no mailbox — a probe that fails when Gmail blips takes
-the pod out of service for something a restart cannot fix. stdio transport
-serves the admin tool set for local use.
+Both endpoints are served over HTTP on one loopback listener (`127.0.0.1:8081`)
+that **checks no token**. In the pod, two [sluis](https://github.com/truvity/sluis)
+`resource-proxy` sidecars are the only way in, one per resource (a proxy handles
+exactly one resource):
+
+```
+gateway ─▶ :8080 proxy-read  (aud = read resource URL)  ─▶ 127.0.0.1:8081/mcp
+        └▶ :8082 proxy-admin (aud = admin resource URL) ─▶ 127.0.0.1:8081/mcp-admin
+```
+
+Each proxy validates the bearer token (signature against the issuer's keys,
+`iss`, and `aud` equal to its own resource URL, RFC 8707), serves the RFC 9728
+protected-resource metadata, writes one `mcp_request` audit line per request
+to its stdout, strips the caller's `Authorization` header and maps its
+resource's path prefix to the server's path (`/mail` to `/mcp`, `/mail-admin`
+to `/mcp-admin`). A token for the read resource fails the admin proxy's `aud`
+check, so it never reaches the write tools.
+
+The MCP listener therefore refuses a non-loopback `--addr` at start (see the
+flags below): a wrong address must not publish the mailboxes with no
+authentication in front of them. `/healthz` is on a separate ops listener
+(`--ops-addr`, default `:9090`), which serves nothing else; it is
+unauthenticated liveness, deliberately touching no mailbox — a probe that fails
+when Gmail blips takes the pod out of service for something a restart cannot
+fix. stdio transport serves the admin tool set for local use.
 
 ## Configuration
 
@@ -104,11 +123,9 @@ openssl s_client -starttls imap -connect 127.0.0.1:143 </dev/null | \
 |---|---|---|---|
 | `--accounts` | `ACCOUNTS_FILE` | yes | all |
 | `--transport` | `TRANSPORT` | no; default `stdio` | all |
-| `--addr` | `ADDR` | no; default `0.0.0.0:8080` | http |
-| `--issuer-url` | `ISSUER_URL` | yes | http |
-| `--read-resource-url` | `READ_RESOURCE_URL` | yes | http |
-| `--admin-resource-url` | `ADMIN_RESOURCE_URL` | yes | http |
-| `--scope` | `SCOPE` | no; default `openid` | http |
+| `--addr` | `ADDR` | no; default `127.0.0.1:8081`; must be a loopback address | http |
+| `--allow-non-loopback` | `ALLOW_NON_LOOPBACK` | no; default off. Allows a non-loopback `--addr`; see below | http |
+| `--ops-addr` | `OPS_ADDR` | no; default `:9090` (`/healthz` only); empty disables it | http |
 | `--pdf-extractor-socket` | `PDF_EXTRACTOR_SOCKET` | no; empty (default) turns PDF text off | all |
 | `--pdf-stage-dir` | `PDF_STAGE_DIR` | no; default `--cache-dir` | all |
 | `--leader-election` | `LEADER_ELECTION` | no; `auto` (default: on when running in a cluster), `true`, or `false` (always the leader, for local runs) | all |
@@ -116,9 +133,19 @@ openssl s_client -starttls imap -connect 127.0.0.1:143 </dev/null | \
 | `--lease-namespace` | `POD_NAMESPACE` | in a cluster, if the service-account namespace file is not mounted | all |
 | (identity) | `POD_NAME` | no; default the hostname | all |
 
-The read and admin resource URLs must differ — that difference is the whole
-point, so that sluis can mint 7-day tokens for the read endpoint and shorter
-tokens for the write endpoint.
+The server holds no issuer or resource URL: those belong to the two proxies
+(chart values `auth.issuerUrl`, `auth.readResourceUrl`, `auth.adminResourceUrl`,
+`auth.scope`). The read and admin resource URLs must differ — that difference
+is the whole point, so that sluis can mint 7-day tokens for the read endpoint
+and shorter tokens for the write endpoint. The chart refuses equal URLs,
+a trailing slash, a URL without a path, and one path inside the other.
+
+**`--allow-non-loopback` is for a setup where something else authenticates
+every request and is the only way in** (say, a different gateway-side
+verifier, or a container port mapped on a developer's machine). The server
+checks no token: with this flag and a reachable address, anyone who can connect
+reads and, on `/mcp-admin`, changes the mailboxes. The flag logs a warning at
+start. Do not set it in the chart.
 
 ## Tools
 
@@ -370,8 +397,11 @@ releases the Lease at once. A pod that loses the Lease stops its jobs, keeps
 serving and campaigns again. Leadership changes are logged at INFO
 (`leadership acquired`, `leadership lost`, `leadership released`).
 
-`/healthz` is ready as soon as the cache is open and the server listens,
-whoever leads. On SIGTERM the server stops accepting, gives in-flight requests
+`/healthz` (ops listener) is ready as soon as the cache is open and the server
+listens, whoever leads. The pod's readiness also needs both proxies' `/readyz`,
+which waits for the issuer's discovery document: an issuer outage keeps a new
+pod from becoming Ready and so stalls a rollout, while the old pod keeps
+serving. On SIGTERM the server stops accepting, gives in-flight requests
 20 s, then stops the jobs, releases the Lease and closes the cache; keep
 `terminationGracePeriodSeconds` above that (the chart uses 45).
 
@@ -405,11 +435,58 @@ release with `Recreate`.
 
 ## Two things to know before deploying it
 
-**The HTTP transport validates every request itself.** A bearer token minted
-by [sluis](https://github.com/truvity/sluis), checked against its JWKS with
-this server's own resource URL as the required audience (RFC 8707). Both
-`ISSUER_URL` and the resource URLs are required — there is no way to start
-the http transport or render the chart without them, and no gateway fallback.
+**The server checks no token; the sidecars do.** The chart fronts it with two
+sluis `resource-proxy` containers, pinned by tag **and** digest
+(`proxy.image.tag` and `proxy.image.digest` are required, there is no default;
+the repository defaults to `ghcr.io/truvity/sluis/resource-proxy`). `auth.issuerUrl`
+and the two resource URLs are required — there is no way to render the chart
+without them, and no gateway fallback. Each resource URL must equal, byte for
+byte, the resource's id in the issuer's policy and the public URL clients use.
+
+The chart also owns the routing and the network policy (both from values):
+
+- `httpRoute.enabled` renders one `HTTPRoute` for both resources, derived from
+  the paths of the two resource URLs, with a 180 s request timeout on the MCP
+  rules, and an Envoy Gateway `BackendTrafficPolicy` (`httpRoute.sessionAffinity`)
+  hashing on `Mcp-Session-Id` so a session stays on the pod that opened it while
+  two pods are Ready during a rolling update. The gateway rewrites nothing
+  except the suffix form of the metadata path.
+- `networkPolicy` admits ingress from the gateway's pods (default: Envoy
+  Gateway's) on the two proxy ports only, and egress to DNS, HTTPS, IMAP
+  (`networkPolicy.egress.imap`, default tcp 993) and `networkPolicy.extraEgress`
+  (an in-cluster Proton Bridge on tcp 143; the Kubernetes API server for the
+  Lease, whose address depends on the cluster).
+
+### Upgrading from 0.9 (breaking)
+
+Everything below changes at once; roll chart, image and gateway together.
+
+- The server no longer validates tokens, so the flags `--issuer-url`,
+  `--read-resource-url`, `--admin-resource-url` and `--scope` (and their
+  environment variables) are **gone**: passing a flag is an error, and the
+  environment variables are silently ignored. The values
+  `auth.issuerUrl`, `auth.readResourceUrl`, `auth.adminResourceUrl` and
+  `auth.scope` keep their names and now feed the proxies.
+- The server's `--addr` default is `127.0.0.1:8081` and a non-loopback address
+  is refused. Anything that probed or called the old `0.0.0.0:8080` directly
+  (including `/healthz`) must use the ops port (`:9090`) or the proxies.
+- The pod's only MCP ports are the proxies' `8080` (read) and `8082` (admin);
+  the Service has both (`service.port`, new `service.adminPort`).
+- The proxies serve the paths of the resource URLs (`/mail`, `/mail-admin`)
+  and map them to `/mcp` and `/mcp-admin` themselves, so a gateway route
+  that rewrites `/mail` to `/mcp` now gets `404`. Use `httpRoute.enabled`, or
+  route each resource's prefix and its two metadata paths to its proxy port
+  without a rewrite.
+- New required values: `proxy.image.tag` and `proxy.image.digest`.
+- The chart now renders a `NetworkPolicy` (`networkPolicy.enabled`, default on)
+  and, with `httpRoute.enabled`, the route and the session-affinity policy. A
+  deployment that already has objects of those names must delete its copies in
+  the same change.
+- During a rollout, a request routed to the new pod through the old rewriting
+  route gets a `404` until the route changes: expect seconds. Tokens stay valid
+  (same issuer, same audience), so nobody signs in again.
+- New: the proxies write the `mcp_request` audit line (subject, client, MCP
+  method, tool, status) to their own stdout; the server logs none of that.
 
 **Proton Mail Bridge presents a self-signed certificate and mail-mcp enforces
 a pin on it — there is no "skip verification" setting at all.** The honest

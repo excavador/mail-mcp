@@ -40,29 +40,138 @@ accounts:
   existingSecret: ""
 
 # stdio is meaningless in a pod, so this chart only ever runs http.
+#
+# The pod has three containers, or four with pdfExtractor:
+#
+#   mail-mcp     serves MCP on 127.0.0.1:8081 (/mcp read, /mcp-admin admin).
+#                It declares no container port for MCP and holds no
+#                authentication code; it refuses a non-loopback address. Its
+#                ops port (9090, /healthz only) is for the kubelet.
+#   proxy-read   a sluis resource-proxy: the read resource's MCP port (8080).
+#   proxy-admin  a second resource-proxy: the admin resource's port (8082).
+#                One proxy handles exactly one resource, so two resources are
+#                two proxies. Each validates the caller's access token
+#                (signature against the issuer's keys, `iss`, and `aud` equal
+#                to ITS resource URL), serves the RFC 9728 protected-resource
+#                metadata, writes one audit line per request, strips the
+#                Authorization header and forwards to mail-mcp on loopback. A
+#                token for the read resource fails the admin proxy's `aud`
+#                check, so it never reaches the write tools.
+#   pdftext      optional, see pdfExtractor.
+#
+# Who may call is the issuer's policy for each resource URL, not anything here.
 service:
   type: ClusterIP
-  port: 8080
+  # The Service's two ports. They target the proxies by name, so these
+  # numbers are free; the container ports are fixed (8080 and 8082).
+  port: 8080       # the read proxy
+  adminPort: 8082  # the admin proxy
 
-# The server validates every request itself against access-roster: no
-# secret to provide here, because a bearer token is never a literal and a
-# CIMD client never registers one. All three are required.
+# What the proxies validate against. All of issuerUrl, readResourceUrl and
+# adminResourceUrl are required.
 auth:
-  # access-roster's own URL, exactly as it appears in a token's `iss`.
+  # The issuer's own URL, exactly as it appears in a token's `iss`. https, no
+  # fragment.
   issuerUrl: ""
-  # This server's own EXTERNAL URL (not its in-cluster Service address):
-  # the RFC 8707 resource indicator a client names, and the audience
-  # access-roster mints a token for. Must match, byte for byte, this
-  # resource's id in access-roster's own policy.
+  # The read endpoint's own EXTERNAL URL (not its in-cluster Service address):
+  # the RFC 8707 resource indicator a client names, and the `aud` the proxy
+  # requires. Must equal, byte for byte, this resource's id in the issuer's
+  # policy AND the public URL clients are given. https, with a path, no
+  # trailing slash. The route (httpRoute) is derived from its path, and the
+  # proxy maps that prefix to the server's /mcp.
   readResourceUrl: ""
-  # The admin endpoint URL, also for RFC 8707 resource indicator.
-  # Must be different from readResourceUrl.
+  # The admin endpoint's URL, the same way (mapped to /mcp-admin). Must differ
+  # from readResourceUrl, and neither path may be inside the other.
   adminResourceUrl: ""
-  # Advertised in the PRM's scopes_supported and the 401 challenge's
-  # scope -- never checked by this server itself. access-roster refuses
-  # an authorize request with no scope at all; "openid" is the one it
-  # accepts by default. An estate needing more sets this, not the image.
+  # Advertised in the PRM's scopes_supported and the 401 challenge's scope --
+  # never checked. An issuer may refuse an authorize request with no scope at
+  # all; "openid" is the one it accepts by default.
   scope: openid
+
+# The resource-proxy sidecars (truvity/sluis, cmd/resource-proxy), both from
+# one image. Built by another repository's release, so there is NO default
+# version: pin the release you have verified by tag AND digest. Both are
+# REQUIRED.
+proxy:
+  image:
+    repository: ghcr.io/truvity/sluis/resource-proxy
+    tag: ""
+    digest: ""
+    pullPolicy: IfNotPresent
+  # The numeric uid the image runs as. `runAsNonRoot` cannot verify a named
+  # user, so the uid is stated.
+  runAsUser: 65532
+  # Per proxy container (there are two).
+  resources:
+    requests:
+      cpu: 10m
+      memory: 32Mi
+    limits:
+      memory: 96Mi
+
+# NetworkPolicy: the pod admits ingress on the two proxies' ports from
+# `ingressFrom` (the gateway that fronts the server; REQUIRED while enabled,
+# an empty list would admit nobody; the default is Envoy Gateway's own pods in
+# its default namespace) and egress to DNS, HTTPS (the issuer's signing keys,
+# and the Google APIs of a calendar) and the IMAP upstreams. The ops port is
+# for the kubelet, whose probes are not subject to a NetworkPolicy.
+#
+# DNS and HTTPS egress are OPEN BY DEFAULT: port 53 and tcp 443 to any
+# destination, because an issuer behind a CDN has no address a chart can know.
+# Name the peers in egress.dns and egress.https to close them. `imap` is the
+# IMAP upstreams, verbatim egress rules: the default is implicit-TLS IMAP
+# (tcp 993, Gmail) to anywhere. `extraEgress` adds rules, verbatim, for what a
+# chart cannot know: an in-cluster Proton Bridge (tcp 143 to its pods), and
+# the Kubernetes API server (the Lease of leader election: its port and
+# address depend on the cluster, e.g. tcp 6443 to the control-plane nodes).
+networkPolicy:
+  enabled: true
+  ingressFrom:
+    - namespaceSelector:
+        matchLabels: {kubernetes.io/metadata.name: envoy-gateway-system}
+      podSelector:
+        matchLabels: {app.kubernetes.io/name: envoy}
+  egress:
+    dns: []
+    https: []
+    imap:
+      - ports:
+          - {port: 993, protocol: TCP}
+  extraEgress: []
+
+# Optional: ONE gateway.networking.k8s.io/v1 HTTPRoute for both resources, in
+# the release namespace, shipped with the Service on purpose (a route whose
+# backend arrives later reads BackendNotFound). Per resource, from the path of
+# its URL (say /mail): PathPrefix /mail, Exact
+# /.well-known/oauth-protected-resource/mail, and Exact
+# /mail/.well-known/oauth-protected-resource (rewritten to the second), all to
+# that resource's proxy port (read: service.port, admin: service.adminPort).
+# No other filter: the proxy maps /mail to /mcp itself.
+httpRoute:
+  enabled: false
+  # Optional: the route's name; defaults to the fullname.
+  name: ""
+  # Required while enabled. Passed through as written: group, kind, name,
+  # namespace, sectionName. Example:
+  #   - {group: gateway.networking.k8s.io, kind: Gateway, name: mcp, namespace: envoy-gateway-system, sectionName: https}
+  parentRefs: []
+  # Optional. When set, the host of both resource URLs must be in it.
+  hostnames: []
+  annotations: {}
+  labels: {}
+  # The request timeout on the two MCP rules (not the metadata rules): a live
+  # IMAP call against a slow account takes longer than a gateway's default
+  # (Envoy: 15s). Cloudflare's proxy gives up on its own after about 100s.
+  # Empty omits it.
+  timeouts:
+    request: 180s
+  # An Envoy Gateway BackendTrafficPolicy hashing on Mcp-Session-Id, so a
+  # session stays on the pod that answered `initialize` while two pods are
+  # Ready during a rolling update. Needs the gateway.envoyproxy.io CRDs: turn
+  # it off on another gateway.
+  sessionAffinity:
+    enabled: true
+    headerName: Mcp-Session-Id
 
 # Cache directory: a writable PVC for IMAP cache. In production this should
 # be backed up and durable; in development an emptyDir is acceptable.

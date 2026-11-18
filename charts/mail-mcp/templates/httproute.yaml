@@ -1,0 +1,102 @@
+{{- if .Values.httpRoute.enabled }}
+{{- $r := .Values.httpRoute }}
+{{- $rp := include "mail-mcp.urlPath" .Values.auth.readResourceUrl }}
+{{- $ap := include "mail-mcp.urlPath" .Values.auth.adminResourceUrl }}
+{{- $name := include "mail-mcp.fullname" . }}
+{{- /*
+One HTTPRoute, shipped WITH the Service on purpose: a route whose backend
+arrives later reads BackendNotFound and degrades whatever owns it.
+
+Each resource's path, and its path-suffixed protected-resource metadata (RFC
+9728 puts the well-known segment BEFORE the resource path), go to that
+resource's proxy: the read resource to the Service's http port, the admin
+resource to its admin port. The suffix form (/<path>/.well-known/...) is
+rewritten to the path-inserted one, which the proxy serves unauthenticated;
+unrewritten it would be an authenticated path and answer 401. The gateway
+rewrites nothing else: the proxy maps a resource's prefix to the server's
+/mcp or /mcp-admin itself. No bare /.well-known/oauth-protected-resource
+rule: two resources share the host, so the bare document would be ambiguous.
+
+PathPrefix matches whole path ELEMENTS, so the read prefix never swallows the
+admin one (validate refuses one path inside the other); Exact beats Prefix,
+so the metadata rules win over both prefixes.
+
+The request timeout (httpRoute.timeouts.request) is on the two MCP rules
+only: a live IMAP call against a slow account outlasts a gateway's default.
+*/}}
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: {{ default $name $r.name }}
+  labels:
+    {{- include "mail-mcp.labels" . | nindent 4 }}
+    {{- with $r.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  {{- with $r.annotations }}
+  annotations: {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  parentRefs: {{- toYaml $r.parentRefs | nindent 4 }}
+  {{- with $r.hostnames }}
+  hostnames: {{- toYaml . | nindent 4 }}
+  {{- end }}
+  rules:
+    {{- range $res := list (dict "path" $ap "port" $.Values.service.adminPort) (dict "path" $rp "port" $.Values.service.port) }}
+    - matches:
+        - path: {type: PathPrefix, value: {{ $res.path }}}
+      backendRefs:
+        - {group: "", kind: Service, name: {{ $name }}, port: {{ $res.port }}, weight: 1}
+      {{- with $r.timeouts.request }}
+      timeouts: {request: {{ . }}}
+      {{- end }}
+    - matches:
+        - path: {type: Exact, value: /.well-known/oauth-protected-resource{{ $res.path }}}
+      backendRefs:
+        - {group: "", kind: Service, name: {{ $name }}, port: {{ $res.port }}, weight: 1}
+    - matches:
+        - path: {type: Exact, value: {{ $res.path }}/.well-known/oauth-protected-resource}
+      filters:
+        - type: URLRewrite
+          urlRewrite:
+            path: {type: ReplaceFullPath, replaceFullPath: /.well-known/oauth-protected-resource{{ $res.path }}}
+      backendRefs:
+        - {group: "", kind: Service, name: {{ $name }}, port: {{ $res.port }}, weight: 1}
+    {{- end }}
+{{- if $r.sessionAffinity.enabled }}
+---
+{{- /*
+Session affinity for the rolling overlap. While the old and the new pod are
+both Ready, an MCP session (Streamable HTTP) lives in the memory of the pod
+that answered `initialize`. Hashing on the Mcp-Session-Id request header
+sends every later request of that session to the same pod; a request without
+the header (initialize, the .well-known documents) hashes to nothing and
+Envoy picks any endpoint. When the owning pod goes away the hash is
+recomputed over the remaining endpoint and the session lands on the
+survivor, which answers 404 for the unknown session id; a spec-compliant
+client then re-initializes.
+
+DELIBERATELY only loadBalancer: no timeouts and no retries here. A retry
+could replay an apply_intent against a second pod.
+
+This is an Envoy Gateway resource (gateway.envoyproxy.io/v1alpha1): turn it
+off with httpRoute.sessionAffinity.enabled=false on any other gateway.
+*/}}
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: BackendTrafficPolicy
+metadata:
+  name: {{ $name }}-session-affinity
+  labels: {{- include "mail-mcp.labels" . | nindent 4 }}
+spec:
+  targetRefs:
+    - group: gateway.networking.k8s.io
+      kind: HTTPRoute
+      name: {{ default $name $r.name }}
+  loadBalancer:
+    type: ConsistentHash
+    consistentHash:
+      type: Headers
+      headers:
+        - name: {{ $r.sessionAffinity.headerName }}
+{{- end }}
+{{- end }}
